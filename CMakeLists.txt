@@ -74,9 +74,13 @@ FetchContent_Declare(dr_libs
 FetchContent_MakeAvailable(dr_libs)
 
 # ── speak.exe ───────────────────────────────────────────────────────────────
-add_executable(speak speak.cpp ${POCKETTTS_SRC})
+# speak.cpp #includes pocket_tts.cpp, so they compile as one translation unit:
+# that is what lets us use upstream's TTSServer (daemon mode) as well as its
+# ptt_* C API. ${CMAKE_BINARY_DIR} is where the fetched source landed.
+add_executable(speak speak.cpp)
 target_compile_definitions(speak PRIVATE PTT_SHARED_LIB _CRT_SECURE_NO_WARNINGS)
 target_include_directories(speak PRIVATE
+    ${CMAKE_BINARY_DIR}
     ${ONNXRUNTIME_ROOT}/include
     ${sentencepiece_SOURCE_DIR}/src
     ${dr_libs_SOURCE_DIR}
@@ -85,7 +89,12 @@ target_link_libraries(speak PRIVATE
     ${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib
     sentencepiece-static
     ws2_32 ole32 gdi32 user32
+    delayimp
 )
+
+# Delay-load the 14 MB inference DLL: when a daemon is already running, the
+# client path never touches ONNX Runtime, so it should not pay to map it in.
+target_link_options(speak PRIVATE /DELAYLOAD:onnxruntime.dll)
 
 # onnxruntime.dll is the one file that must sit beside the exe.
 add_custom_command(TARGET speak POST_BUILD
