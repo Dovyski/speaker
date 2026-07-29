@@ -27,32 +27,27 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
-// ── PocketTTS.cpp C API (defined in the include above) ──────────────────────
-extern "C" {
-void*  ptt_create(const char* models_dir, const char* voices_dir,
-                  const char* tokenizer_path, const char* precision,
-                  float temperature, int lsd_steps, int num_threads);
-void   ptt_destroy(void* handle);
-void   ptt_free_audio(float* samples);
-void*  ptt_stream_start(void* handle, const char* text, const char* voice);
-int    ptt_stream_read(void* stream_ctx, float** out_samples, int* out_len);
-void   ptt_stream_end(void* stream_ctx);
-}
-
 namespace {
 
 constexpr int    kSampleRate  = 24000;
 constexpr size_t kEnvBlock    = 256;   // frames per amplitude-envelope entry
 constexpr int    kDefaultPort = 8123;
+
+// Silence appended to the render stream after the last real sample. Without it
+// the device stops the moment the final sample is consumed, which clips the
+// audible tail of the last word.
+constexpr size_t kTailSilenceFrames = kSampleRate / 4;   // 250 ms
 
 // Shared state between the audio writer and the orb renderer.
 std::atomic<uint64_t> g_play_pos{0};      // frames handed to the speakers
@@ -231,20 +226,64 @@ struct PcmSource {
     virtual bool Next(std::vector<float>* out) = 0;
 };
 
-// In-process synthesis through the ptt_* streaming API.
-class LocalSource : public PcmSource {
+// In-process synthesis: runs the engine on a worker thread and queues the chunks
+// it emits. We drive pocket_tts::PocketTTS directly rather than through its ptt_*
+// C API because that API cannot pass EOS settings, and the tail of the last word
+// depends on them.
+class EngineSource : public PcmSource {
 public:
-    explicit LocalSource(void* stream) : stream_(stream) {}
+    EngineSource(pocket_tts::PocketTTS* tts, std::string text, std::string voice) {
+        worker_ = std::thread([this, tts, text = std::move(text),
+                                     voice = std::move(voice)]() mutable {
+            try {
+                tts->stream(text, voice, [this](const float* s, size_t n) {
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        if (abort_) return false;
+                        queue_.emplace_back(s, s + n);
+                    }
+                    cv_.notify_one();
+                    return true;
+                });
+            } catch (const std::exception& e) {
+                error_ = e.what();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                done_ = true;
+            }
+            cv_.notify_one();
+        });
+    }
+
+    ~EngineSource() override {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            abort_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
     bool Next(std::vector<float>* out) override {
-        float* samples = nullptr;
-        int    len     = 0;
-        if (ptt_stream_read(stream_, &samples, &len) != 1 || len <= 0) return false;
-        out->assign(samples, samples + len);
-        ptt_free_audio(samples);
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return !queue_.empty() || done_; });
+        if (queue_.empty()) return false;
+        *out = std::move(queue_.front());
+        queue_.pop_front();
         return true;
     }
+
+    const std::string& error() const { return error_; }
+
 private:
-    void* stream_;
+    std::thread                          worker_;
+    std::mutex                           mtx_;
+    std::condition_variable              cv_;
+    std::deque<std::vector<float>>       queue_;
+    std::string                          error_;
+    bool                                 done_  = false;
+    bool                                 abort_ = false;
 };
 
 // ── HTTP client for the resident daemon ─────────────────────────────────────
@@ -535,8 +574,10 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
                 }
                 if (recorded) recorded->insert(recorded->end(), chunk.begin(), chunk.end());
             } else {
+                // Follow the last sample with silence, so the device drains the
+                // real tail instead of stopping on top of it.
                 source_done = true;
-                chunk.clear();
+                chunk.assign(kTailSilenceFrames, 0.f);
             }
         }
 
@@ -667,9 +708,24 @@ struct Options {
     bool   auto_serve  = true;   // warm a daemon in the background on a cold call
     bool   use_daemon  = true;   // try the daemon first
     float  temperature = 0.7f;
+    float  eos_threshold = -4.0f;
+    int    eos_extra   = 4;      // upstream default (-1, auto) clips the last word
     int    threads     = 0;
     int    port        = kDefaultPort;
 };
+
+pocket_tts::Config BuildConfig(const Options& opt) {
+    pocket_tts::Config cfg;
+    cfg.models_dir       = opt.models_dir;
+    cfg.voices_dir       = opt.voices_dir;
+    cfg.tokenizer_path   = opt.models_dir + "\\tokenizer.model";
+    cfg.precision        = "int8";
+    cfg.temperature      = opt.temperature;
+    cfg.num_threads      = opt.threads;
+    cfg.eos_threshold    = opt.eos_threshold;
+    cfg.eos_extra_frames = opt.eos_extra;
+    return cfg;
+}
 
 // ── daemon ──────────────────────────────────────────────────────────────────
 
@@ -702,13 +758,7 @@ int RunDaemon(const Options& opt) {
         return 0;
     }
 
-    pocket_tts::Config cfg;
-    cfg.models_dir     = opt.models_dir;
-    cfg.voices_dir     = opt.voices_dir;
-    cfg.tokenizer_path = opt.models_dir + "\\tokenizer.model";
-    cfg.precision      = "int8";
-    cfg.temperature    = opt.temperature;
-    cfg.num_threads    = opt.threads;
+    const pocket_tts::Config cfg = BuildConfig(opt);
 
     try {
         std::fprintf(stderr, "speak: loading models from %s\n", opt.models_dir.c_str());
@@ -749,7 +799,8 @@ bool SpawnDaemon(const Options& opt) {
     std::string cmd = "\"" + ExePath() + "\" --serve --port " + std::to_string(opt.port) +
                       " --voice \"" + opt.voice + "\"" +
                       " --models-dir \"" + opt.models_dir + "\"" +
-                      " --voices-dir \"" + opt.voices_dir + "\"";
+                      " --voices-dir \"" + opt.voices_dir + "\"" +
+                      " --eos-extra " + std::to_string(opt.eos_extra);
     if (opt.threads) cmd += " --threads " + std::to_string(opt.threads);
 
     std::wstring wcmd = Wide(cmd);
@@ -813,6 +864,10 @@ void Usage() {
         "  --timing              report time to first audio\n"
         "  --port <n>            daemon port (default 8123)\n"
         "  --temperature <f>     sampling temperature (default 0.7)\n"
+        "  --eos-extra <n>       extra frames after end-of-speech (default 4,\n"
+        "                        -1 = upstream auto; raise if words get clipped)\n"
+        "  --eos-threshold <f>   end-of-speech threshold (default -4.0, lower =\n"
+        "                        later cutoff)\n"
         "  --threads <n>         thread budget (0 = half the cores)\n"
         "  --models-dir <dir>    ONNX models (default: <exe dir>/models)\n"
         "  --voices-dir <dir>    voice samples (default: <exe dir>/voices)\n");
@@ -847,6 +902,8 @@ int main() {
         else if (a == "--models-dir")  opt.models_dir = next("--models-dir");
         else if (a == "--voices-dir")  opt.voices_dir = next("--voices-dir");
         else if (a == "--temperature") opt.temperature = std::strtof(next("--temperature").c_str(), nullptr);
+        else if (a == "--eos-extra")   opt.eos_extra = std::atoi(next("--eos-extra").c_str());
+        else if (a == "--eos-threshold") opt.eos_threshold = std::strtof(next("--eos-threshold").c_str(), nullptr);
         else if (a == "--threads")     opt.threads = std::atoi(next("--threads").c_str());
         else if (a == "--port")        opt.port = std::atoi(next("--port").c_str());
         else if (a == "--no-orb")      opt.show_orb = false;
@@ -889,29 +946,21 @@ int main() {
     }
 
     // Cold path: synthesize here, and warm a daemon for next time.
-    void* tts    = nullptr;
-    void* stream = nullptr;
+    const bool used_daemon = source != nullptr;
+    std::unique_ptr<pocket_tts::PocketTTS> engine;
     if (!source) {
         if (opt.use_daemon && opt.auto_serve && !DaemonRegistered(opt.port)) {
             SpawnDaemon(opt);
         }
-        const std::string tokenizer = opt.models_dir + "\\tokenizer.model";
-        tts = ptt_create(opt.models_dir.c_str(), opt.voices_dir.c_str(),
-                         tokenizer.c_str(), "int8", opt.temperature, 1, opt.threads);
-        if (!tts) {
-            std::fprintf(stderr, "speak: could not load models from %s\n",
-                         opt.models_dir.c_str());
+        try {
+            engine = std::make_unique<pocket_tts::PocketTTS>(BuildConfig(opt));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "speak: could not load models from %s (%s)\n",
+                         opt.models_dir.c_str(), e.what());
             CoUninitialize();
             return 1;
         }
-        stream = ptt_stream_start(tts, opt.text.c_str(), opt.voice.c_str());
-        if (!stream) {
-            std::fprintf(stderr, "speak: could not start synthesis\n");
-            ptt_destroy(tts);
-            CoUninitialize();
-            return 1;
-        }
-        source = std::make_unique<LocalSource>(stream);
+        source = std::make_unique<EngineSource>(engine.get(), opt.text, opt.voice);
     }
 
     std::thread orb;
@@ -921,19 +970,24 @@ int main() {
     double first_audio_ms = 0;
     const bool ok = PlayStream(source.get(), opt.save_path.empty() ? nullptr : &recorded,
                                &first_audio_ms);
+
+    std::string engine_error;
+    if (auto* es = dynamic_cast<EngineSource*>(source.get())) engine_error = es->error();
     source.reset();          // closes the socket / joins the generator thread
-    if (stream) ptt_stream_end(stream);
     if (ok && !opt.save_path.empty()) WriteWav(opt.save_path, recorded);
 
     g_audio_done.store(true);
     if (orb.joinable()) orb.join();
 
-    if (tts) ptt_destroy(tts);
+    engine.reset();
     CoUninitialize();
 
+    if (!ok && !engine_error.empty()) {
+        std::fprintf(stderr, "speak: synthesis failed: %s\n", engine_error.c_str());
+    }
     if (opt.timing) {
         std::fprintf(stderr, "speak: first audio in %.0f ms (%s)\n", first_audio_ms,
-                     stream ? "local" : "daemon");
+                     used_daemon ? "daemon" : "local");
     }
     if (!ok && !daemon_err.empty() && opt.use_daemon) {
         std::fprintf(stderr, "speak: daemon path failed (%s)\n", daemon_err.c_str());

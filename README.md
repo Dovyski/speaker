@@ -108,6 +108,8 @@ speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 | `--local` | — | Never use the daemon; always synthesize in-process |
 | `--no-auto-serve` | — | Do not start a daemon in the background on a cold call |
 | `--temperature <f>` | `0.7` | Sampling temperature |
+| `--eos-extra <n>` | `4` | Extra frames generated after end-of-speech (`-1` = upstream auto) |
+| `--eos-threshold <f>` | `-4.0` | End-of-speech threshold; lower cuts off later |
 | `--threads <n>` | `0` | Thread budget (`0` = half the cores) |
 | `--models-dir <dir>` | `<exe dir>\models` | ONNX model directory |
 | `--voices-dir <dir>` | `<exe dir>\voices` | Voice sample directory |
@@ -203,7 +205,20 @@ speak.exe
 Playback does not know or care which source it is draining, so the orb, the WAV
 saving and the timing all behave identically on both paths.
 
-Two details worth knowing:
+### Don't clip the last word
+
+Two independent things clip the tail of an utterance, and both are handled here:
+
+- **The model stops too early.** With upstream's automatic setting, generation
+  ends while the final consonant is still sounding — measured over the last 50 ms
+  of "…is instant": `-29.8 dB` of residual energy, i.e. audio cut mid-sound. The
+  default here is `--eos-extra 4`, which brings that to `-64.3 dB`, a real decay
+  into silence, for ~160 ms more audio. Raise it further if you still hear clipping.
+- **Playback stops too early.** The device used to stop the instant the last
+  sample was consumed, which cuts whatever the audio engine had not pushed out
+  yet. Playback now appends 250 ms of silence and drains that before stopping.
+
+Two more details worth knowing:
 
 - The orb is driven by `frames_written - GetCurrentPadding()`, i.e. the frame the
   speakers are actually on. Driving it from the generator instead would make it
