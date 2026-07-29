@@ -1,0 +1,16 @@
+# build output
+.build/
+speak.exe
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+
+# fetched weights (~200 MB) — get them with get-models.ps1
+models/
+
+# voice samples and generated audio
+voices/
+*.wav
+*.bmp
