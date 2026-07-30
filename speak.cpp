@@ -712,6 +712,7 @@ struct Options {
     int    eos_extra   = 4;      // upstream default (-1, auto) clips the last word
     int    threads     = 0;
     int    port        = kDefaultPort;
+    int    keepalive   = 60;     // daemon: seconds between warm-up nudges, 0 = off
 };
 
 pocket_tts::Config BuildConfig(const Options& opt) {
@@ -786,6 +787,25 @@ int RunDaemon(const Options& opt) {
 
         pocket_tts::TTSServer server(tts, opt.port);
         if (!server.start()) return 1;
+
+        // Keepalive: an idle daemon gets slow again (CPU clocks down, its working
+        // set gets paged out), turning ~100 ms calls into ~500 ms ones. So nudge
+        // it periodically with a throwaway word. This goes through our own HTTP
+        // endpoint rather than calling the engine directly, so the server
+        // serializes it against real requests instead of racing them.
+        if (opt.keepalive > 0) {
+            std::thread([opt] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(opt.keepalive));
+                    std::string err;
+                    auto src = DaemonSource::Post(opt.port, "Ok.", opt.voice, 500, &err);
+                    if (!src) continue;
+                    std::vector<float> discard;
+                    while (src->Next(&discard)) {}
+                }
+            }).detach();
+        }
+
         server.run();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "speak: daemon failed: %s\n", e.what());
@@ -800,7 +820,8 @@ bool SpawnDaemon(const Options& opt) {
                       " --voice \"" + opt.voice + "\"" +
                       " --models-dir \"" + opt.models_dir + "\"" +
                       " --voices-dir \"" + opt.voices_dir + "\"" +
-                      " --eos-extra " + std::to_string(opt.eos_extra);
+                      " --eos-extra " + std::to_string(opt.eos_extra) +
+                      " --keepalive " + std::to_string(opt.keepalive);
     if (opt.threads) cmd += " --threads " + std::to_string(opt.threads);
 
     std::wstring wcmd = Wide(cmd);
@@ -859,6 +880,9 @@ void Usage() {
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
+        "  --keepalive <sec>     daemon: nudge itself every N seconds so it stays\n"
+        "                        fast when idle (default 60)\n"
+        "  --no-keepalive        daemon: let it go cold between calls\n"
         "  --local               never use the daemon; synthesize in-process\n"
         "  --no-auto-serve       do not start a daemon in the background\n"
         "  --timing              report time to first audio\n"
@@ -903,6 +927,8 @@ int main() {
         else if (a == "--voices-dir")  opt.voices_dir = next("--voices-dir");
         else if (a == "--temperature") opt.temperature = std::strtof(next("--temperature").c_str(), nullptr);
         else if (a == "--eos-extra")   opt.eos_extra = std::atoi(next("--eos-extra").c_str());
+        else if (a == "--keepalive")   opt.keepalive = std::atoi(next("--keepalive").c_str());
+        else if (a == "--no-keepalive") opt.keepalive = 0;
         else if (a == "--eos-threshold") opt.eos_threshold = std::strtof(next("--eos-threshold").c_str(), nullptr);
         else if (a == "--threads")     opt.threads = std::atoi(next("--threads").c_str());
         else if (a == "--port")        opt.port = std::atoi(next("--port").c_str());

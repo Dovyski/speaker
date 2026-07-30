@@ -105,6 +105,8 @@ speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 | `--serve` | — | Run as the resident daemon (see below) |
 | `--status` / `--stop` | — | Inspect or stop the daemon |
 | `--port <n>` | `8123` | Daemon port |
+| `--keepalive <sec>` | `60` | Daemon: nudge itself every N seconds so it stays fast when idle |
+| `--no-keepalive` | — | Daemon: let it go cold between calls |
 | `--local` | — | Never use the daemon; always synthesize in-process |
 | `--no-auto-serve` | — | Do not start a daemon in the background on a cold call |
 | `--temperature <f>` | `0.7` | Sampling temperature |
@@ -151,9 +153,9 @@ command to hearing the first sample:
 | | first audio |
 |---|---|
 | cold, in-process (`--local`) | ~5 700 ms |
-| **warm, via daemon** | **~80 ms** |
+| **warm, via daemon** | **~100 ms** |
 
-Roughly 70× less latency. Three things get it that low:
+Roughly 55× less latency. Three things get it that low:
 
 - The daemon calls `warmup()` **and** synthesizes one throwaway phrase with the
   default voice at startup, so ONNX kernels and the voice's KV state are already
@@ -176,6 +178,18 @@ and it dies when that job is cleaned up. Auto-spawned daemons use
 
 The daemon is a single instance per port, guarded by a named mutex, so extra
 `--serve` calls exit harmlessly.
+
+### Keepalive
+
+An *idle* daemon gets slow again — the CPU clocks down and its working set gets
+paged out, so the first call after a few quiet minutes measured 350–660 ms
+instead of ~100 ms. Text length is not the factor here; idleness is.
+
+So the daemon nudges itself with a throwaway word every 60 s (`--keepalive <sec>`,
+`--no-keepalive` to turn it off). The nudge goes through the daemon's own HTTP
+endpoint rather than calling the engine directly, so the server serializes it
+against real requests instead of racing them. Each tick costs a fraction of a
+second of CPU, and shows up in the daemon's log as a normal `POST /tts`.
 
 ## Performance
 
