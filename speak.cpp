@@ -190,7 +190,7 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade
     const float R0         = S * 0.29f * (1.f + 0.09f * level);
     // Grows superlinearly with the voice: barely rippling when quiet, properly
     // turbulent when loud, and exactly 0 — a true circle — in silence.
-    const float wobble     = (0.085f + 0.13f * voice) * voice * R0;
+    const float wobble     = (0.095f + 0.19f * voice) * voice * R0;
     const float churn      = time * (1.f + 1.1f * voice);   // faster when loud
     const float spin       = time * 0.55f;           // the outline orbits
     const float rotation   = time * 0.33f;           // the colours drift round
@@ -704,7 +704,7 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
     uint64_t           written = 0;
     std::vector<float> chunk;
     size_t             chunk_pos = 0;
-    bool               source_done = false, started = false;
+    bool               source_done = false, started = false, chunk_is_tail = false;
 
     while (true) {
         UINT32 padding = 0;
@@ -726,7 +726,8 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
             } else {
                 // Follow the last sample with silence, so the device drains the
                 // real tail instead of stopping on top of it.
-                source_done = true;
+                source_done   = true;
+                chunk_is_tail = true;
                 chunk.assign(kTailSilenceFrames, 0.f);
             }
         }
@@ -742,7 +743,9 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
                     render->ReleaseBuffer(n, 0);
                     written   += n;
                     chunk_pos += n;
-                    if (!started) {
+                    // Only real samples count as having spoken — the trailing
+                    // silence must not make an empty synthesis look successful.
+                    if (!started && !chunk_is_tail) {
                         started = true;
                         if (first_audio_ms) *first_audio_ms = MsSinceStart();
                     }
@@ -1191,8 +1194,13 @@ int main() {
     engine.reset();
     CoUninitialize();
 
-    if (!ok && !engine_error.empty()) {
-        std::fprintf(stderr, "speak: synthesis failed: %s\n", engine_error.c_str());
+    if (!ok) {
+        if (!engine_error.empty()) {
+            std::fprintf(stderr, "speak: synthesis failed: %s\n", engine_error.c_str());
+        } else {
+            std::fprintf(stderr, "speak: no audio was produced (voice '%s')\n",
+                         opt.voice.c_str());
+        }
     }
     if (opt.timing) {
         std::fprintf(stderr, "speak: first audio in %.0f ms (%s)\n", first_audio_ms,

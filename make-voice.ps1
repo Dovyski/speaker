@@ -16,7 +16,10 @@ param(
     [Parameter(Mandatory, Position = 0)][string] $Out,
     [Parameter(Mandatory, ValueFromRemainingArguments)][string[]] $Clips,
     [int] $MaxSeconds = 30,
-    [double] $GapSeconds = 0.25
+    [double] $GapSeconds = 0.25,
+    # FFT denoiser, for source clips with background hiss. Helps with steady
+    # noise; it cannot remove music or another voice.
+    [switch] $Denoise
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,12 +40,13 @@ try {
 
         # 24 kHz mono, silence trimmed at both ends, loudness-normalized so clips
         # recorded at different levels do not fight each other.
-        $filter = @(
-            'areverse,silenceremove=start_periods=1:start_silence=0.05:start_threshold=-50dB'
-            'areverse,silenceremove=start_periods=1:start_silence=0.05:start_threshold=-50dB'
-            'loudnorm=I=-20:TP=-2:LRA=7'
-            'aresample=24000'
-        ) -join ','
+        $steps = @()
+        if ($Denoise) { $steps += 'afftdn=nf=-25' }
+        $steps += 'areverse,silenceremove=start_periods=1:start_silence=0.05:start_threshold=-50dB'
+        $steps += 'areverse,silenceremove=start_periods=1:start_silence=0.05:start_threshold=-50dB'
+        $steps += 'loudnorm=I=-20:TP=-2:LRA=7'
+        $steps += 'aresample=24000'
+        $filter = $steps -join ','
 
         & ffmpeg -y -v error -i $clip -ac 1 -af $filter -c:a pcm_f32le $part
         if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed on $clip" }
