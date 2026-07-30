@@ -163,9 +163,19 @@ Roughly 70× less latency. Three things get it that low:
 - `onnxruntime.dll` (14 MB) is **delay-loaded**, so the client process never maps
   the inference library at all — worth ~30 ms of the budget on its own.
 
-To have it always warm, run `speak.exe --serve` at login — e.g. drop a shortcut
-to it in `shell:startup`. The daemon is a single instance per port, guarded by a
-named mutex, so extra `--serve` calls exit harmlessly.
+Start the daemon detached, so it is not tied to whatever shell launched it:
+
+```powershell
+Start-Process -FilePath .\speak.exe -ArgumentList '--serve' -WindowStyle Hidden
+```
+
+`--serve` never returns — it *is* the server — so a job-controlled background
+launch (`speak.exe --serve &`, or an agent's background task) keeps it attached
+and it dies when that job is cleaned up. Auto-spawned daemons use
+`DETACHED_PROCESS` and are immune to this.
+
+The daemon is a single instance per port, guarded by a named mutex, so extra
+`--serve` calls exit harmlessly.
 
 ## Performance
 
