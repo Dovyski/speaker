@@ -4,7 +4,7 @@ A single, self-contained Windows binary that speaks text out loud and shows a
 glowing orb on screen while it talks.
 
 <p align="center">
-  <img src="docs/orb.png" width="180" alt="the orb, pulsing with the voice">
+  <img src="docs/orb-strip.png" width="640" alt="the orb, wobbling and pulsing with the voice">
 </p>
 
 No Python. No server to start. No `ffplay` to pipe into. One `speak.exe` (plus
@@ -14,7 +14,7 @@ click-through overlay in the corner of the screen in time with the voice.
 
 ```
 speak.exe --serve             &:: once: resident daemon holding the model
-speak.exe "Hello world."      &:: ~80 ms to first audio
+speak.exe "Hello world."      &:: ~100 ms to first audio
 ```
 
 ## Why
@@ -32,9 +32,9 @@ of what the speakers are playing right now, and fades out when the audio drains.
 ## Features
 
 - **One binary** — inference, playback, daemon and UI in a single `speak.exe`
-- **~80 ms to first audio** with the resident daemon (vs ~5.7 s loading per call)
+- **~100 ms to first audio** with the resident daemon (vs ~5.7 s loading per call)
 - **No Python at build time or run time** — pre-exported ONNX weights, fetched by a script
-- **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice
+- **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Audio-reactive orb** — per-pixel-alpha layered window, click-through, always on top, parked above the taskbar
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
@@ -85,6 +85,18 @@ Point at it with `--voice alba.wav` (or pass an absolute path to any file).
 The default is `alba.wav`. First use of a voice costs a few hundred ms of
 conditioning; after that it is cached in `voices/.cache/` and reloads in ~4 ms.
 
+**Several short recordings?** The engine conditions on one file (and uses at most
+30 s of it), so join them first:
+
+```powershell
+pwsh -File make-voice.ps1 -Out voices/mine.wav take1.wav take2.m4a take3.mp3
+```
+
+That resamples each clip to 24 kHz mono, trims leading/trailing silence,
+loudness-normalizes them so takes recorded at different levels do not fight each
+other, joins them with a 0.25 s gap, and caps the result at 30 s. Aim for at
+least ~5 s of speech in total; more and cleaner beats longer and noisier.
+
 ## Usage
 
 ```bat
@@ -100,7 +112,10 @@ speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 | `--voice <name\|path>` | `alba.wav` | Voice sample; bare names resolve inside `--voices-dir` |
 | `--save <file.wav>` | — | Also write the audio to a 32-bit float WAV |
 | `--no-orb` | — | Skip the on-screen indicator |
+| `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
+| `--orb-size <px>` | `220` | Square size of the overlay |
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
+| `--orb-preview <prefix>` | — | Render a strip of frames across time and loudness, and exit |
 | `--timing` | — | Report milliseconds to first audio, and which path served it |
 | `--serve` | — | Run as the resident daemon (see below) |
 | `--status` / `--stop` | — | Inspect or stop the daemon |
@@ -228,6 +243,30 @@ speak.exe
 
 Playback does not know or care which source it is draining, so the orb, the WAV
 saving and the timing all behave identically on both paths.
+
+### The orb
+
+No image files or animation assets: every frame is rasterized from math into a
+premultiplied-BGRA buffer and pushed to the layered window at ~60 fps. The
+default `aurora` style is a luminous ring —
+
+```
+per angle θ:  R(θ) = R₀ + wobble·(sin(3θ + 1.1t) + 0.62·sin(5θ − 0.8t) + 0.45·sin(2θ + 0.47t))
+              colour(θ) = ember → white → azure → cyan, rotating with t
+per pixel:    dr   = distance − R(θ)
+              rim  = gauss(|dr| / 1.7)      ← thin white-hot line
+              glow = gauss(|dr| / 8.5)      ← wide coloured halo
+              bleed= gauss(−dr / 0.5R)      ← light leaking inward (dr < 0 only)
+```
+
+Loudness drives radius, wobble amplitude and brightness; three out-of-phase
+harmonics keep the outline from looking machine-drawn. Per-pixel polar
+coordinates and the Gaussian falloff are precomputed into lookup tables, so a
+frame is table reads and a few multiplies — cheap enough to ignore.
+
+`--orb-preview <prefix>` writes a strip of frames across time and loudness, which
+is how the image at the top of this README was made. Handy because the overlay is
+invisible to GDI screen capture (see below).
 
 ### Don't clip the last word
 

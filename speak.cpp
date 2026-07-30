@@ -72,12 +72,25 @@ double MsSinceStart() {
 
 // ── Orb overlay ─────────────────────────────────────────────────────────────
 
-constexpr int kOrbSize = 180;
+constexpr float kPi = 3.14159265358979f;
+
+int g_orb_size = 220;
+
+enum class OrbStyle { Aurora, Dot };
+OrbStyle g_orb_style = OrbStyle::Aurora;
 
 struct Rgb { float r, g, b; };
+
+// "dot" style: the original solid core plus halo
 constexpr Rgb kCoreIn  {1.00f, 0.86f, 0.78f};   // hot centre
 constexpr Rgb kCoreOut {0.85f, 0.42f, 0.26f};   // core rim
 constexpr Rgb kGlow    {0.88f, 0.48f, 0.31f};   // outer halo
+
+// "aurora" style: a luminous rim whose colours travel around the ring
+constexpr Rgb kEmber {1.00f, 0.30f, 0.13f};     // red-orange
+constexpr Rgb kHot   {1.00f, 0.96f, 0.93f};     // white-hot
+constexpr Rgb kAzure {0.16f, 0.52f, 1.00f};     // blue
+constexpr Rgb kCyan  {0.36f, 0.86f, 1.00f};     // cyan
 
 float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
@@ -86,20 +99,135 @@ float SmoothStep(float edge0, float edge1, float x) {
     return t * t * (3.f - 2.f * t);
 }
 
+Rgb Mix(const Rgb& a, const Rgb& b, float t) {
+    return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t};
+}
+
+// Colour around the rim, u in 0..1. Ember and azure sit opposite each other with
+// white-hot arcs between them, which is what gives the ring its two-tone look.
+Rgb RimColour(float u) {
+    static const Rgb stops[] = {
+        kEmber, Mix(kEmber, kHot, 0.45f), kHot, kAzure, kCyan, Mix(kAzure, kHot, 0.35f),
+    };
+    constexpr int n = static_cast<int>(sizeof(stops) / sizeof(stops[0]));
+    const float x  = u * n;
+    const int   i0 = static_cast<int>(x) % n;
+    float       t  = x - std::floor(x);
+    t = t * t * (3.f - 2.f * t);                 // ease the hand-off between stops
+    return Mix(stops[i0], stops[(i0 + 1) % n], t);
+}
+
+// Per-pixel polar coordinates never change, so they are computed once, together
+// with a lookup table for the Gaussian falloff used by the rim and its glow.
+struct OrbGeometry {
+    int                  size = 0;
+    std::vector<float>   dist;
+    std::vector<int16_t> angle;
+    std::vector<float>   gauss;
+
+    static constexpr int kAngles   = 512;
+    static constexpr int kGaussLut = 512;
+
+    void Ensure(int s) {
+        if (gauss.empty()) {
+            gauss.resize(kGaussLut);
+            for (int i = 0; i < kGaussLut; ++i) {
+                const float x = 4.f * i / (kGaussLut - 1);
+                gauss[i] = std::exp(-x * x);
+            }
+        }
+        if (size == s) return;
+        size = s;
+        dist.resize(static_cast<size_t>(s) * s);
+        angle.resize(static_cast<size_t>(s) * s);
+        const float c = s * 0.5f;
+        for (int y = 0; y < s; ++y) {
+            for (int x = 0; x < s; ++x) {
+                const float dx = x + 0.5f - c, dy = y + 0.5f - c;
+                const size_t i = static_cast<size_t>(y) * s + x;
+                dist[i] = std::sqrt(dx * dx + dy * dy);
+                float a = std::atan2(dy, dx) / (2 * kPi);
+                if (a < 0.f) a += 1.f;
+                angle[i] = static_cast<int16_t>(
+                    std::min(kAngles - 1, static_cast<int>(a * kAngles)));
+            }
+        }
+    }
+
+    float Gauss(float x) const {   // x >= 0
+        if (x >= 4.f) return 0.f;
+        return gauss[static_cast<int>(x * (kGaussLut - 1) / 4.f)];
+    }
+};
+
+OrbGeometry g_geom;
+
 LRESULT CALLBACK OrbWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// Composes one frame of the orb into a premultiplied-alpha BGRA buffer.
-// `level` is 0..1 loudness, `fade` is 0..1 opacity.
-void ComposeOrb(uint32_t* pixels, float level, float fade) {
-    const float cx = kOrbSize * 0.5f, cy = kOrbSize * 0.5f;
+// Writes one premultiplied-alpha BGRA pixel.
+inline uint32_t Pack(const Rgb& c, float a) {
+    const auto ch = [a](float v) {
+        return static_cast<uint32_t>(Clamp01(v) * a * 255.f + 0.5f);
+    };
+    return (static_cast<uint32_t>(a * 255.f + 0.5f) << 24) |
+           (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b);
+}
+
+// "aurora": a luminous, slightly irregular ring. The rim is a thin white-hot
+// line riding on a wide coloured glow, the radius wobbles organically, and the
+// colours rotate around the circle. Loudness drives size, wobble and brightness.
+void ComposeAurora(uint32_t* pixels, int S, float level, float fade, float time) {
+    g_geom.Ensure(S);
+
+    const float R0         = S * 0.29f * (1.f + 0.09f * level);
+    const float wobble     = (0.045f + 0.05f * level) * R0;
+    const float rotation   = time * 0.28f;
+    const float rim_sigma  = 1.7f + 1.0f * level;    // the hot line itself
+    const float glow_sigma = 8.5f + 7.0f * level;    // coloured halo either side
+    const float gain       = 0.72f + 0.45f * level;
+
+    static std::vector<float> radius;
+    static std::vector<Rgb>   colour;
+    radius.resize(OrbGeometry::kAngles);
+    colour.resize(OrbGeometry::kAngles);
+    for (int a = 0; a < OrbGeometry::kAngles; ++a) {
+        const float th = 2 * kPi * a / OrbGeometry::kAngles;
+        // Three out-of-phase harmonics: circular enough to read as a ring,
+        // irregular enough not to look machine-drawn.
+        radius[a] = R0 + wobble * 0.6f * (std::sin(3 * th + 1.10f * time) +
+                                          0.62f * std::sin(5 * th - 0.80f * time) +
+                                          0.45f * std::sin(2 * th + 0.47f * time));
+        colour[a] = RimColour(std::fmod((th - rotation) / (2 * kPi) + 2.f, 1.f));
+    }
+
+    const size_t n = static_cast<size_t>(S) * S;
+    for (size_t i = 0; i < n; ++i) {
+        const float d  = g_geom.dist[i];
+        const float R  = radius[g_geom.angle[i]];
+        const float dr = d - R;
+
+        const float rim  = g_geom.Gauss(std::fabs(dr) / rim_sigma);
+        const float glow = 0.62f * g_geom.Gauss(std::fabs(dr) / glow_sigma);
+        // Light bleeding inward, so the inside is tinted rather than empty.
+        const float bleed = dr < 0.f ? 0.20f * g_geom.Gauss(-dr / (0.5f * R)) : 0.f;
+
+        float alpha = Clamp01((rim + glow + bleed) * gain);
+        if (alpha <= 0.004f) { pixels[i] = 0; continue; }
+        pixels[i] = Pack(Mix(colour[g_geom.angle[i]], kHot, 0.85f * rim), alpha * fade);
+    }
+}
+
+// "dot": the original solid core with a soft halo.
+void ComposeDot(uint32_t* pixels, int S, float level, float fade) {
+    const float cx = S * 0.5f, cy = S * 0.5f;
     const float r  = 20.f + 12.f * level;              // solid core radius
     const float R  = r + 34.f + 22.f * level;          // halo radius
 
-    for (int y = 0; y < kOrbSize; ++y) {
-        for (int x = 0; x < kOrbSize; ++x) {
+    for (int y = 0; y < S; ++y) {
+        for (int x = 0; x < S; ++x) {
             const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
             const float d  = std::sqrt(dx * dx + dy * dy);
 
@@ -109,27 +237,24 @@ void ComposeOrb(uint32_t* pixels, float level, float fade) {
                 const float u = 1.f - (d - r) / (R - r);
                 halo = 0.55f * u * u * u;
             }
-            float a = Clamp01(core + (1.f - core) * halo);
-            if (a <= 0.f) { pixels[y * kOrbSize + x] = 0; continue; }
+            const float a = Clamp01(core + (1.f - core) * halo);
+            if (a <= 0.f) { pixels[y * S + x] = 0; continue; }
 
             // core: hot centre → rim, then rim → halo colour outside the core
             const float t = std::min(1.f, d / std::max(r, 1.f));
-            Rgb c{kCoreIn.r + (kCoreOut.r - kCoreIn.r) * t,
-                  kCoreIn.g + (kCoreOut.g - kCoreIn.g) * t,
-                  kCoreIn.b + (kCoreOut.b - kCoreIn.b) * t};
-            if (core < 1.f) {
-                const float m = 1.f - core;
-                c = {c.r + (kGlow.r - c.r) * m, c.g + (kGlow.g - c.g) * m,
-                     c.b + (kGlow.b - c.b) * m};
-            }
+            Rgb c = Mix(kCoreIn, kCoreOut, t);
+            if (core < 1.f) c = Mix(c, kGlow, 1.f - core);
 
-            a *= fade;
-            const auto ch = [a](float v) {
-                return static_cast<uint32_t>(Clamp01(v) * a * 255.f + 0.5f);
-            };
-            pixels[y * kOrbSize + x] = (static_cast<uint32_t>(a * 255.f + 0.5f) << 24) |
-                                       (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b);
+            pixels[y * S + x] = Pack(c, a * fade);
         }
+    }
+}
+
+void ComposeOrb(uint32_t* pixels, float level, float fade, float time) {
+    if (g_orb_style == OrbStyle::Aurora) {
+        ComposeAurora(pixels, g_orb_size, level, fade, time);
+    } else {
+        ComposeDot(pixels, g_orb_size, level, fade);
     }
 }
 
@@ -138,8 +263,8 @@ void ComposeOrb(uint32_t* pixels, float level, float fade) {
 void PushOrb(HWND hwnd, HDC mem_dc) {
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    POINT pos{work.right - kOrbSize - 24, work.bottom - kOrbSize - 24};
-    SIZE  size{kOrbSize, kOrbSize};
+    POINT pos{work.right - g_orb_size - 24, work.bottom - g_orb_size - 24};
+    SIZE  size{g_orb_size, g_orb_size};
     POINT src{0, 0};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(hwnd, nullptr, &pos, &size, mem_dc, &src, 0, &blend,
@@ -159,7 +284,7 @@ void OrbThread() {
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
             WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"", WS_POPUP, 0, 0, kOrbSize, kOrbSize, nullptr,
+        wc.lpszClassName, L"", WS_POPUP, 0, 0, g_orb_size, g_orb_size, nullptr,
         nullptr, wc.hInstance, nullptr);
     if (!hwnd) return;
 
@@ -167,8 +292,8 @@ void OrbThread() {
     HDC mem_dc = CreateCompatibleDC(screen);
     BITMAPINFO bi{};
     bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = kOrbSize;
-    bi.bmiHeader.biHeight      = -kOrbSize;   // top-down
+    bi.bmiHeader.biWidth       = g_orb_size;
+    bi.bmiHeader.biHeight      = -g_orb_size;   // top-down
     bi.bmiHeader.biPlanes      = 1;
     bi.bmiHeader.biBitCount    = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -204,7 +329,7 @@ void OrbThread() {
         fade += ((closing ? 0.f : 1.f) - fade) * (closing ? 0.12f : 0.22f);
         if (closing && fade < 0.01f) break;
 
-        ComposeOrb(pixels, level, fade);
+        ComposeOrb(pixels, level, fade, frame / 60.f);
         PushOrb(hwnd, mem_dc);
         Sleep(16);
     }
@@ -662,9 +787,9 @@ void WriteWav(const std::string& path, const std::vector<float>& samples) {
 
 // Renders a single orb frame to a 32-bit BMP, flattened over a dark backdrop.
 // Used to eyeball/regression-check the visuals without a screen recorder.
-void DumpOrbFrame(const std::string& path, float level) {
-    std::vector<uint32_t> px(kOrbSize * kOrbSize);
-    ComposeOrb(px.data(), level, 1.0f);
+void DumpOrbFrame(const std::string& path, float level, float time) {
+    std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
+    ComposeOrb(px.data(), level, 1.0f, time);
 
     const uint32_t data_bytes = static_cast<uint32_t>(px.size() * 4);
     BITMAPFILEHEADER fh{};
@@ -673,8 +798,8 @@ void DumpOrbFrame(const std::string& path, float level) {
     fh.bfSize    = fh.bfOffBits + data_bytes;
     BITMAPINFOHEADER ih{};
     ih.biSize     = sizeof(ih);
-    ih.biWidth    = kOrbSize;
-    ih.biHeight   = -kOrbSize;  // top-down
+    ih.biWidth    = g_orb_size;
+    ih.biHeight   = -g_orb_size;  // top-down
     ih.biPlanes   = 1;
     ih.biBitCount = 32;
 
@@ -703,6 +828,8 @@ struct Options {
     std::string save_path;
     std::string models_dir;
     std::string voices_dir;
+    std::string dump_orb;       // render one orb frame to this BMP and exit
+    std::string orb_preview;    // render a strip of orb frames to <prefix>N.bmp
     bool   show_orb    = true;
     bool   timing      = false;
     bool   auto_serve  = true;   // warm a daemon in the background on a cold call
@@ -879,7 +1006,10 @@ void Usage() {
         "  --voice <name|path>   voice sample (default: alba.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
+        "  --orb-style <s>       aurora (default) or dot\n"
+        "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
+        "  --orb-preview <pfx>   render a strip of orb frames and exit\n"
         "  --keepalive <sec>     daemon: nudge itself every N seconds so it stays\n"
         "                        fast when idle (default 60)\n"
         "  --no-keepalive        daemon: let it go cold between calls\n"
@@ -939,9 +1069,18 @@ int main() {
         else if (a == "--serve")       serve = true;
         else if (a == "--stop")        stop = true;
         else if (a == "--status")      status = true;
-        else if (a == "--dump-orb") {
-            DumpOrbFrame(next("--dump-orb"), 0.65f);
-            return 0;
+        else if (a == "--dump-orb")    opt.dump_orb = next("--dump-orb");
+        else if (a == "--orb-preview") opt.orb_preview = next("--orb-preview");
+        else if (a == "--orb-size")    g_orb_size = std::max(60, std::atoi(next("--orb-size").c_str()));
+        else if (a == "--orb-style") {
+            const std::string style = next("--orb-style");
+            if (style == "aurora")   g_orb_style = OrbStyle::Aurora;
+            else if (style == "dot") g_orb_style = OrbStyle::Dot;
+            else {
+                std::fprintf(stderr, "speak: unknown orb style '%s' (aurora|dot)\n",
+                             style.c_str());
+                return 2;
+            }
         }
         else if (a == "-h" || a == "--help") { Usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
@@ -954,6 +1093,22 @@ int main() {
     }
     LocalFree(wargv);
 
+    if (!opt.dump_orb.empty()) {
+        DumpOrbFrame(opt.dump_orb, 0.65f, 0.f);
+        return 0;
+    }
+    if (!opt.orb_preview.empty()) {
+        // A strip across time and loudness, to review the look without a capture.
+        constexpr int kFrames = 6;
+        for (int i = 0; i < kFrames; ++i) {
+            const float t = i * 0.7f;
+            const float l = 0.15f + 0.85f * std::fabs(std::sin(i * 0.9f));
+            DumpOrbFrame(opt.orb_preview + std::to_string(i) + ".bmp", l, t);
+        }
+        std::printf("wrote %d frames to %s0..%d.bmp\n", kFrames,
+                    opt.orb_preview.c_str(), kFrames - 1);
+        return 0;
+    }
     if (stop)   return StopDaemon(opt);
     if (status) return DaemonStatus(opt);
     if (serve)  return RunDaemon(opt);
