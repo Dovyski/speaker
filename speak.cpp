@@ -176,18 +176,36 @@ inline uint32_t Pack(const Rgb& c, float a) {
            (ch(c.r) << 16) | (ch(c.g) << 8) | ch(c.b);
 }
 
-// "aurora": a luminous, slightly irregular ring. The rim is a thin white-hot
-// line riding on a wide coloured glow, the radius wobbles organically, and the
-// colours rotate around the circle. Loudness drives size, wobble and brightness.
-void ComposeAurora(uint32_t* pixels, int S, float level, float fade, float time) {
+// "aurora": a luminous ring. The rim is a thin white-hot line riding on a wide
+// coloured glow, and the whole thing spins slowly.
+//
+// Two separate drives: `voice` is the actual audio envelope and is the only thing
+// that distorts the outline — silence means a perfect circle. `level` is voice or
+// the idle breath, whichever is larger, and drives size and brightness so the orb
+// still looks alive between words.
+void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade,
+                   float time) {
     g_geom.Ensure(S);
 
     const float R0         = S * 0.29f * (1.f + 0.09f * level);
-    const float wobble     = (0.045f + 0.05f * level) * R0;
-    const float rotation   = time * 0.28f;
+    // Grows superlinearly with the voice: barely rippling when quiet, properly
+    // turbulent when loud, and exactly 0 — a true circle — in silence.
+    const float wobble     = (0.085f + 0.13f * voice) * voice * R0;
+    const float churn      = time * (1.f + 1.1f * voice);   // faster when loud
+    const float spin       = time * 0.55f;           // the outline orbits
+    const float rotation   = time * 0.33f;           // the colours drift round
     const float rim_sigma  = 1.7f + 1.0f * level;    // the hot line itself
     const float glow_sigma = 8.5f + 7.0f * level;    // coloured halo either side
     const float gain       = 0.72f + 0.45f * level;
+
+    // Out-of-phase harmonics: circular enough to read as a ring, irregular enough
+    // not to look machine-drawn. The high ones are scaled by the voice, so loud
+    // passages get sharp kinks where quiet ones only get broad lobes. Amplitudes
+    // are normalized, otherwise they occasionally align and the ring turns into a
+    // star instead of a wobbling circle.
+    const float h1 = 1.00f, h2 = 0.62f, h3 = 0.45f;
+    const float h4 = 0.60f * voice, h5 = 0.f;   // 11θ dropped: reads as a starfish
+    const float norm = 1.f / (h1 + h2 + h3 + h4 + h5);
 
     static std::vector<float> radius;
     static std::vector<Rgb>   colour;
@@ -195,11 +213,13 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float fade, float time)
     colour.resize(OrbGeometry::kAngles);
     for (int a = 0; a < OrbGeometry::kAngles; ++a) {
         const float th = 2 * kPi * a / OrbGeometry::kAngles;
-        // Three out-of-phase harmonics: circular enough to read as a ring,
-        // irregular enough not to look machine-drawn.
-        radius[a] = R0 + wobble * 0.6f * (std::sin(3 * th + 1.10f * time) +
-                                          0.62f * std::sin(5 * th - 0.80f * time) +
-                                          0.45f * std::sin(2 * th + 0.47f * time));
+        const float ph = th - spin;   // harmonics ride the spin, so bumps travel
+        radius[a] = R0 + wobble * norm *
+                             (h1 * std::sin(3 * ph + 1.10f * churn) +
+                              h2 * std::sin(5 * ph - 0.80f * churn) +
+                              h3 * std::sin(2 * ph + 0.47f * churn) +
+                              h4 * std::sin(7 * ph + 1.90f * churn) +
+                              h5 * std::sin(11 * ph - 2.40f * churn));
         colour[a] = RimColour(std::fmod((th - rotation) / (2 * kPi) + 2.f, 1.f));
     }
 
@@ -250,9 +270,9 @@ void ComposeDot(uint32_t* pixels, int S, float level, float fade) {
     }
 }
 
-void ComposeOrb(uint32_t* pixels, float level, float fade, float time) {
+void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float time) {
     if (g_orb_style == OrbStyle::Aurora) {
-        ComposeAurora(pixels, g_orb_size, level, fade, time);
+        ComposeAurora(pixels, g_orb_size, level, voice, fade, time);
     } else {
         ComposeDot(pixels, g_orb_size, level, fade);
     }
@@ -304,7 +324,7 @@ void OrbThread() {
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
-    float level = 0.f, fade = 0.f;
+    float voice = 0.f, level = 0.f, fade = 0.f;
     bool  closing = false;
     for (int frame = 0;; ++frame) {
         MSG msg;
@@ -320,16 +340,21 @@ void OrbThread() {
             std::lock_guard<std::mutex> lock(g_env_mtx);
             if (idx < g_env.size()) target = g_env[idx];
         }
-        // Keep it alive between words with a slow breath.
+        // Voice: the audio envelope alone, so silence really is silence and the
+        // outline settles into a perfect circle. Decays a little slower than it
+        // rises, otherwise the ring snaps flat between syllables.
+        const float voice_target = Clamp01(target * 1.6f);
+        voice += (voice_target - voice) * (voice_target > voice ? 0.35f : 0.12f);
+
+        // Level: keep it alive between words with a slow breath.
         const float breath = 0.10f + 0.06f * std::sin(frame * 0.09f);
-        target = std::max(Clamp01(target * 1.6f), breath);
-        level += (target - level) * 0.35f;
+        level += (std::max(voice, breath) - level) * 0.35f;
 
         if (g_audio_done.load()) closing = true;
         fade += ((closing ? 0.f : 1.f) - fade) * (closing ? 0.12f : 0.22f);
         if (closing && fade < 0.01f) break;
 
-        ComposeOrb(pixels, level, fade, frame / 60.f);
+        ComposeOrb(pixels, level, voice, fade, frame / 60.f);
         PushOrb(hwnd, mem_dc);
         Sleep(16);
     }
@@ -787,9 +812,9 @@ void WriteWav(const std::string& path, const std::vector<float>& samples) {
 
 // Renders a single orb frame to a 32-bit BMP, flattened over a dark backdrop.
 // Used to eyeball/regression-check the visuals without a screen recorder.
-void DumpOrbFrame(const std::string& path, float level, float time) {
+void DumpOrbFrame(const std::string& path, float level, float voice, float time) {
     std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
-    ComposeOrb(px.data(), level, 1.0f, time);
+    ComposeOrb(px.data(), level, voice, 1.0f, time);
 
     const uint32_t data_bytes = static_cast<uint32_t>(px.size() * 4);
     BITMAPFILEHEADER fh{};
@@ -1094,16 +1119,19 @@ int main() {
     LocalFree(wargv);
 
     if (!opt.dump_orb.empty()) {
-        DumpOrbFrame(opt.dump_orb, 0.65f, 0.f);
+        DumpOrbFrame(opt.dump_orb, 0.65f, 0.65f, 0.f);
         return 0;
     }
     if (!opt.orb_preview.empty()) {
         // A strip across time and loudness, to review the look without a capture.
+        // Frame 0 is silence, so the "perfect circle when idle" case is visible.
         constexpr int kFrames = 6;
+        constexpr float kVoices[kFrames] = {0.f, 0.25f, 0.6f, 1.f, 0.55f, 0.f};
         for (int i = 0; i < kFrames; ++i) {
             const float t = i * 0.7f;
-            const float l = 0.15f + 0.85f * std::fabs(std::sin(i * 0.9f));
-            DumpOrbFrame(opt.orb_preview + std::to_string(i) + ".bmp", l, t);
+            const float v = kVoices[i];
+            DumpOrbFrame(opt.orb_preview + std::to_string(i) + ".bmp",
+                         std::max(v, 0.13f), v, t);
         }
         std::printf("wrote %d frames to %s0..%d.bmp\n", kFrames,
                     opt.orb_preview.c_str(), kFrames - 1);

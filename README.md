@@ -4,8 +4,9 @@ A single, self-contained Windows binary that speaks text out loud and shows a
 glowing orb on screen while it talks.
 
 <p align="center">
-  <img src="docs/orb-strip.png" width="640" alt="the orb, wobbling and pulsing with the voice">
+  <img src="docs/orb-strip.png" width="640" alt="the orb: a circle in silence, churning while speaking, circle again">
 </p>
+<p align="center"><em>silent → speaking → loud → silent</em></p>
 
 No Python. No server to start. No `ffplay` to pipe into. One `speak.exe` (plus
 `onnxruntime.dll`) that loads the [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
@@ -251,7 +252,9 @@ premultiplied-BGRA buffer and pushed to the layered window at ~60 fps. The
 default `aurora` style is a luminous ring —
 
 ```
-per angle θ:  R(θ) = R₀ + wobble·(sin(3θ + 1.1t) + 0.62·sin(5θ − 0.8t) + 0.45·sin(2θ + 0.47t))
+φ = θ − spin                                       ← the whole outline orbits
+per angle θ:  R(θ) = R₀ + wobble·norm·( sin(3φ + 1.1c) + 0.62·sin(5φ − 0.8c)
+                                      + 0.45·sin(2φ + 0.47c) + 0.6·voice·sin(7φ + 1.9c) )
               colour(θ) = ember → white → azure → cyan, rotating with t
 per pixel:    dr   = distance − R(θ)
               rim  = gauss(|dr| / 1.7)      ← thin white-hot line
@@ -259,10 +262,23 @@ per pixel:    dr   = distance − R(θ)
               bleed= gauss(−dr / 0.5R)      ← light leaking inward (dr < 0 only)
 ```
 
-Loudness drives radius, wobble amplitude and brightness; three out-of-phase
-harmonics keep the outline from looking machine-drawn. Per-pixel polar
-coordinates and the Gaussian falloff are precomputed into lookup tables, so a
-frame is table reads and a few multiplies — cheap enough to ignore.
+Two independent drives, which is what makes it read as *listening* rather than
+merely animated:
+
+- **`voice`** is the raw audio envelope and the only thing that distorts the
+  outline. `wobble = (0.085 + 0.13·voice)·voice·R₀`, so it grows superlinearly
+  while talking and is exactly **zero in silence — a true circle**. The 7φ
+  harmonic is scaled by `voice` too, so loud passages get sharp kinks where quiet
+  ones only get broad lobes, and `c` (churn) runs the phases faster when loud.
+  Amplitudes are normalized, otherwise the harmonics occasionally align and the
+  ring turns into a starfish.
+- **`level`** is `voice` or a slow idle breath, whichever is larger, and drives
+  size and brightness — so a quiet orb still looks alive.
+
+`voice` also decays slower than it rises (0.12 vs 0.35), otherwise the ring snaps
+flat between syllables. Per-pixel polar coordinates and the Gaussian falloff are
+precomputed into lookup tables, so a frame is table reads and a few multiplies —
+cheap enough to ignore.
 
 `--orb-preview <prefix>` writes a strip of frames across time and loudness, which
 is how the image at the top of this README was made. Handy because the overlay is
