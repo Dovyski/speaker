@@ -979,14 +979,78 @@ void DumpOrbFrame(const std::string& path, float level, float voice, float time,
 
 int g_point_size = 320;
 
-constexpr float kRingLife  = 1.90f;   // seconds one ring takes to expand and die
-constexpr float kRingGap   = 0.80f;   // seconds between successive rings
+// How long a ring lives, and how long after it the next one is born. Tunable at
+// runtime (--point-duration) so the gesture can be paced without a rebuild; the
+// two keep their ratio, since that is what makes the rings read as a sequence
+// rather than as one thick pulse.
+constexpr float kRingLife = 1.90f;
+constexpr float kRingGap  = 0.80f;
 
-float PointerDuration(int pulses) {
-    return (std::max(1, pulses) - 1) * kRingGap + kRingLife;
+float g_ring_life = kRingLife;
+float g_ring_gap  = kRingGap;
+
+// The one colour the pointer is built from: rings are born white-hot and settle
+// into it as they expand, and the core dot's halo takes it too. Ember by default,
+// so pointing looks like the rest of the app — set it to say something else
+// ("red" for a problem, say) without touching the code.
+Rgb g_point_colour = kEmber;
+
+// #rrggbb, rrggbb, r,g,b in 0..255, or one of a few names.
+bool ParseColour(const std::string& text, Rgb* out) {
+    std::string s;
+    for (char c : text) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    if (s.empty()) return false;
+
+    static const struct { const char* name; Rgb rgb; } kNames[] = {
+        {"ember",   kEmber},                   {"red",     {1.00f, 0.14f, 0.10f}},
+        {"orange",  {1.00f, 0.48f, 0.05f}},    {"amber",   {1.00f, 0.72f, 0.12f}},
+        {"yellow",  {1.00f, 0.90f, 0.20f}},    {"green",   {0.24f, 0.90f, 0.36f}},
+        {"cyan",    kCyan},                    {"azure",   kAzure},
+        {"blue",    {0.20f, 0.40f, 1.00f}},    {"violet",  {0.62f, 0.36f, 1.00f}},
+        {"magenta", {1.00f, 0.24f, 0.72f}},    {"pink",    {1.00f, 0.45f, 0.70f}},
+        {"white",   kHot},                     {"steel",   kSteel},
+    };
+    for (const auto& n : kNames) {
+        if (s == n.name) { *out = n.rgb; return true; }
+    }
+
+    if (s.find(',') != std::string::npos) {
+        int v[3]{};
+        if (std::sscanf(s.c_str(), "%d,%d,%d", &v[0], &v[1], &v[2]) != 3) return false;
+        *out = {Clamp01(v[0] / 255.f), Clamp01(v[1] / 255.f), Clamp01(v[2] / 255.f)};
+        return true;
+    }
+
+    if (s[0] == '#') s.erase(0, 1);
+    if (s.size() != 6 || s.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        return false;
+    }
+    const auto byte = [&](size_t i) {
+        return static_cast<float>(std::stoi(s.substr(i, 2), nullptr, 16)) / 255.f;
+    };
+    *out = {byte(0), byte(2), byte(4)};
+    return true;
 }
 
-// One frame: `pulses` rings born kRingGap apart, each expanding out of the
+float PointerDuration(int pulses) {
+    return (std::max(1, pulses) - 1) * g_ring_gap + g_ring_life;
+}
+
+// Stretches or compresses the animation to `total` seconds for this many pulses.
+void SetPointerDuration(float total, int pulses) {
+    if (total <= 0.f) return;
+    g_ring_life = kRingLife;
+    g_ring_gap  = kRingGap;
+    const float scale = std::min(20.f, std::max(0.05f, total / PointerDuration(pulses)));
+    g_ring_life *= scale;
+    g_ring_gap  *= scale;
+}
+
+// One frame: `pulses` rings born g_ring_gap apart, each expanding out of the
 // centre and thinning as it goes, over a hot core that marks the exact spot.
 // Perfectly circular by design — this is a pointer, not a voice.
 void ComposePointer(uint32_t* px, int S, float t, int pulses) {
@@ -1004,7 +1068,7 @@ void ComposePointer(uint32_t* px, int S, float t, int pulses) {
     // Core: brightest as each ring is born, so the spot itself keeps blinking.
     float core = 0.f;
     for (int i = 0; i < pulses; ++i) {
-        const float u = (t - i * kRingGap) / kRingLife;
+        const float u = (t - i * g_ring_gap) / g_ring_life;
         if (u < 0.f || u > 1.f) continue;
         core = std::max(core, (1.f - u) * (1.f - u));
     }
@@ -1018,20 +1082,22 @@ void ComposePointer(uint32_t* px, int S, float t, int pulses) {
             const float glow = d > r ? 0.42f * std::pow(1.f - (d - r) / (halo - r), 3.f) : 0.f;
             const float a = Clamp01(dot + (1.f - dot) * glow) * core * fade;
             if (a <= 0.004f) continue;
-            px[i] = BlendOver(Pack(Mix(kHot, kEmber, 1.f - dot), a), px[i]);
+            px[i] = BlendOver(Pack(Mix(kHot, g_point_colour, 1.f - dot), a), px[i]);
         }
     }
 
     // Rings, oldest (widest) first so the newest one reads on top.
     for (int i = 0; i < pulses; ++i) {
-        const float u = (t - i * kRingGap) / kRingLife;
+        const float u = (t - i * g_ring_gap) / g_ring_life;
         if (u < 0.f || u > 1.f) continue;
 
         // Ease-out: leaves the centre fast, then coasts outward.
         const float R     = R_max * (0.05f + 0.95f * (1.f - std::pow(1.f - u, 2.2f)));
         const float sigma = 2.1f + 2.4f * u;
         const float gain  = std::pow(1.f - u, 1.4f) * fade;
-        const Rgb   col   = Mix(kHot, kEmber, SmoothStep(0.f, 0.85f, u));
+        // Takes the colour early — a ring that only tints once it is nearly gone
+        // reads as white whatever it was asked to be.
+        const Rgb   col   = Mix(kHot, g_point_colour, SmoothStep(0.f, 0.30f, u));
 
         // A thin bright line riding a wider glow, so the ring still reads over a
         // busy window instead of disappearing into the text behind it.
@@ -1042,7 +1108,7 @@ void ComposePointer(uint32_t* px, int S, float t, int pulses) {
             const float line = g_geom.Gauss(dr / sigma);
             const float a = Clamp01((line + 0.38f * g_geom.Gauss(dr / glow_sigma)) * gain);
             if (a <= 0.004f) continue;
-            px[j] = BlendOver(Pack(Mix(col, kHot, 0.7f * line), a), px[j]);
+            px[j] = BlendOver(Pack(Mix(col, kHot, 0.40f * line), a), px[j]);
         }
     }
 }
@@ -1263,7 +1329,21 @@ struct PointRequest {
     std::string title;
     int         pulses  = 3;
     int         size    = 0;      // 0 = g_point_size
+    float       duration = 0.f;   // 0 = the built-in pacing
+    bool        have_colour = false;
+    Rgb         colour{};         // only read when have_colour
 };
+
+// Applies a request's look — pacing and colour — and hands back the ring count.
+// Both the live overlay and --point-preview go through here, so a previewed frame
+// is the frame that would be drawn. Colour is reset rather than left behind: the
+// daemon serves many callers, and each gets the default unless it asks otherwise.
+int ApplyPointStyle(const PointRequest& req) {
+    const int pulses = std::max(1, req.pulses);
+    SetPointerDuration(req.duration, pulses);
+    g_point_colour = req.have_colour ? req.colour : kEmber;
+    return pulses;
+}
 
 // Resolves the request to a screen point. On failure fills `err` with something
 // the caller can act on, and `candidates` with the JSON list to choose from.
@@ -1336,8 +1416,8 @@ bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
 bool Point(const PointRequest& req, std::string* err, std::string* candidates) {
     POINT centre{};
     if (!ResolvePoint(req, &centre, err, candidates)) return false;
-    PointerOverlay(centre, req.size > 0 ? req.size : g_point_size,
-                   std::max(1, req.pulses));
+    const int pulses = ApplyPointStyle(req);
+    PointerOverlay(centre, req.size > 0 ? req.size : g_point_size, pulses);
     return true;
 }
 
@@ -1407,8 +1487,21 @@ void HandlePointRequest(SOCKET fd) {
         pr.have_at = true;
         pr.at = POINT{static_cast<LONG>(x), static_cast<LONG>(y)};
     }
-    if (JsonGetNumber(req.body, "pulses", &v)) pr.pulses = static_cast<int>(v);
-    if (JsonGetNumber(req.body, "size", &v))   pr.size   = static_cast<int>(v);
+    if (JsonGetNumber(req.body, "pulses", &v))   pr.pulses = static_cast<int>(v);
+    if (JsonGetNumber(req.body, "size", &v))     pr.size   = static_cast<int>(v);
+    if (JsonGetNumber(req.body, "duration", &v)) pr.duration = static_cast<float>(v);
+
+    std::string colour = pocket_tts::json_get_string(req.body, "color");
+    if (colour.empty()) colour = pocket_tts::json_get_string(req.body, "colour");
+    if (!colour.empty()) {
+        if (!ParseColour(colour, &pr.colour)) {
+            PointHttpRespond(fd, 400, "{\"ok\":false,\"error\":\"colour '" +
+                                          JsonEscape(colour) +
+                                          "' is not a name, #rrggbb or r,g,b\"}");
+            return;
+        }
+        pr.have_colour = true;
+    }
 
     if (!pr.have_at && !pr.hwnd && pr.title.empty()) {
         PointHttpRespond(fd, 400,
@@ -1687,7 +1780,12 @@ void Usage() {
         "  --hwnd <n>            point at this window handle\n"
         "  --at <x,y>            point at a screen position\n"
         "  --pulses <n>          rings to send out (default 3)\n"
-        "  --point-size <px>     pointer square size (default 320)\n"
+        "  --duration <s>        how long the whole gesture lasts, in seconds\n"
+        "                        (default 3.5 for 3 rings; the pacing scales)\n"
+        "  --color <c>           colour to build the rings from: a name (red,\n"
+        "                        amber, cyan, ...), #rrggbb, or r,g,b\n"
+        "  --size <px>           pointer square size (default 320)\n"
+        "                        (--point-* also works for these four)\n"
         "  --point-preview <pfx> render a strip of pointer frames and exit\n"
         "  --list-targets        list pointable windows as JSON and exit\n"
         "  --point-port <n>      daemon: pointing endpoint port (default port+1)\n"
@@ -1772,8 +1870,22 @@ int main() {
             opt.point_req.at = POINT{std::atol(v.c_str()), std::atol(v.c_str() + comma + 1)};
             opt.point = true;
         }
-        else if (a == "--pulses")      opt.point_req.pulses = std::max(1, std::atoi(next("--pulses").c_str()));
-        else if (a == "--point-size")  g_point_size = std::max(80, std::atoi(next("--point-size").c_str()));
+        else if (a == "--pulses" || a == "--point-pulses")
+            opt.point_req.pulses = std::max(1, std::atoi(next(a.c_str()).c_str()));
+        else if (a == "--duration" || a == "--point-duration")
+            opt.point_req.duration = std::strtof(next(a.c_str()).c_str(), nullptr);
+        else if (a == "--color" || a == "--colour" ||
+                 a == "--point-color" || a == "--point-colour") {
+            const std::string v = next(a.c_str());
+            if (!ParseColour(v, &opt.point_req.colour)) {
+                std::fprintf(stderr, "speak: '%s' is not a colour name, #rrggbb or r,g,b\n",
+                             v.c_str());
+                return 2;
+            }
+            opt.point_req.have_colour = true;
+        }
+        else if (a == "--size" || a == "--point-size")
+            g_point_size = std::max(80, std::atoi(next(a.c_str()).c_str()));
         else if (a == "--point-preview") opt.point_preview = next("--point-preview");
         else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
         else if (a == "--no-point-server") opt.point_server = false;
@@ -1825,7 +1937,7 @@ int main() {
         // ring leaving, then two rings in flight, then the tail.
         constexpr int kFrames = 8;
         const int  S = g_point_size;
-        const int  pulses = std::max(1, opt.point_req.pulses);
+        const int  pulses = ApplyPointStyle(opt.point_req);
         const float total = PointerDuration(pulses);
         for (int i = 0; i < kFrames; ++i) {
             std::vector<uint32_t> px(static_cast<size_t>(S) * S);

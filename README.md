@@ -132,7 +132,9 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--title <substr>` | — | Point at the window whose title contains this (implies `--point`) |
 | `--hwnd <n>` / `--at <x,y>` | — | Point at a window handle / a screen position (imply `--point`) |
 | `--pulses <n>` | `3` | Rings to send out |
-| `--point-size <px>` | `320` | Square size of the pointer overlay |
+| `--duration <s>` | `3.5` | Seconds the whole gesture lasts; the pacing scales to fit |
+| `--color <c>` | `ember` | Colour the rings are built from: a name, `#rrggbb`, or `r,g,b` |
+| `--size <px>` | `320` | Square size of the pointer overlay |
 | `--point-preview <prefix>` | — | Render a strip of pointer frames and exit |
 | `--list-targets` | — | Print the pointable windows as JSON and exit |
 | `--point-port <n>` | `port+1` | Daemon: port for the pointing endpoint |
@@ -243,8 +245,32 @@ speak.exe --point --title "reviewer worker"   rem point at that window
 speak.exe --title "reviewer worker" "Tests are green."   rem speak, then point
 speak.exe --list-targets                     rem what --title can match, as JSON
 speak.exe --point --at 1200,800 --pulses 2    rem a bare screen position
+speak.exe --point --title dev --duration 8    rem slower, for a big screen
+speak.exe --point --title dev --color red     rem a different kind of attention
 speak.exe --point-preview p                   rem render the frames, no screen needed
 ```
+
+`--point` is the mode; `--pulses`, `--duration`, `--color` and `--size` shape the
+gesture (`--point-pulses` and friends are accepted too, if you prefer the prefix).
+
+Pulses and duration are independent: one is how many rings, the other how long the
+whole gesture takes. The built-in pacing is a `1.90 s` ring life and a `0.80 s`
+gap — `0.8·pulses + 1.1` seconds — and `--duration` scales both to hit the total
+you asked for, keeping their ratio so the rings still read as a sequence rather
+than one thick pulse.
+
+<p align="center">
+  <img src="docs/pointer-colours.png" width="640" alt="the same ring in ember, red, green and cyan">
+</p>
+<p align="center"><em><code>--color</code>: the default ember, then red, green, cyan</em></p>
+
+Everything is derived from that one colour: rings are born white-hot and settle
+into it as they expand, the thin line keeps a touch of white so it stays legible,
+and the core dot's halo takes it too. Names (`red`, `amber`, `yellow`, `green`,
+`cyan`, `azure`, `blue`, `violet`, `magenta`, `pink`, `white`, `steel`, `ember`),
+`#rrggbb` and `r,g,b` all work; anything else is a usage error rather than a
+silent fallback. So an agent can keep ember for "done" and use red for "this one
+needs you".
 
 No model and no audio device are involved, so a pointing call costs a process
 start (~240 ms) whether or not a daemon is running.
@@ -299,8 +325,10 @@ $ curl -s http://127.0.0.1:8124/health
 {"ok":true,"service":"speak-pointer"}
 ```
 
-`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`
-and `size`. It must be told a target: the caller is at the other end of a socket,
+`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`,
+`duration`, `color` and `size` — the flags' JSON counterparts, same defaults, and
+an unparseable colour is a 400 rather than a silent ember. It must be told a
+target: the caller is at the other end of a socket,
 so the daemon's own process tree says nothing about where the request came from.
 It answers when the animation has finished (~3.5 s for three rings), and requests
 queue rather than overlapping.

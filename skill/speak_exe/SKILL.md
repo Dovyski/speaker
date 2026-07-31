@@ -90,8 +90,30 @@ or focus anything.
 ```
 
 No model is loaded for pointing, so the only cost beyond the animation itself is
-~240 ms of process start, daemon or not. `--pulses <n>` (default 3) sets how many
-rings, and so also how long the call takes: roughly `0.8 n + 1.3` seconds.
+~240 ms of process start, daemon or not.
+
+Four flags shape the gesture, and none of them need the `--point` prefix (though
+`--point-pulses` and friends are accepted):
+
+```bash
+# slower, bigger, and red — "this one needs you", not "this one is done"
+"C:/Dev/www/claude-speak/speak.exe" --point --title "reviewer worker" \
+    --color red --duration 6 --pulses 4 --size 420
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--pulses <n>` | `3` | How many rings |
+| `--duration <s>` | `3.5` | How long the whole gesture lasts; the pacing scales to fit |
+| `--color <c>` | `ember` | The one colour everything is derived from |
+| `--size <px>` | `320` | Overlay size |
+
+Duration is what the call blocks for, so pick it for how long the user needs to
+notice, not for speed. `--color` takes a name (`red`, `amber`, `yellow`, `green`,
+`cyan`, `azure`, `blue`, `violet`, `magenta`, `pink`, `white`, `steel`, `ember`),
+`#rrggbb`, or `r,g,b`; anything else is a usage error (exit 2), never a silent
+fallback. Use the colour to mean something — keep the default for routine "done",
+and switch to red or amber when the user needs to act.
 
 **Work out the target with `--list-targets` first.** It prints every pointable
 window as JSON — `hwnd`, `pid`, `process`, `title`, `x`, `y`, `w`, `h`:
@@ -132,10 +154,10 @@ curl -s -X POST http://127.0.0.1:8124/point -d '{"title":"reviewer worker"}'   #
 curl -s http://127.0.0.1:8124/targets                                          # same as --list-targets
 ```
 
-`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses` and
-`size`; a request **must** name its target, since the daemon cannot tell where the
-call came from. It replies when the animation ends (~3.5 s), and concurrent
-requests queue.
+`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`,
+`duration`, `color` and `size`; a request **must** name its target, since the
+daemon cannot tell where the call came from. It replies when the animation ends
+(~3.5 s), and concurrent requests queue.
 
 ## Rules
 
@@ -164,8 +186,8 @@ requests queue.
 | `--point` | — | Point at a window; with text, speaks first and points after |
 | `--title <substr>` | — | Point at the window whose title contains this (implies `--point`) |
 | `--hwnd <n>` / `--at <x,y>` | — | Point at a window handle / screen position (imply `--point`) |
-| `--pulses <n>` | `3` | Rings to send out |
-| `--point-size <px>` | `320` | Size of the pointer overlay |
+| `--pulses <n>` / `--duration <s>` | `3` / `3.5` | Rings, and how long the gesture lasts |
+| `--color <c>` / `--size <px>` | `ember` / `320` | Pointer colour and overlay size |
 | `--list-targets` | — | Print pointable windows as JSON and exit |
 | `--serve` / `--status` / `--stop` | — | Manage the resident daemon |
 | `--port <n>` | `8123` | Daemon port |
