@@ -347,6 +347,13 @@ Two more details worth knowing:
 - `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` lets the audio engine resample 24 kHz
   mono float to whatever the device mix format is, so there is no resampler here.
 
+## Driving it from a coding agent
+
+[`skill/speak_exe/`](skill/speak_exe/SKILL.md) is an agent skill that documents
+the binary the way an agent needs it — calling convention, daemon handling, how to
+phrase text for the model, and failure modes. See
+[`skill/README.md`](skill/README.md) for how to install it.
+
 ## Credits
 
 - [kyutai-labs/pocket-tts](https://github.com/kyutai-labs/pocket-tts) — the model (CC-BY-4.0 weights)
