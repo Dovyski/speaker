@@ -37,6 +37,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **No Python at build time or run time** — pre-exported ONNX weights, fetched by a script
 - **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Audio-reactive orb** — per-pixel-alpha layered window, always on top, parked above the taskbar
+- **Caption card** — a title and a line of context beside the orb, so you also see *what* it is about
 - **Click the orb to pause**, click again to resume from the same word
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
@@ -113,6 +114,7 @@ speak.exe "Hello world."
 speak.exe --voice narrator.wav "A different voice."
 speak.exe --save out.wav "Speak and keep a copy."
 speak.exe --no-orb "Speak with no overlay."
+speak.exe --caption-title "o-cli #85" --caption "CI green." "The pull request is ready."
 speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 ```
 
@@ -123,6 +125,8 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `--voices-dir` |
 | `--save <file.wav>` | — | Also write the audio to a 32-bit float WAV |
 | `--no-orb` | — | Skip the on-screen indicator |
+| `--caption <text>` | — | One short line of context, shown as a card left of the orb |
+| `--caption-title <t>` | — | The caption's title line, above that text |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
@@ -155,6 +159,40 @@ Click the orb while it is speaking to pause, and again to resume.
 
 Paths default relative to the executable, not the working directory, so
 `speak.exe` works from anywhere once built.
+
+## Captions
+
+<p align="center">
+  <img src="docs/caption.png" width="640" alt="a translucent card with a title and one line of context, beside the orb">
+</p>
+
+The orb says *something is speaking*. A caption says **what about**:
+
+```bat
+speak.exe --caption-title "i35 - optiwork-forms" ^
+          --caption "PRs 357-364 rebased on dev, tests green." ^
+          "The forms batch is ready to merge."
+```
+
+Both flags are optional and independent — a caption can be a title alone, a line
+alone, or both. The card sits to the left of the orb, which keeps its corner; the
+panel grows leftwards to fit the text, up to `340 px` wide, wrapping the body over
+at most three lines (a fourth is cut: this is a toast, not a paragraph). Sizes
+scale with `--orb-size`.
+
+It is drawn from the same material as the ring rather than as a separate widget:
+translucent dark glass, a hairline edge carrying the ring's ember→white→azure
+palette, and a soft halo around it. The palette **sweeps horizontally** across the
+panel and drifts at the ring's own rate, the whole thing brightens with the voice,
+and it cools to steel and dims when you pause playback — one object in two shapes.
+(Mapping the colour by angle around the panel was the first attempt; a rectangle's
+angle barely moves along its long edges, so it produced flat bands.)
+
+The text is rasterized once, when the process starts: GDI cannot draw into an
+alpha channel, so each string is drawn white-on-black into a scratch DIB and its
+luminance becomes the coverage mask that the per-frame colours are applied
+through. `ANTIALIASED_QUALITY` matters here — ClearType's subpixel antialiasing
+would leave colour fringes once luminance is reinterpreted as alpha.
 
 ## Low latency: the daemon
 

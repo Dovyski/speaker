@@ -78,6 +78,26 @@ double MsSinceStart() {
     return double(now.QuadPart - g_t0.QuadPart) * 1000.0 / double(g_qpf.QuadPart);
 }
 
+// ── text encoding ───────────────────────────────────────────────────────────
+// Arguments arrive as UTF-16 and are carried around as UTF-8; the caption and the
+// window APIs need them back as UTF-16.
+
+std::string Utf8(const wchar_t* w) {
+    if (!w || !*w) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string out(n > 0 ? n - 1 : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Wide(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring out(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), n);
+    return out;
+}
+
 // ── Orb overlay ─────────────────────────────────────────────────────────────
 
 constexpr float kPi = 3.14159265358979f;
@@ -171,14 +191,17 @@ struct OrbGeometry {
 
 OrbGeometry g_geom;
 
+int CaptionStripWidth();
+
 // True for points inside the ring, which is the only part that reacts to a click.
-// The overlay is a square window but mostly empty, so everything outside this
-// radius is reported as transparent and the click goes to whatever is underneath.
+// The overlay is a square window (wider with a caption) but mostly empty, so
+// everything outside this radius is reported as transparent and the click goes to
+// whatever is underneath.
 bool InsideOrb(HWND hwnd, POINT screen_pt) {
     POINT p = screen_pt;
     ScreenToClient(hwnd, &p);
     const float c  = g_orb_size * 0.5f;
-    const float dx = p.x + 0.5f - c, dy = p.y + 0.5f - c;
+    const float dx = p.x + 0.5f - c - CaptionStripWidth(), dy = p.y + 0.5f - c;
     // A shade wider than the rim (0.29 S) so the target is comfortable to hit.
     const float hit = g_orb_size * 0.36f;
     return dx * dx + dy * dy <= hit * hit;
@@ -370,13 +393,301 @@ void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float ti
     OverlayPauseGlyph(pixels, g_orb_size, pause, fade);
 }
 
+// ── Caption ─────────────────────────────────────────────────────────────────
+// A toast to the left of the orb: a title and one short line of context, so the
+// orb says *what* it is about and not merely that something spoke. The card is
+// built once — the text cannot change mid-utterance — and blended into every
+// frame with the orb's own fade, so the two arrive and leave as one object.
+
+std::string g_cap_title, g_cap_text;
+
+constexpr int kCapMaxWidth  = 340;   // panel width ceiling, at the default orb size
+constexpr int kCapGap       = 14;    // between the panel edge and the orb square
+constexpr int kCapPad       = 15;
+constexpr int kCapRadius    = 13;
+constexpr int kCapMargin    = 12;    // room around the panel for its outer glow
+constexpr int kCapLineGap   = 5;     // between title and body
+constexpr int kCapTitlePx   = 15;
+constexpr int kCapBodyPx    = 14;
+constexpr int kCapTitleLines = 2;
+constexpr int kCapBodyLines  = 3;
+
+// Dark enough to read text against, translucent enough to be glass: the panel is
+// tinted by the same travelling rim colours as the orb rather than being a
+// flat-grey toast.
+constexpr float kCapFillAlpha = 0.62f;
+constexpr Rgb kCapGlass {0.035f, 0.045f, 0.065f};
+constexpr Rgb kCapBodyInk {0.90f, 0.93f, 0.97f};
+
+bool HaveCaption() { return !g_cap_title.empty() || !g_cap_text.empty(); }
+
+// Everything on the card is sized off the orb, so --orb-size scales the pair.
+int CapScale(int v) {
+    return std::max(1, static_cast<int>(std::lround(v * g_orb_size / 220.0)));
+}
+
+// Coverage mask: alpha per pixel, no colour of its own. GDI cannot draw into an
+// alpha channel, so the text is drawn white on black and its luminance becomes
+// the alpha.
+struct TextMask {
+    int                  w = 0, h = 0;
+    std::vector<uint8_t> a;
+};
+
+TextMask RenderText(const std::wstring& text, int height_px, bool bold, int max_w,
+                    int max_lines) {
+    TextMask mask;
+    if (text.empty() || max_w <= 0) return mask;
+
+    HDC screen = GetDC(nullptr);
+    HDC dc     = CreateCompatibleDC(screen);
+    // ANTIALIASED_QUALITY rather than the ClearType default: subpixel antialiasing
+    // would leave colour fringes once luminance is reinterpreted as alpha.
+    HFONT font = CreateFontW(-height_px, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
+                             FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(dc, font);
+
+    constexpr UINT kFlags = DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX;
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    RECT measure{0, 0, max_w, 0};
+    DrawTextW(dc, text.c_str(), -1, &measure, kFlags | DT_CALCRECT);
+    // Anything past max_lines is simply cut: a caption is a toast, not a paragraph.
+    const int w = std::max(1, std::min<int>(measure.right, max_w));
+    const int h = std::max(1, std::min<int>(measure.bottom, max_lines * tm.tmHeight));
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;   // top-down
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void*   bits = nullptr;
+    HBITMAP dib  = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dib && bits) {
+        HGDIOBJ old_bmp = SelectObject(dc, dib);
+        std::memset(bits, 0, static_cast<size_t>(w) * h * 4);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT r{0, 0, w, h};
+        DrawTextW(dc, text.c_str(), -1, &r, kFlags);
+        GdiFlush();
+
+        mask.w = w;
+        mask.h = h;
+        mask.a.resize(static_cast<size_t>(w) * h);
+        const auto* px = static_cast<const uint32_t*>(bits);
+        for (size_t i = 0; i < mask.a.size(); ++i) {
+            mask.a[i] = static_cast<uint8_t>((px[i] >> 8) & 0xFF);   // grey: any channel
+        }
+        SelectObject(dc, old_bmp);
+        DeleteObject(dib);
+    }
+
+    SelectObject(dc, old_font);
+    DeleteObject(font);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return mask;
+}
+
+// Geometry only, rasterized once. The colours are applied per frame, so the
+// panel's edge carries the same drifting ember→white→azure as the ring and dims
+// and brightens with it — one object, two shapes, rather than a toast parked next
+// to an orb.
+struct CaptionCard {
+    int                  w = 0, h = 0;   // panel plus the glow margin around it
+    std::vector<float>   dist;           // signed distance to the panel edge, <0 inside
+    std::vector<uint8_t> title_ink, body_ink;   // text coverage, card-sized
+};
+
+CaptionCard g_card;
+int g_cap_panel_w = 0;   // the glass itself, without the margin
+
+// Width the caption adds to the left of the orb square, 0 when there is none. The
+// right-hand glow margin is allowed to overlap the orb square, so the gap is
+// measured from the glass edge.
+int CaptionStripWidth() {
+    return g_card.w ? g_cap_panel_w + CapScale(kCapMargin) + CapScale(kCapGap) : 0;
+}
+
+void StampMask(std::vector<uint8_t>* layer, int layer_w, int layer_h,
+               const TextMask& m, int x0, int y0) {
+    for (int y = 0; y < m.h; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= layer_h) continue;
+        for (int x = 0; x < m.w; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= layer_w) continue;
+            (*layer)[static_cast<size_t>(cy) * layer_w + cx] =
+                m.a[static_cast<size_t>(y) * m.w + x];
+        }
+    }
+}
+
+void BuildCaptionCard() {
+    g_card = {};
+    g_cap_panel_w = 0;
+    if (!HaveCaption()) return;
+
+    const int pad       = CapScale(kCapPad);
+    const int max_inner = CapScale(kCapMaxWidth) - 2 * pad;
+    const TextMask title = RenderText(Wide(g_cap_title), CapScale(kCapTitlePx), true,
+                                      max_inner, kCapTitleLines);
+    const TextMask body  = RenderText(Wide(g_cap_text), CapScale(kCapBodyPx), false,
+                                      max_inner, kCapBodyLines);
+    const int gap     = (title.h && body.h) ? CapScale(kCapLineGap) : 0;
+    const int inner_w = std::max(title.w, body.w);
+    const int inner_h = title.h + gap + body.h;
+    if (inner_w <= 0 || inner_h <= 0) return;
+
+    const int margin = CapScale(kCapMargin);
+    const int panel_w = inner_w + 2 * pad, panel_h = inner_h + 2 * pad;
+    g_cap_panel_w = panel_w;
+    g_card.w = panel_w + 2 * margin;
+    g_card.h = panel_h + 2 * margin;
+    const size_t n = static_cast<size_t>(g_card.w) * g_card.h;
+    g_card.dist.resize(n);
+    g_card.title_ink.assign(n, 0);
+    g_card.body_ink.assign(n, 0);
+
+    // Signed distance to a rounded rectangle: negative inside. One expression then
+    // gives the antialiased silhouette, the hairline on its edge and the halo
+    // outside it — exactly how the ring is drawn from its own radius.
+    const float radius = static_cast<float>(CapScale(kCapRadius));
+    const float hw = panel_w * 0.5f, hh = panel_h * 0.5f;
+    const float cx = g_card.w * 0.5f, cy = g_card.h * 0.5f;
+    for (int y = 0; y < g_card.h; ++y) {
+        for (int x = 0; x < g_card.w; ++x) {
+            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            const float qx = std::max(std::fabs(dx) - (hw - radius), 0.f);
+            const float qy = std::max(std::fabs(dy) - (hh - radius), 0.f);
+            g_card.dist[static_cast<size_t>(y) * g_card.w + x] =
+                std::sqrt(qx * qx + qy * qy) - radius;
+        }
+    }
+
+    StampMask(&g_card.title_ink, g_card.w, g_card.h, title, margin + pad, margin + pad);
+    StampMask(&g_card.body_ink, g_card.w, g_card.h, body, margin + pad,
+              margin + pad + title.h + gap);
+}
+
+int FrameWidth()  { return CaptionStripWidth() + g_orb_size; }
+int FrameHeight() { return g_orb_size; }
+
+// Dims a premultiplied pixel — all four channels scale together.
+inline uint32_t ScaleAlpha(uint32_t p, float f) {
+    const auto ch = [&](int shift) {
+        return static_cast<uint32_t>(((p >> shift) & 0xFF) * f + 0.5f);
+    };
+    return (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+// Draws the caption into the frame: coloured halo, glass, luminous hairline, text.
+// `level`, `time` and `pause` are the orb's own drives, so the panel breathes and
+// cools with the ring instead of sitting there statically.
+void OverlayCaption(uint32_t* frame, int W, int H, float level, float fade,
+                    float time, float pause) {
+    if (!g_card.w || fade <= 0.004f) return;
+
+    const float rotation  = time * 0.33f;                    // as the ring's colours drift
+    // The title is one colour at a time, sampled from the same cycle: per-pixel
+    // rim colour turns a five-word title into five differently coloured words.
+    const Rgb title_col = Mix(Mix(RimColour(std::fmod(0.62f - rotation + 2.f, 1.f)),
+                                  kSteel, 0.62f * pause), kHot, 0.28f);
+    const float rim_sigma = std::max(0.9f, CapScale(1) * 1.1f);
+    const float glow_sigma = static_cast<float>(CapScale(kCapMargin));
+    const float lit  = (0.80f + 0.42f * level) * (1.f - 0.30f * pause);
+    const float x0   = 0.f;
+    const int   y0   = (H - g_card.h) / 2;
+
+    // The ring maps the palette around its circumference; a panel is not a circle,
+    // so the same palette sweeps across it horizontally instead — three quarters of
+    // a cycle, drifting at the ring's own rate. Angle-mapping was tried first and
+    // gives long flat bands along the top and bottom, where the angle barely moves.
+    static std::vector<Rgb> sweep;
+    sweep.resize(g_card.w);
+    for (int x = 0; x < g_card.w; ++x) {
+        const float u = 0.72f * (x + 0.5f) / g_card.w - rotation;
+        sweep[x] = Mix(RimColour(std::fmod(u + 2.f, 1.f)), kSteel, 0.62f * pause);
+    }
+
+    for (int y = 0; y < g_card.h; ++y) {
+        const int fy = y0 + y;
+        if (fy < 0 || fy >= H) continue;
+        for (int x = 0; x < g_card.w && x + x0 < W; ++x) {
+            const size_t ci = static_cast<size_t>(y) * g_card.w + x;
+            const float  d  = g_card.dist[ci];
+            const float  inside = 1.f - SmoothStep(-1.f, 0.5f, d);
+            // Deliberately capped: unlike the ring's, this line traces text, and a
+            // white-hot outline both washes its own hue out and shouts over the
+            // words it is framing.
+            const float  line = std::exp(-(d / rim_sigma) * (d / rim_sigma) * 1.6f) *
+                                (0.50f + 0.14f * level) * (1.f - 0.35f * pause);
+            const float  halo = 0.34f * std::exp(-(d / glow_sigma) * (d / glow_sigma)) * lit;
+            const uint8_t tink = g_card.title_ink[ci];
+            const uint8_t bink = g_card.body_ink[ci];
+            if (inside <= 0.004f && line <= 0.004f && halo <= 0.004f) continue;
+
+            const Rgb col = sweep[x];   // same palette, same drift, cooling when held
+
+            uint32_t p = 0;
+            if (halo > 0.004f) p = Pack(col, Clamp01(halo));
+            if (inside > 0.004f) {
+                // Glass, tinted by the light spilling in from its own edge.
+                const float bleed = 0.10f + 0.22f * SmoothStep(-glow_sigma, 0.f, d);
+                p = BlendOver(Pack(Mix(kCapGlass, col, bleed),
+                                   inside * kCapFillAlpha * (0.92f + 0.14f * level)),
+                              p);
+            }
+            if (line > 0.004f) {
+                p = BlendOver(Pack(Mix(col, kHot, 0.28f), Clamp01(line)), p);
+            }
+            if (tink) p = BlendOver(Pack(title_col, tink / 255.f), p);
+            if (bink) p = BlendOver(Pack(kCapBodyInk, bink / 255.f * 0.94f), p);
+
+            const size_t i = static_cast<size_t>(fy) * W + static_cast<int>(x0) + x;
+            frame[i] = BlendOver(ScaleAlpha(p, fade), frame[i]);
+        }
+    }
+}
+
+// The whole overlay: the orb on the right, the caption card centred against it on
+// the left. Without a caption this is exactly the orb, at exactly its old size.
+void ComposeFrame(uint32_t* frame, float level, float voice, float fade, float time,
+                  float pause) {
+    const int S = g_orb_size, W = FrameWidth();
+    if (W == S) {
+        ComposeOrb(frame, level, voice, fade, time, pause);
+        return;
+    }
+
+    static std::vector<uint32_t> orb;
+    orb.resize(static_cast<size_t>(S) * S);
+    ComposeOrb(orb.data(), level, voice, fade, time, pause);
+
+    std::memset(frame, 0, static_cast<size_t>(W) * S * 4);
+    for (int y = 0; y < S; ++y) {
+        std::memcpy(frame + static_cast<size_t>(y) * W + (W - S),
+                    orb.data() + static_cast<size_t>(y) * S,
+                    static_cast<size_t>(S) * 4);
+    }
+
+    OverlayCaption(frame, W, S, level, fade, time, pause);
+}
+
 // Pushes the composed frame to the layered window, parked just inside the
-// bottom-right corner of the work area (above the taskbar).
+// bottom-right corner of the work area (above the taskbar). The orb keeps that
+// corner whether or not there is a caption — the card grows leftwards.
 void PushOrb(HWND hwnd, HDC mem_dc) {
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    POINT pos{work.right - g_orb_size - 24, work.bottom - g_orb_size - 24};
-    SIZE  size{g_orb_size, g_orb_size};
+    const int W = FrameWidth(), H = FrameHeight();
+    POINT pos{work.right - W - 24, work.bottom - H - 24};
+    SIZE  size{W, H};
     POINT src{0, 0};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(hwnd, nullptr, &pos, &size, mem_dc, &src, 0, &blend,
@@ -396,9 +707,10 @@ void OrbThread() {
     // No WS_EX_TRANSPARENT: the ring has to receive clicks to be pausable. Clicks
     // outside it are handed on via WM_NCHITTEST, so the square stays click-through.
     // WS_EX_NOACTIVATE keeps the click from stealing focus from the user's window.
+    const int W = FrameWidth(), H = FrameHeight();
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"", WS_POPUP, 0, 0, g_orb_size, g_orb_size, nullptr,
+        wc.lpszClassName, L"", WS_POPUP, 0, 0, W, H, nullptr,
         nullptr, wc.hInstance, nullptr);
     if (!hwnd) return;
 
@@ -406,8 +718,8 @@ void OrbThread() {
     HDC mem_dc = CreateCompatibleDC(screen);
     BITMAPINFO bi{};
     bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = g_orb_size;
-    bi.bmiHeader.biHeight      = -g_orb_size;   // top-down
+    bi.bmiHeader.biWidth       = W;
+    bi.bmiHeader.biHeight      = -H;   // top-down
     bi.bmiHeader.biPlanes      = 1;
     bi.bmiHeader.biBitCount    = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -459,7 +771,7 @@ void OrbThread() {
         fade += ((closing ? 0.f : 1.f) - fade) * (closing ? 0.12f : 0.22f);
         if (closing && fade < 0.01f) break;
 
-        ComposeOrb(pixels, level, voice, fade, anim, pause);
+        ComposeFrame(pixels, level, voice, fade, anim, pause);
         PushOrb(hwnd, mem_dc);
         Sleep(16);
     }
@@ -883,22 +1195,6 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
 
 // ── misc helpers ────────────────────────────────────────────────────────────
 
-std::string Utf8(const wchar_t* w) {
-    if (!w || !*w) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    std::string out(n > 0 ? n - 1 : 0, '\0');
-    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
-    return out;
-}
-
-std::wstring Wide(const std::string& s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring out(n > 0 ? n - 1 : 0, L'\0');
-    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), n);
-    return out;
-}
-
 std::string ExePath() {
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -931,10 +1227,10 @@ void WriteWav(const std::string& path, const std::vector<float>& samples) {
     std::fclose(f);
 }
 
-// Writes a square of premultiplied BGRA pixels to a 32-bit BMP, flattened over
+// Writes a block of premultiplied BGRA pixels to a 32-bit BMP, flattened over
 // a dark backdrop. Used to eyeball/regression-check the visuals without a screen
 // recorder — the overlays themselves are invisible to GDI capture.
-void WriteBmp(const std::string& path, std::vector<uint32_t> px, int S) {
+void WriteBmp(const std::string& path, std::vector<uint32_t> px, int w, int h) {
     const uint32_t data_bytes = static_cast<uint32_t>(px.size() * 4);
     BITMAPFILEHEADER fh{};
     fh.bfType    = 0x4D42;  // "BM"
@@ -942,8 +1238,8 @@ void WriteBmp(const std::string& path, std::vector<uint32_t> px, int S) {
     fh.bfSize    = fh.bfOffBits + data_bytes;
     BITMAPINFOHEADER ih{};
     ih.biSize     = sizeof(ih);
-    ih.biWidth    = S;
-    ih.biHeight   = -S;  // top-down
+    ih.biWidth    = w;
+    ih.biHeight   = -h;  // top-down
     ih.biPlanes   = 1;
     ih.biBitCount = 32;
 
@@ -966,9 +1262,10 @@ void WriteBmp(const std::string& path, std::vector<uint32_t> px, int S) {
 
 void DumpOrbFrame(const std::string& path, float level, float voice, float time,
                   float pause = 0.f) {
-    std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
-    ComposeOrb(px.data(), level, voice, 1.0f, time, pause);
-    WriteBmp(path, std::move(px), g_orb_size);
+    const int W = FrameWidth(), H = FrameHeight();
+    std::vector<uint32_t> px(static_cast<size_t>(W) * H);
+    ComposeFrame(px.data(), level, voice, 1.0f, time, pause);
+    WriteBmp(path, std::move(px), W, H);
 }
 
 // ── Pointing at a window ────────────────────────────────────────────────────
@@ -1767,6 +2064,9 @@ void Usage() {
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
+        "  --caption <text>      one short line of context shown as a card to the\n"
+        "                        left of the orb (the repo, the issue, the task)\n"
+        "  --caption-title <t>   the caption's title line, above that text\n"
         "  --orb-style <s>       aurora (default) or dot\n"
         "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
@@ -1889,6 +2189,8 @@ int main() {
         else if (a == "--point-preview") opt.point_preview = next("--point-preview");
         else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
         else if (a == "--no-point-server") opt.point_server = false;
+        else if (a == "--caption")       g_cap_text  = next("--caption");
+        else if (a == "--caption-title") g_cap_title = next("--caption-title");
         else if (a == "--orb-size")    g_orb_size = std::max(60, std::atoi(next("--orb-size").c_str()));
         else if (a == "--orb-style") {
             const std::string style = next("--orb-style");
@@ -1910,6 +2212,10 @@ int main() {
         }
     }
     LocalFree(wargv);
+
+    // Rasterized once here, before anything can render a frame: --orb-size is
+    // settled by now and the text never changes after this point.
+    BuildCaptionCard();
 
     if (!opt.dump_orb.empty()) {
         DumpOrbFrame(opt.dump_orb, 0.65f, 0.65f, 0.f);
@@ -1942,7 +2248,7 @@ int main() {
         for (int i = 0; i < kFrames; ++i) {
             std::vector<uint32_t> px(static_cast<size_t>(S) * S);
             ComposePointer(px.data(), S, total * (i + 0.5f) / kFrames, pulses);
-            WriteBmp(opt.point_preview + std::to_string(i) + ".bmp", std::move(px), S);
+            WriteBmp(opt.point_preview + std::to_string(i) + ".bmp", std::move(px), S, S);
         }
         std::printf("wrote %d frames to %s0..%d.bmp\n", kFrames,
                     opt.point_preview.c_str(), kFrames - 1);

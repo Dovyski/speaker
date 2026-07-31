@@ -1,13 +1,13 @@
 ---
 name: speak
-description: "Low-latency text-to-speech via speak.exe. Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
+description: "Low-latency text-to-speech via speak.exe. Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, can caption it with the initiative/repo/issue the utterance is about, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
 ---
 
 # speak — Text-to-Speech via speak.exe
 
 Speaks text out loud using a single self-contained native binary. No Python, no
 `ffplay` pipeline. A glowing orb appears in the bottom-right corner of the screen
-while the audio plays.
+while the audio plays, optionally captioned with what the utterance is about.
 
 Source: `C:\Dev\www\claude-speak` (published at https://github.com/Dovyski/speaker).
 This skill lives in that repo under `skill/speak/`; every path below assumes
@@ -73,6 +73,40 @@ first call after a few idle minutes takes ~500 ms instead of ~100 ms. Pass
 The daemon does not survive a reboot — after one, the first call is slow and
 warms a new daemon automatically.
 
+## Captions: say what it is about, on screen
+
+Speech is heard once and gone, and the orb alone does not say *which* piece of work
+just finished. A caption puts that on screen beside the orb — a title and one short
+line, styled from the same palette as the ring:
+
+```bash
+"C:/Dev/www/claude-speak/speak.exe" \
+    --caption-title "i35 - optiwork-forms" \
+    --caption "PRs 357-364 rebased on dev, tests green." \
+    "The forms batch is ready to merge, sir."
+```
+
+**Caption almost every utterance.** It costs nothing, and it is what lets the user
+place the sentence they just heard when several sessions are running.
+
+| Part | Put here | Keep to |
+|---|---|---|
+| `--caption-title` | The subject: initiative, repository, issue, PR — `i35 - optiwork-forms`, `o-cli #85`, `optiwork-api-gateway` | one line, ~34 characters |
+| `--caption` | The state in a fragment: `PRs 357-364 rebased, tests green.`, `Deploy blocked on #1470.` | one sentence, ~2 lines |
+
+Rules that matter:
+
+- **Not a transcript.** The caption is the label, the speech is the message —
+  never the same words twice.
+- **Written, not spoken.** Unlike the text you speak, this is read: `#85`,
+  `optiwork-forms`, `2.4×` and `→` are all fine, and preferred over spelling
+  things out.
+- Body text wraps to at most three lines and the panel is at most `340 px` wide;
+  anything past that is cut, so write it short rather than trusting the wrap.
+- Either flag works alone. `--no-orb` removes the caption with the orb.
+- Quote each value as one argument — a bare `--caption-title i35 - optiwork-forms`
+  keeps only `i35`.
+
 ## Pointing at the window you spoke from
 
 Speaking tells the user something happened; it does not tell them **which
@@ -81,9 +115,14 @@ of it and fade, three times over ~3.5 s, then vanish. The call is synchronous an
 returns when the animation ends. The overlay is click-through and does not raise
 or focus anything.
 
+A caption and a pointing gesture answer different questions — *what* it is about
+and *where* to go — so the full form of a milestone utterance carries both.
+
 ```bash
 # speak, then point at the window whose title contains this text
-"C:/Dev/www/claude-speak/speak.exe" --title "reviewer worker" "Tests are green."
+"C:/Dev/www/claude-speak/speak.exe" --title "reviewer worker" \
+    --caption-title "i11 - reviewer worker" --caption "PR #451 reviewed, CI green." \
+    "Tests are green."
 
 # point without speaking
 "C:/Dev/www/claude-speak/speak.exe" --point --title "reviewer worker"
@@ -180,6 +219,8 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `voices/` |
 | `--save <file.wav>` | — | Also write the audio to a WAV |
 | `--no-orb` | — | Speak without the on-screen orb |
+| `--caption <text>` | — | One short line of context on a card left of the orb |
+| `--caption-title <t>` | — | The caption's title line, above that text |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--timing` | — | Report ms to first audio and which path served it |
