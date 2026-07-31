@@ -493,7 +493,7 @@ Two more details worth knowing:
 
 ## Driving it from a coding agent
 
-[`skill/speak_exe/`](skill/speak_exe/SKILL.md) is an agent skill that documents
+[`skill/speak/`](skill/speak/SKILL.md) is an agent skill that documents
 the binary the way an agent needs it — calling convention, daemon handling, how to
 phrase text for the model, and failure modes. See
 [`skill/README.md`](skill/README.md) for how to install it.

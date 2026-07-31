@@ -1,16 +1,16 @@
 ---
-name: speak_exe
+name: speak
 description: "Low-latency text-to-speech via speak.exe, a self-contained native binary (Pocket TTS, no Python). Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
 ---
 
-# speak_exe — Text-to-Speech via speak.exe
+# speak — Text-to-Speech via speak.exe
 
 Speaks text out loud using a single self-contained native binary. No Python, no
 `ffplay` pipeline. A glowing orb appears in the bottom-right corner of the screen
 while the audio plays.
 
 Source: `C:\Dev\www\claude-speak` (published at https://github.com/Dovyski/speaker).
-This skill lives in that repo under `skill/speak_exe/`; every path below assumes
+This skill lives in that repo under `skill/speak/`; every path below assumes
 the checkout is at `C:\Dev\www\claude-speak` — adjust them if it is cloned
 elsewhere.
 
