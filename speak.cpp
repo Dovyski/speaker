@@ -852,7 +852,7 @@ void DumpOrbFrame(const std::string& path, float level, float voice, float time)
 
 struct Options {
     std::string text;
-    std::string voice       = "alba.wav";
+    std::string voice       = "jarvis.wav";
     std::string save_path;
     std::string models_dir;
     std::string voices_dir;
@@ -1031,7 +1031,7 @@ void Usage() {
         "  speak [options] \"text to speak\"\n"
         "  speak --serve [--port N]      run the resident daemon (fast speech)\n"
         "  speak --status | --stop       inspect or stop the daemon\n\n"
-        "  --voice <name|path>   voice sample (default: alba.wav)\n"
+        "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
         "  --orb-style <s>       aurora (default) or dot\n"

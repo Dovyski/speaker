@@ -79,12 +79,13 @@ Voice cloning is zero-shot, so a voice is just an audio file in `voices/`:
 
 ```
 voices/
-└── alba.wav        ← 5–30 s of clean speech, any WAV/MP3/FLAC
+└── jarvis.wav      ← 5–30 s of speech, any WAV/MP3/FLAC
 ```
 
-Point at it with `--voice alba.wav` (or pass an absolute path to any file).
-The default is `alba.wav`. First use of a voice costs a few hundred ms of
-conditioning; after that it is cached in `voices/.cache/` and reloads in ~4 ms.
+Point at it with `--voice jarvis.wav` (or pass an absolute path to any file).
+The default is `jarvis.wav`. First use of a voice costs conditioning time —
+a few hundred ms for a short sample, several seconds for a 20 s+ one — after
+which it is cached in `voices/.cache/` and reloads in ~4 ms.
 
 **Several short recordings?** The engine conditions on one file (and uses at most
 30 s of it), so join them first:
@@ -95,8 +96,13 @@ pwsh -File make-voice.ps1 -Out voices/mine.wav take1.wav take2.m4a take3.mp3
 
 That resamples each clip to 24 kHz mono, trims leading/trailing silence,
 loudness-normalizes them so takes recorded at different levels do not fight each
-other, joins them with a 0.25 s gap, and caps the result at 30 s. Aim for at
-least ~5 s of speech in total; more and cleaner beats longer and noisier.
+other, joins them with a 0.25 s gap, and caps the result at 30 s. Add `-Denoise`
+for sources with background hiss — an FFT denoiser, which will not remove music
+or a second voice.
+
+Aim for at least ~5 s of speech. Length matters: in a four-way blind listen, a
+28 s denoised sample beat a 5 s clean one, so do not throw away a longer take
+just because it is noisier — build both and compare by ear.
 
 ## Usage
 
