@@ -979,8 +979,8 @@ void DumpOrbFrame(const std::string& path, float level, float voice, float time,
 
 int g_point_size = 320;
 
-constexpr float kRingLife  = 0.95f;   // seconds one ring takes to expand and die
-constexpr float kRingGap   = 0.40f;   // seconds between successive rings
+constexpr float kRingLife  = 1.90f;   // seconds one ring takes to expand and die
+constexpr float kRingGap   = 0.80f;   // seconds between successive rings
 
 float PointerDuration(int pulses) {
     return (std::max(1, pulses) - 1) * kRingGap + kRingLife;

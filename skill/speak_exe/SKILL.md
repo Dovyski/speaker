@@ -77,8 +77,9 @@ warms a new daemon automatically.
 
 Speaking tells the user something happened; it does not tell them **which
 terminal** to come back to. To show them, point at the window — rings expand out
-of it and fade, three times, then vanish. The overlay is click-through and does
-not raise or focus anything.
+of it and fade, three times over ~3.5 s, then vanish. The call is synchronous and
+returns when the animation ends. The overlay is click-through and does not raise
+or focus anything.
 
 ```bash
 # speak, then point at the window whose title contains this text
@@ -88,8 +89,9 @@ not raise or focus anything.
 "C:/Dev/www/claude-speak/speak.exe" --point --title "reviewer worker"
 ```
 
-No model is loaded for pointing, so it costs ~240 ms whether a daemon is running
-or not, and `--pulses <n>` (default 3) sets how many rings.
+No model is loaded for pointing, so the only cost beyond the animation itself is
+~240 ms of process start, daemon or not. `--pulses <n>` (default 3) sets how many
+rings, and so also how long the call takes: roughly `0.8 n + 1.3` seconds.
 
 **Work out the target with `--list-targets` first.** It prints every pointable
 window as JSON — `hwnd`, `pid`, `process`, `title`, `x`, `y`, `w`, `h`:
@@ -132,7 +134,7 @@ curl -s http://127.0.0.1:8124/targets                                          #
 
 `POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses` and
 `size`; a request **must** name its target, since the daemon cannot tell where the
-call came from. It replies when the animation ends (~1.8 s), and concurrent
+call came from. It replies when the animation ends (~3.5 s), and concurrent
 requests queue.
 
 ## Rules

@@ -236,7 +236,7 @@ second of CPU, and shows up in the daemon's log as a normal `POST /tts`.
 Speech tells you *that* something finished; it does not tell you **where**. With
 several agents running in several terminals, the useful next question is which
 window to go back to. So `speak.exe` can also point at one: rings that expand out
-of the window's centre and fade, three times over, and then nothing.
+of the window's centre and fade, three times over across ~3.5 s, and then nothing.
 
 ```bat
 speak.exe --point --title "reviewer worker"   rem point at that window
@@ -302,7 +302,7 @@ $ curl -s http://127.0.0.1:8124/health
 `POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`
 and `size`. It must be told a target: the caller is at the other end of a socket,
 so the daemon's own process tree says nothing about where the request came from.
-It answers when the animation has finished (~1.8 s for three rings), and requests
+It answers when the animation has finished (~3.5 s for three rings), and requests
 queue rather than overlapping.
 
 This is a separate listener rather than a new route on upstream's `TTSServer`,
@@ -428,7 +428,7 @@ The same layered-window machinery, with the opposite personality: a perfect
 circle, no audio drive, `WS_EX_TRANSPARENT` for a fully click-through overlay,
 and a life measured in rings rather than in samples. Each ring is a Gaussian band
 at radius `R(u)` with an ease-out on `u`, a thin bright line riding a 4.5× wider
-glow so it survives over a busy window, born `0.40 s` apart and living `0.95 s`;
+glow so it survives over a busy window, born `0.80 s` apart and living `1.90 s`;
 a hot core dot re-brightens with every ring so the exact spot stays marked.
 
 One trap worth naming: **DPI.** `GetWindowRect` and overlay placement only agree
