@@ -38,6 +38,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Audio-reactive orb** — per-pixel-alpha layered window, always on top, parked above the taskbar
 - **Click the orb to pause**, click again to resume from the same word
+- **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
 - **UTF-8 / accents** — arguments are read as wide chars, so `"Olá, tudo bem?"` works
@@ -127,6 +128,15 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
 | `--orb-preview <prefix>` | — | Render a strip of frames across time and loudness, and exit |
 | `--timing` | — | Report milliseconds to first audio, and which path served it |
+| `--point` | — | Ring out a window (see [Pointing](#pointing-at-a-window)); alone it only points, with text it speaks first |
+| `--title <substr>` | — | Point at the window whose title contains this (implies `--point`) |
+| `--hwnd <n>` / `--at <x,y>` | — | Point at a window handle / a screen position (imply `--point`) |
+| `--pulses <n>` | `3` | Rings to send out |
+| `--point-size <px>` | `320` | Square size of the pointer overlay |
+| `--point-preview <prefix>` | — | Render a strip of pointer frames and exit |
+| `--list-targets` | — | Print the pointable windows as JSON and exit |
+| `--point-port <n>` | `port+1` | Daemon: port for the pointing endpoint |
+| `--no-point-server` | — | Daemon: do not serve the pointing endpoint |
 | `--serve` | — | Run as the resident daemon (see below) |
 | `--status` / `--stop` | — | Inspect or stop the daemon |
 | `--port <n>` | `8123` | Daemon port |
@@ -215,6 +225,95 @@ So the daemon nudges itself with a throwaway word every 60 s (`--keepalive <sec>
 endpoint rather than calling the engine directly, so the server serializes it
 against real requests instead of racing them. Each tick costs a fraction of a
 second of CPU, and shows up in the daemon's log as a normal `POST /tts`.
+
+## Pointing at a window
+
+<p align="center">
+  <img src="docs/pointer.png" width="640" alt="a ring leaving the marked point, two rings in flight, and the tail fading">
+</p>
+<p align="center"><em>a ring leaving the point → two in flight → the tail fading</em></p>
+
+Speech tells you *that* something finished; it does not tell you **where**. With
+several agents running in several terminals, the useful next question is which
+window to go back to. So `speak.exe` can also point at one: rings that expand out
+of the window's centre and fade, three times over, and then nothing.
+
+```bat
+speak.exe --point --title "reviewer worker"   rem point at that window
+speak.exe --title "reviewer worker" "Tests are green."   rem speak, then point
+speak.exe --list-targets                     rem what --title can match, as JSON
+speak.exe --point --at 1200,800 --pulses 2    rem a bare screen position
+speak.exe --point-preview p                   rem render the frames, no screen needed
+```
+
+No model and no audio device are involved, so a pointing call costs a process
+start (~240 ms) whether or not a daemon is running.
+
+The overlay is click-through everywhere — unlike the orb there is nothing on it
+to click — and it points at *where the window is*, without raising it or taking
+focus. A window that is behind others gets rings drawn over whatever covers it.
+
+### Which window?
+
+This is the part that needs care, and the reason `--title` exists. With no target
+given, `speak.exe` works out where the call came from:
+
+1. **`GetConsoleWindow()`**, for a classic conhost window, which owns a real
+   window of its own.
+2. Otherwise the **process tree**: under a ConPTY terminal that console is a
+   hidden pseudo-console, and a tool child of an agent gets its own conhost
+   besides — but the parent chain still reaches the terminal
+   (`speak.exe ← bash ← claude ← pwsh ← WindowsTerminal.exe`), so it walks up and
+   takes the first ancestor that owns windows. It stops before `explorer.exe` and
+   the service layer: pointing at Program Manager or a heap of File Explorer
+   windows would be worse than admitting defeat.
+
+If that ancestor owns **more than one** window, the call fails (exit 3) and
+prints the candidates as JSON instead of guessing. That is the normal case for
+Windows Terminal, which serves every window from one process:
+
+```console
+> speak.exe --point
+speak: windowsterminal.exe (pid 22788) owns 6 windows — pass --title to say which
+[{"hwnd":526232,"pid":22788,"process":"windowsterminal.exe","title":"⠐ Explore speaking with a skill", ...}]
+```
+
+Nothing in the process tree, and nothing in Windows Terminal's UI Automation
+tree, says which of those windows hosts a given pane — there is no pane or
+session id exposed anywhere on the window. The window **title** is the only
+discriminator, which is workable because terminals running an agent usually title
+themselves after the task. Hence: pick from `--list-targets`, pass `--title`.
+
+### The pointing endpoint
+
+The daemon serves this on **the next port** (`8124` by default), from its own
+listener bound to `127.0.0.1` — it moves things on someone's screen, so it never
+leaves the machine:
+
+```console
+$ curl -s -X POST http://127.0.0.1:8124/point -d '{"title":"reviewer worker"}'
+{"ok":true}
+
+$ curl -s http://127.0.0.1:8124/targets      # same list as --list-targets
+$ curl -s http://127.0.0.1:8124/health
+{"ok":true,"service":"speak-pointer"}
+```
+
+`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`
+and `size`. It must be told a target: the caller is at the other end of a socket,
+so the daemon's own process tree says nothing about where the request came from.
+It answers when the animation has finished (~1.8 s for three rings), and requests
+queue rather than overlapping.
+
+This is a separate listener rather than a new route on upstream's `TTSServer`,
+whose routing is hardcoded in a source file CMake downloads at a pinned SHA —
+carrying a patch against that file would be the only other way in.
+
+Two things it deliberately does not do: raise or focus the window (pointing is a
+hint, not a hijack), and point at a *tab*. Windows Terminal's tab headers do turn
+up in the UI Automation tree with their own bounding rectangles, so tab-level
+pointing is possible later, but it needs UIA in the binary and a way to tell
+which tab is which.
 
 ## Performance
 
@@ -322,6 +421,23 @@ Three details make it behave:
 - **`voice` is forced to zero while held.** The playback position freezes wherever
   it was, possibly mid-syllable, and the envelope at that position would otherwise
   keep the outline distorted instead of letting it settle into a circle.
+
+### The pointer
+
+The same layered-window machinery, with the opposite personality: a perfect
+circle, no audio drive, `WS_EX_TRANSPARENT` for a fully click-through overlay,
+and a life measured in rings rather than in samples. Each ring is a Gaussian band
+at radius `R(u)` with an ease-out on `u`, a thin bright line riding a 4.5× wider
+glow so it survives over a busy window, born `0.40 s` apart and living `0.95 s`;
+a hot core dot re-brightens with every ring so the exact spot stays marked.
+
+One trap worth naming: **DPI.** `GetWindowRect` and overlay placement only agree
+if the calling thread is per-monitor aware — a system-DPI-aware process is quietly
+handed virtualized rectangles, and on a scaled monitor the rings land beside the
+window instead of on it. Rather than change the whole process (the orb was written
+against the old behaviour), pointing calls `SetThreadDpiAwarenessContext` with
+`PER_MONITOR_AWARE_V2` on their own thread — awareness is per thread, so the two
+overlays coexist with different views of the screen.
 
 A held utterance keeps `speak.exe` alive until you click again — which also means
 a caller with a timeout (an agent shell, for instance) may reap it while paused.

@@ -24,6 +24,8 @@
 #include <shellapi.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <dwmapi.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +39,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -928,13 +931,10 @@ void WriteWav(const std::string& path, const std::vector<float>& samples) {
     std::fclose(f);
 }
 
-// Renders a single orb frame to a 32-bit BMP, flattened over a dark backdrop.
-// Used to eyeball/regression-check the visuals without a screen recorder.
-void DumpOrbFrame(const std::string& path, float level, float voice, float time,
-                  float pause = 0.f) {
-    std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
-    ComposeOrb(px.data(), level, voice, 1.0f, time, pause);
-
+// Writes a square of premultiplied BGRA pixels to a 32-bit BMP, flattened over
+// a dark backdrop. Used to eyeball/regression-check the visuals without a screen
+// recorder — the overlays themselves are invisible to GDI capture.
+void WriteBmp(const std::string& path, std::vector<uint32_t> px, int S) {
     const uint32_t data_bytes = static_cast<uint32_t>(px.size() * 4);
     BITMAPFILEHEADER fh{};
     fh.bfType    = 0x4D42;  // "BM"
@@ -942,8 +942,8 @@ void DumpOrbFrame(const std::string& path, float level, float voice, float time,
     fh.bfSize    = fh.bfOffBits + data_bytes;
     BITMAPINFOHEADER ih{};
     ih.biSize     = sizeof(ih);
-    ih.biWidth    = g_orb_size;
-    ih.biHeight   = -g_orb_size;  // top-down
+    ih.biWidth    = S;
+    ih.biHeight   = -S;  // top-down
     ih.biPlanes   = 1;
     ih.biBitCount = 32;
 
@@ -964,6 +964,512 @@ void DumpOrbFrame(const std::string& path, float level, float voice, float time,
     std::fclose(f);
 }
 
+void DumpOrbFrame(const std::string& path, float level, float voice, float time,
+                  float pause = 0.f) {
+    std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
+    ComposeOrb(px.data(), level, voice, 1.0f, time, pause);
+    WriteBmp(path, std::move(px), g_orb_size);
+}
+
+// ── Pointing at a window ────────────────────────────────────────────────────
+// A second, non-interactive overlay: rings that expand out of a point and fade,
+// a few times over, so an agent can show *which* window it was that just spoke.
+// Nothing here touches the model or the audio device, so a pointing call costs
+// no more than starting the process.
+
+int g_point_size = 320;
+
+constexpr float kRingLife  = 0.95f;   // seconds one ring takes to expand and die
+constexpr float kRingGap   = 0.40f;   // seconds between successive rings
+
+float PointerDuration(int pulses) {
+    return (std::max(1, pulses) - 1) * kRingGap + kRingLife;
+}
+
+// One frame: `pulses` rings born kRingGap apart, each expanding out of the
+// centre and thinning as it goes, over a hot core that marks the exact spot.
+// Perfectly circular by design — this is a pointer, not a voice.
+void ComposePointer(uint32_t* px, int S, float t, int pulses) {
+    g_geom.Ensure(S);
+    const size_t n = static_cast<size_t>(S) * S;
+    std::memset(px, 0, n * 4);
+
+    const float total = PointerDuration(pulses);
+    // Fade in fast, and out over the last stretch so nothing snaps off-screen.
+    const float fade = std::min(Clamp01(t / 0.08f), Clamp01((total - t) / 0.22f));
+    if (fade <= 0.f) return;
+
+    const float R_max = S * 0.46f;
+
+    // Core: brightest as each ring is born, so the spot itself keeps blinking.
+    float core = 0.f;
+    for (int i = 0; i < pulses; ++i) {
+        const float u = (t - i * kRingGap) / kRingLife;
+        if (u < 0.f || u > 1.f) continue;
+        core = std::max(core, (1.f - u) * (1.f - u));
+    }
+    if (core > 0.f) {
+        const float r    = S * 0.030f * (1.f + 0.35f * core);
+        const float halo = S * 0.105f;
+        for (size_t i = 0; i < n; ++i) {
+            const float d = g_geom.dist[i];
+            if (d > halo) continue;
+            const float dot = 1.f - SmoothStep(r - 1.2f, r + 1.2f, d);
+            const float glow = d > r ? 0.42f * std::pow(1.f - (d - r) / (halo - r), 3.f) : 0.f;
+            const float a = Clamp01(dot + (1.f - dot) * glow) * core * fade;
+            if (a <= 0.004f) continue;
+            px[i] = BlendOver(Pack(Mix(kHot, kEmber, 1.f - dot), a), px[i]);
+        }
+    }
+
+    // Rings, oldest (widest) first so the newest one reads on top.
+    for (int i = 0; i < pulses; ++i) {
+        const float u = (t - i * kRingGap) / kRingLife;
+        if (u < 0.f || u > 1.f) continue;
+
+        // Ease-out: leaves the centre fast, then coasts outward.
+        const float R     = R_max * (0.05f + 0.95f * (1.f - std::pow(1.f - u, 2.2f)));
+        const float sigma = 2.1f + 2.4f * u;
+        const float gain  = std::pow(1.f - u, 1.4f) * fade;
+        const Rgb   col   = Mix(kHot, kEmber, SmoothStep(0.f, 0.85f, u));
+
+        // A thin bright line riding a wider glow, so the ring still reads over a
+        // busy window instead of disappearing into the text behind it.
+        const float glow_sigma = 4.5f * sigma;
+        for (size_t j = 0; j < n; ++j) {
+            const float dr = std::fabs(g_geom.dist[j] - R);
+            if (dr > 4.f * glow_sigma) continue;
+            const float line = g_geom.Gauss(dr / sigma);
+            const float a = Clamp01((line + 0.38f * g_geom.Gauss(dr / glow_sigma)) * gain);
+            if (a <= 0.004f) continue;
+            px[j] = BlendOver(Pack(Mix(col, kHot, 0.7f * line), a), px[j]);
+        }
+    }
+}
+
+// The overlay window itself. Fully click-through (unlike the orb, there is
+// nothing here to click) and gone the moment the last ring dies.
+void PointerOverlay(POINT centre, int size, int pulses) {
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"ClaudeSpeakPointer";
+    RegisterClassExW(&wc);
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+            WS_EX_NOACTIVATE,
+        wc.lpszClassName, L"", WS_POPUP, 0, 0, size, size, nullptr, nullptr,
+        wc.hInstance, nullptr);
+    if (!hwnd) return;
+
+    HDC screen = GetDC(nullptr);
+    HDC mem_dc = CreateCompatibleDC(screen);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = size;
+    bi.bmiHeader.biHeight      = -size;   // top-down
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ old = SelectObject(mem_dc, dib);
+
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    const POINT pos{centre.x - size / 2, centre.y - size / 2};
+    const float total = PointerDuration(pulses);
+    LARGE_INTEGER qpf{}, t0{};
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const float t = float(now.QuadPart - t0.QuadPart) / float(qpf.QuadPart);
+        if (t >= total) break;
+
+        ComposePointer(static_cast<uint32_t*>(bits), size, t, pulses);
+        SIZE  wnd_size{size, size};
+        POINT src{0, 0};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(hwnd, nullptr, const_cast<POINT*>(&pos), &wnd_size, mem_dc,
+                            &src, 0, &blend, ULW_ALPHA);
+        Sleep(16);
+    }
+
+    SelectObject(mem_dc, old);
+    DeleteObject(dib);
+    DeleteDC(mem_dc);
+    ReleaseDC(nullptr, screen);
+    DestroyWindow(hwnd);
+}
+
+// ── finding the window to point at ──────────────────────────────────────────
+
+struct WindowTarget {
+    HWND        hwnd = nullptr;
+    RECT        rect{};
+    std::string title;
+    std::string process;
+    DWORD       pid = 0;
+};
+
+// Window rectangles and overlay placement are only in the same coordinate space
+// if this thread is per-monitor aware; otherwise Windows silently scales both for
+// a system-DPI-aware process and the rings land off-target on a scaled monitor.
+// Set per *thread*, so the orb (bottom-right of the primary work area) keeps the
+// process-wide awareness it was written against.
+void MakeThreadDpiAware() {
+    using Fn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        if (auto set = reinterpret_cast<Fn>(
+                GetProcAddress(user32, "SetThreadDpiAwarenessContext"))) {
+            set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+}
+
+bool WindowIsCloaked(HWND hwnd) {
+    int cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                           sizeof(cloaked))) &&
+           cloaked != 0;
+}
+
+std::string LowerAscii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::unordered_map<DWORD, std::pair<DWORD, std::string>> ProcessTable() {
+    std::unordered_map<DWORD, std::pair<DWORD, std::string>> table;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return table;
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof(e);
+    for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+        table[e.th32ProcessID] = {e.th32ParentProcessID,
+                                  LowerAscii(Utf8(e.szExeFile))};
+    }
+    CloseHandle(snap);
+    return table;
+}
+
+// Every top-level window a human could point at: visible, titled, real size, not
+// a DWM-cloaked ghost (background store apps leave those behind), and not one of
+// ours. Optionally narrowed to one process.
+std::vector<WindowTarget> EnumTargets(DWORD only_pid = 0) {
+    struct Ctx {
+        DWORD                     only_pid;
+        std::vector<WindowTarget> out;
+    } ctx{only_pid, {}};
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto& ctx = *reinterpret_cast<Ctx*>(lp);
+        if (!IsWindowVisible(hwnd)) return TRUE;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (ctx.only_pid && pid != ctx.only_pid) return TRUE;
+        if (pid == GetCurrentProcessId()) return TRUE;
+
+        wchar_t cls[64]{};
+        GetClassNameW(hwnd, cls, 64);
+        if (!std::wcscmp(cls, L"ClaudeSpeakOrb") || !std::wcscmp(cls, L"ClaudeSpeakPointer"))
+            return TRUE;
+
+        wchar_t title[512]{};
+        if (GetWindowTextW(hwnd, title, 512) <= 0) return TRUE;
+
+        RECT r{};
+        if (!GetWindowRect(hwnd, &r)) return TRUE;
+        if (r.right - r.left < 80 || r.bottom - r.top < 60) return TRUE;
+        if (WindowIsCloaked(hwnd)) return TRUE;
+
+        WindowTarget t;
+        t.hwnd  = hwnd;
+        t.rect  = r;
+        t.title = Utf8(title);
+        t.pid   = pid;
+        ctx.out.push_back(std::move(t));
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    const auto table = ProcessTable();
+    for (auto& t : ctx.out) {
+        const auto it = table.find(t.pid);
+        if (it != table.end()) t.process = it->second.second;
+    }
+    return ctx.out;
+}
+
+std::string TargetsJson(const std::vector<WindowTarget>& targets) {
+    std::string out = "[";
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const auto& t = targets[i];
+        if (i) out += ",";
+        out += "{\"hwnd\":" + std::to_string(reinterpret_cast<uintptr_t>(t.hwnd)) +
+               ",\"pid\":" + std::to_string(t.pid) +
+               ",\"process\":\"" + JsonEscape(t.process) + "\"" +
+               ",\"title\":\"" + JsonEscape(t.title) + "\"" +
+               ",\"x\":" + std::to_string(t.rect.left) +
+               ",\"y\":" + std::to_string(t.rect.top) +
+               ",\"w\":" + std::to_string(t.rect.right - t.rect.left) +
+               ",\"h\":" + std::to_string(t.rect.bottom - t.rect.top) + "}";
+    }
+    return out + "]";
+}
+
+// Where the caller lives. A tool child of an agent gets its own conhost, so the
+// console is no help — but the process tree still reaches the terminal that hosts
+// the session, so walk up it and take the first ancestor that owns windows.
+// Stops at the shell/service layer: pointing at Program Manager or a pile of
+// File Explorer windows would be worse than admitting we do not know.
+std::vector<WindowTarget> AncestorTargets(std::string* who) {
+    const auto table = ProcessTable();
+    DWORD pid = GetCurrentProcessId();
+    for (int depth = 0; depth < 16; ++depth) {
+        const auto it = table.find(pid);
+        if (it == table.end()) break;
+        pid = it->second.first;
+        const auto parent = table.find(pid);
+        if (!pid || parent == table.end()) break;
+
+        const std::string& name = parent->second.second;
+        if (name == "explorer.exe" || name == "services.exe" || name == "svchost.exe" ||
+            name == "wininit.exe" || name == "winlogon.exe" || name == "system") {
+            break;
+        }
+        auto found = EnumTargets(pid);
+        if (!found.empty()) {
+            if (who) *who = name + " (pid " + std::to_string(pid) + ")";
+            return found;
+        }
+    }
+    return {};
+}
+
+// What to point at, in the order a caller means it: explicit point, explicit
+// window, title match, or "wherever I am".
+struct PointRequest {
+    bool        have_at = false;
+    POINT       at{};
+    HWND        hwnd    = nullptr;
+    std::string title;
+    int         pulses  = 3;
+    int         size    = 0;      // 0 = g_point_size
+};
+
+// Resolves the request to a screen point. On failure fills `err` with something
+// the caller can act on, and `candidates` with the JSON list to choose from.
+bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
+                  std::string* candidates) {
+    if (req.have_at) { *out = req.at; return true; }
+
+    const auto centre = [](const WindowTarget& t) {
+        return POINT{(t.rect.left + t.rect.right) / 2, (t.rect.top + t.rect.bottom) / 2};
+    };
+
+    if (req.hwnd) {
+        if (!IsWindow(req.hwnd)) { *err = "no such window"; return false; }
+        RECT r{};
+        if (!GetWindowRect(req.hwnd, &r)) { *err = "window has no rectangle"; return false; }
+        *out = POINT{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+        return true;
+    }
+
+    if (!req.title.empty()) {
+        const std::string needle = LowerAscii(req.title);
+        std::vector<WindowTarget> hits;
+        for (auto& t : EnumTargets()) {
+            if (LowerAscii(t.title).find(needle) != std::string::npos) hits.push_back(t);
+        }
+        if (hits.empty()) { *err = "no window title contains '" + req.title + "'"; return false; }
+        if (hits.size() > 1) {
+            *err = "'" + req.title + "' matches " + std::to_string(hits.size()) + " windows";
+            if (candidates) *candidates = TargetsJson(hits);
+            return false;
+        }
+        *out = centre(hits[0]);
+        return true;
+    }
+
+    // A classic console (conhost) has a real window of its own, and a process
+    // attached to one can just ask. Under a ConPTY terminal — Windows Terminal,
+    // VS Code, an agent's tool shell — this is a hidden pseudo-console instead, so
+    // it fails the visibility test and we fall through to the process tree.
+    if (HWND console = GetConsoleWindow()) {
+        RECT r{};
+        if (IsWindowVisible(console) && !WindowIsCloaked(console) &&
+            GetWindowRect(console, &r) && r.right - r.left >= 80 && r.bottom - r.top >= 60) {
+            *out = POINT{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+            return true;
+        }
+    }
+
+    std::string who;
+    auto found = AncestorTargets(&who);
+    if (found.empty()) {
+        *err = "could not tell which window this call came from — pass --title, "
+               "--hwnd or --at";
+        return false;
+    }
+    if (found.size() > 1) {
+        // The common case: one Windows Terminal process owning a window per
+        // session. Nothing in the process tree says which one, so say so rather
+        // than pointing at an arbitrary sibling.
+        *err = who + " owns " + std::to_string(found.size()) +
+               " windows — pass --title to say which";
+        if (candidates) *candidates = TargetsJson(found);
+        return false;
+    }
+    *out = centre(found[0]);
+    return true;
+}
+
+// Runs a pointing request to completion. Must be called on a DPI-aware thread.
+bool Point(const PointRequest& req, std::string* err, std::string* candidates) {
+    POINT centre{};
+    if (!ResolvePoint(req, &centre, err, candidates)) return false;
+    PointerOverlay(centre, req.size > 0 ? req.size : g_point_size,
+                   std::max(1, req.pulses));
+    return true;
+}
+
+// ── the pointing endpoint ───────────────────────────────────────────────────
+// Upstream's TTSServer has its routes hardcoded and lives in a file CMake
+// downloads at a pinned SHA, so this is our own tiny listener next to it, on the
+// following port. Loopback only: it moves things on the user's screen.
+//
+// A request must name its target (title, hwnd or x/y). Ancestry resolution is
+// meaningless here — the caller is at the other end of a socket, and the daemon's
+// own process tree says nothing about it.
+
+std::atomic<bool> g_pointing{false};
+
+// Numbers, to go with upstream's json_get_string. Enough for a flat object of
+// integers, which is all this endpoint takes.
+bool JsonGetNumber(const std::string& json, const std::string& key, double* out) {
+    const std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + search.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+    if (pos >= json.size() || json[pos] == '"') return false;
+    char* end = nullptr;
+    const double v = std::strtod(json.c_str() + pos, &end);
+    if (end == json.c_str() + pos) return false;
+    *out = v;
+    return true;
+}
+
+void PointHttpRespond(SOCKET fd, int status, const std::string& body) {
+    const char* text = status == 200 ? "OK" : (status == 404 ? "Not Found"
+                                            : (status == 409 ? "Conflict" : "Bad Request"));
+    std::string resp = "HTTP/1.1 " + std::to_string(status) + " " + text + "\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                       "Connection: close\r\n\r\n" + body;
+    SendAll(fd, resp);
+}
+
+void HandlePointRequest(SOCKET fd) {
+    const pocket_tts::HttpRequest req = pocket_tts::HttpRequest::parse(fd);
+
+    if (req.method == "GET" && (req.path == "/health" || req.path == "/")) {
+        PointHttpRespond(fd, 200, "{\"ok\":true,\"service\":\"speak-pointer\"}");
+        return;
+    }
+    if (req.method == "GET" && req.path == "/targets") {
+        PointHttpRespond(fd, 200, TargetsJson(EnumTargets()));
+        return;
+    }
+    if (req.method != "POST" || req.path != "/point") {
+        PointHttpRespond(fd, 404,
+                         "{\"ok\":false,\"error\":\"try GET /targets or POST /point\"}");
+        return;
+    }
+
+    PointRequest pr;
+    pr.title = pocket_tts::json_get_string(req.body, "title");
+    double v = 0;
+    if (JsonGetNumber(req.body, "hwnd", &v))
+        pr.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(v));
+    double x = 0, y = 0;
+    if (JsonGetNumber(req.body, "x", &x) && JsonGetNumber(req.body, "y", &y)) {
+        pr.have_at = true;
+        pr.at = POINT{static_cast<LONG>(x), static_cast<LONG>(y)};
+    }
+    if (JsonGetNumber(req.body, "pulses", &v)) pr.pulses = static_cast<int>(v);
+    if (JsonGetNumber(req.body, "size", &v))   pr.size   = static_cast<int>(v);
+
+    if (!pr.have_at && !pr.hwnd && pr.title.empty()) {
+        PointHttpRespond(fd, 400,
+            "{\"ok\":false,\"error\":\"name a target: title, hwnd, or x and y\"}");
+        return;
+    }
+    // One overlay at a time: two animations on top of each other read as noise.
+    bool expected = false;
+    if (!g_pointing.compare_exchange_strong(expected, true)) {
+        PointHttpRespond(fd, 409, "{\"ok\":false,\"error\":\"already pointing\"}");
+        return;
+    }
+
+    std::string err, candidates;
+    const bool ok = Point(pr, &err, &candidates);
+    g_pointing.store(false);
+
+    if (ok) {
+        PointHttpRespond(fd, 200, "{\"ok\":true}");
+    } else {
+        std::string body = "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"";
+        if (!candidates.empty()) body += ",\"candidates\":" + candidates;
+        PointHttpRespond(fd, 400, body + "}");
+    }
+}
+
+// Serves the endpoint until the process ends. Its own thread, so a long animation
+// cannot stall speech and a busy engine cannot stall the animation.
+void RunPointServer(int port) {
+    MakeThreadDpiAware();
+    if (!WinsockInit()) return;
+
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof(on));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // never off this machine
+    addr.sin_port        = htons(static_cast<unsigned short>(port));
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(fd, 8) != 0) {
+        std::fprintf(stderr, "speak: pointing endpoint could not take port %d\n", port);
+        closesocket(fd);
+        return;
+    }
+    std::fprintf(stderr, "speak: pointing endpoint on http://127.0.0.1:%d/point\n", port);
+
+    for (;;) {
+        SOCKET client = accept(fd, nullptr, nullptr);
+        if (client == INVALID_SOCKET) break;
+        DWORD timeout = 5000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        HandlePointRequest(client);
+        closesocket(client);
+    }
+    closesocket(fd);
+}
+
 // ── options ─────────────────────────────────────────────────────────────────
 
 struct Options {
@@ -974,6 +1480,12 @@ struct Options {
     std::string voices_dir;
     std::string dump_orb;       // render one orb frame to this BMP and exit
     std::string orb_preview;    // render a strip of orb frames to <prefix>N.bmp
+    std::string point_preview;  // render a strip of pointer frames and exit
+    bool   point        = false;   // point at a window (before or instead of speaking)
+    bool   list_targets = false;
+    bool   point_server = true;    // daemon: serve the pointing endpoint
+    int    point_port   = 0;       // 0 = speech port + 1
+    PointRequest point_req;
     bool   show_orb    = true;
     bool   timing      = false;
     bool   auto_serve  = true;   // warm a daemon in the background on a cold call
@@ -1059,6 +1571,13 @@ int RunDaemon(const Options& opt) {
         pocket_tts::TTSServer server(tts, opt.port);
         if (!server.start()) return 1;
 
+        // The pointing endpoint rides along on the next port. Separate listener,
+        // separate thread, no model involved.
+        if (opt.point_server) {
+            const int point_port = opt.point_port ? opt.point_port : opt.port + 1;
+            std::thread(RunPointServer, point_port).detach();
+        }
+
         // Keepalive: an idle daemon gets slow again (CPU clocks down, its working
         // set gets paged out), turning ~100 ms calls into ~500 ms ones. So nudge
         // it periodically with a throwaway word. This goes through our own HTTP
@@ -1094,6 +1613,8 @@ bool SpawnDaemon(const Options& opt) {
                       " --eos-extra " + std::to_string(opt.eos_extra) +
                       " --keepalive " + std::to_string(opt.keepalive);
     if (opt.threads) cmd += " --threads " + std::to_string(opt.threads);
+    if (opt.point_port) cmd += " --point-port " + std::to_string(opt.point_port);
+    if (!opt.point_server) cmd += " --no-point-server";
 
     std::wstring wcmd = Wide(cmd);
     STARTUPINFOW si{};
@@ -1146,7 +1667,9 @@ void Usage() {
         "speak — text to speech with an on-screen orb\n\n"
         "  speak [options] \"text to speak\"\n"
         "  speak --serve [--port N]      run the resident daemon (fast speech)\n"
-        "  speak --status | --stop       inspect or stop the daemon\n\n"
+        "  speak --status | --stop       inspect or stop the daemon\n"
+        "  speak --point [--title T]     ring out a window so a human can find it\n"
+        "  speak --list-targets          the windows --title can match, as JSON\n\n"
         "  Click the orb to pause while speaking, click again to resume.\n\n"
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
@@ -1155,6 +1678,20 @@ void Usage() {
         "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
         "  --orb-preview <pfx>   render a strip of orb frames and exit\n"
+        "  --point               point at a window: expanding rings, then gone.\n"
+        "                        Alone it only points; with text it speaks first.\n"
+        "                        With no target given, the window of the calling\n"
+        "                        session is used, and it is an error (exit 3) if\n"
+        "                        that cannot be told apart from its siblings.\n"
+        "  --title <substr>      point at the window whose title contains this\n"
+        "  --hwnd <n>            point at this window handle\n"
+        "  --at <x,y>            point at a screen position\n"
+        "  --pulses <n>          rings to send out (default 3)\n"
+        "  --point-size <px>     pointer square size (default 320)\n"
+        "  --point-preview <pfx> render a strip of pointer frames and exit\n"
+        "  --list-targets        list pointable windows as JSON and exit\n"
+        "  --point-port <n>      daemon: pointing endpoint port (default port+1)\n"
+        "  --no-point-server     daemon: do not serve the pointing endpoint\n"
         "  --keepalive <sec>     daemon: nudge itself every N seconds so it stays\n"
         "                        fast when idle (default 60)\n"
         "  --no-keepalive        daemon: let it go cold between calls\n"
@@ -1216,6 +1753,30 @@ int main() {
         else if (a == "--status")      status = true;
         else if (a == "--dump-orb")    opt.dump_orb = next("--dump-orb");
         else if (a == "--orb-preview") opt.orb_preview = next("--orb-preview");
+        else if (a == "--point")       opt.point = true;
+        else if (a == "--list-targets") opt.list_targets = true;
+        else if (a == "--title")       { opt.point_req.title = next("--title"); opt.point = true; }
+        else if (a == "--hwnd") {
+            opt.point_req.hwnd = reinterpret_cast<HWND>(
+                static_cast<uintptr_t>(std::strtoull(next("--hwnd").c_str(), nullptr, 0)));
+            opt.point = true;
+        }
+        else if (a == "--at") {
+            const std::string v = next("--at");
+            const size_t comma = v.find(',');
+            if (comma == std::string::npos) {
+                std::fprintf(stderr, "speak: --at wants x,y\n");
+                return 2;
+            }
+            opt.point_req.have_at = true;
+            opt.point_req.at = POINT{std::atol(v.c_str()), std::atol(v.c_str() + comma + 1)};
+            opt.point = true;
+        }
+        else if (a == "--pulses")      opt.point_req.pulses = std::max(1, std::atoi(next("--pulses").c_str()));
+        else if (a == "--point-size")  g_point_size = std::max(80, std::atoi(next("--point-size").c_str()));
+        else if (a == "--point-preview") opt.point_preview = next("--point-preview");
+        else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
+        else if (a == "--no-point-server") opt.point_server = false;
         else if (a == "--orb-size")    g_orb_size = std::max(60, std::atoi(next("--orb-size").c_str()));
         else if (a == "--orb-style") {
             const std::string style = next("--orb-style");
@@ -1259,9 +1820,40 @@ int main() {
                     opt.orb_preview.c_str(), kFrames - 1);
         return 0;
     }
+    if (!opt.point_preview.empty()) {
+        // A strip across the life of the animation: the core alone, then the first
+        // ring leaving, then two rings in flight, then the tail.
+        constexpr int kFrames = 8;
+        const int  S = g_point_size;
+        const int  pulses = std::max(1, opt.point_req.pulses);
+        const float total = PointerDuration(pulses);
+        for (int i = 0; i < kFrames; ++i) {
+            std::vector<uint32_t> px(static_cast<size_t>(S) * S);
+            ComposePointer(px.data(), S, total * (i + 0.5f) / kFrames, pulses);
+            WriteBmp(opt.point_preview + std::to_string(i) + ".bmp", std::move(px), S);
+        }
+        std::printf("wrote %d frames to %s0..%d.bmp\n", kFrames,
+                    opt.point_preview.c_str(), kFrames - 1);
+        return 0;
+    }
+    if (opt.list_targets) {
+        MakeThreadDpiAware();
+        std::printf("%s\n", TargetsJson(EnumTargets()).c_str());
+        return 0;
+    }
     if (stop)   return StopDaemon(opt);
     if (status) return DaemonStatus(opt);
     if (serve)  return RunDaemon(opt);
+
+    // Pointing on its own: no model, no audio device, nothing to wait for.
+    if (opt.point && opt.text.empty()) {
+        MakeThreadDpiAware();
+        std::string err, candidates;
+        if (Point(opt.point_req, &err, &candidates)) return 0;
+        std::fprintf(stderr, "speak: %s\n", err.c_str());
+        if (!candidates.empty()) std::printf("%s\n", candidates.c_str());
+        return 3;
+    }
     if (opt.text.empty()) { Usage(); return 2; }
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
@@ -1327,6 +1919,18 @@ int main() {
     }
     if (!ok && !daemon_err.empty() && opt.use_daemon) {
         std::fprintf(stderr, "speak: daemon path failed (%s)\n", daemon_err.c_str());
+    }
+
+    // Spoke and pointing too: point afterwards, so the orb has finished and the
+    // rings are the only thing moving. A failure to point is reported but does not
+    // turn a successful utterance into a failed call.
+    if (opt.point) {
+        MakeThreadDpiAware();
+        std::string err, candidates;
+        if (!Point(opt.point_req, &err, &candidates)) {
+            std::fprintf(stderr, "speak: spoke, but could not point (%s)\n", err.c_str());
+            if (!candidates.empty()) std::printf("%s\n", candidates.c_str());
+        }
     }
     return ok ? 0 : 1;
 }

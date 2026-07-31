@@ -88,7 +88,7 @@ target_include_directories(speak PRIVATE
 target_link_libraries(speak PRIVATE
     ${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib
     sentencepiece-static
-    ws2_32 ole32 gdi32 user32
+    ws2_32 ole32 gdi32 user32 dwmapi
     delayimp
 )
 
