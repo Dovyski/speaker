@@ -22,10 +22,11 @@ $voices = Join-Path $root 'voices'
 $make   = Join-Path $root 'make-voice.ps1'
 $speak  = Join-Path $root 'speak.exe'
 
-$clean   = Join-Path $here 'clean-few-seconds.mp3'
-$battery = Join-Path $here 'jarvis_low_battery.mp3'
-$aswish  = Join-Path $here 'as-you-wish-sir-jarvis.mp3'
-$intro   = Join-Path $here 'jarvis-intro-1.mp3'
+$message = Join-Path $here 'jarvis-voice-message.mp3'
+$clean   = Join-Path $here 'jarvis-clean-few-seconds.mp3'
+$battery = Join-Path $here 'jarvis-low-battery.mp3'
+$aswish  = Join-Path $here 'jarvis-as-you-wish-sir.mp3'
+$intro   = Join-Path $here 'jarvis-intro-1.mp3'   # noisy: excluded on purpose
 
 function Build([string] $name, [string[]] $clips, [switch] $Denoise) {
     Write-Host "`n=== $name ===" -ForegroundColor Cyan
@@ -34,18 +35,21 @@ function Build([string] $name, [string[]] $clips, [switch] $Denoise) {
     else          { & pwsh -NoProfile -File $make -Out $out @clips }
 }
 
-# The chosen voice: clean sources only. The intro clip is deliberately excluded —
-# see README.md.
-Build 'jarvis-E' @($clean, $battery, $aswish)
-Copy-Item (Join-Path $voices 'jarvis-E.wav') (Join-Path $voices 'jarvis.wav') -Force
-Write-Host "`ninstalled voices/jarvis.wav (= jarvis-E)" -ForegroundColor Green
+# The chosen voice: clean sources only, longest clip first. The intro clip is
+# deliberately excluded — see README.md.
+$chosen = 'jarvis-G'
+Build $chosen @($message, $clean, $battery, $aswish)
+Copy-Item (Join-Path $voices "$chosen.wav") (Join-Path $voices 'jarvis.wav') -Force
+Write-Host "`ninstalled voices/jarvis.wav (= $chosen)" -ForegroundColor Green
 
 if ($All) {
-    Build 'jarvis-A'          @($aswish, $battery)
-    Build 'jarvis-B'          @($intro)
-    Build 'jarvis-C'          @($intro) -Denoise
-    Build 'jarvis-D'          @($intro, $aswish, $battery) -Denoise
-    Build 'jarvis-F'          @($clean, $battery, $aswish, $intro) -Denoise
+    Build 'jarvis-A' @($aswish, $battery)
+    Build 'jarvis-B' @($intro)
+    Build 'jarvis-C' @($intro) -Denoise
+    Build 'jarvis-D' @($intro, $aswish, $battery) -Denoise
+    Build 'jarvis-E' @($clean, $battery, $aswish)
+    Build 'jarvis-F' @($clean, $battery, $aswish, $intro) -Denoise
+    Build 'jarvis-H' @($message)
 }
 
 if ($Render) {
