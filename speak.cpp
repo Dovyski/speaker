@@ -20,6 +20,7 @@
 #include "pocket_tts.cpp"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -52,6 +53,10 @@ constexpr size_t kTailSilenceFrames = kSampleRate / 4;   // 250 ms
 // Shared state between the audio writer and the orb renderer.
 std::atomic<uint64_t> g_play_pos{0};      // frames handed to the speakers
 std::atomic<bool>     g_audio_done{false};
+// Set by clicking the orb, read by the audio writer: playback holds where it is
+// until the next click. The orb is the only way in, so there is nothing to do
+// here when running with --no-orb.
+std::atomic<bool>     g_paused{false};
 std::mutex            g_env_mtx;
 std::vector<float>    g_env;             // peak amplitude per kEnvBlock frames
 
@@ -91,6 +96,7 @@ constexpr Rgb kEmber {1.00f, 0.30f, 0.13f};     // red-orange
 constexpr Rgb kHot   {1.00f, 0.96f, 0.93f};     // white-hot
 constexpr Rgb kAzure {0.16f, 0.52f, 1.00f};     // blue
 constexpr Rgb kCyan  {0.36f, 0.86f, 1.00f};     // cyan
+constexpr Rgb kSteel {0.60f, 0.72f, 0.88f};     // cold, dimmed: the paused ring
 
 float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
@@ -162,8 +168,41 @@ struct OrbGeometry {
 
 OrbGeometry g_geom;
 
+// True for points inside the ring, which is the only part that reacts to a click.
+// The overlay is a square window but mostly empty, so everything outside this
+// radius is reported as transparent and the click goes to whatever is underneath.
+bool InsideOrb(HWND hwnd, POINT screen_pt) {
+    POINT p = screen_pt;
+    ScreenToClient(hwnd, &p);
+    const float c  = g_orb_size * 0.5f;
+    const float dx = p.x + 0.5f - c, dy = p.y + 0.5f - c;
+    // A shade wider than the rim (0.29 S) so the target is comfortable to hit.
+    const float hit = g_orb_size * 0.36f;
+    return dx * dx + dy * dy <= hit * hit;
+}
+
 LRESULT CALLBACK OrbWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    switch (msg) {
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+
+        // Everything but the ring itself is click-through.
+        case WM_NCHITTEST: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            return InsideOrb(hwnd, pt) ? HTCLIENT : HTTRANSPARENT;
+        }
+
+        case WM_SETCURSOR:
+            // IDC_HAND is an ANSI-typed macro without UNICODE defined.
+            SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
+            return TRUE;
+
+        // Click to pause, click again to resume.
+        case WM_LBUTTONDOWN:
+            g_paused.store(!g_paused.load());
+            return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -183,20 +222,24 @@ inline uint32_t Pack(const Rgb& c, float a) {
 // that distorts the outline — silence means a perfect circle. `level` is voice or
 // the idle breath, whichever is larger, and drives size and brightness so the orb
 // still looks alive between words.
+//
+// `pause` (0..1) is the third drive, and it reads as the orb holding its breath:
+// the ring contracts a little, cools from ember to a dim steel blue, and — since
+// the caller stops advancing `time` — comes to a near standstill.
 void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade,
-                   float time) {
+                   float time, float pause) {
     g_geom.Ensure(S);
 
-    const float R0         = S * 0.29f * (1.f + 0.09f * level);
+    const float R0         = S * 0.29f * (1.f + 0.09f * level) * (1.f - 0.055f * pause);
     // Grows superlinearly with the voice: barely rippling when quiet, properly
     // turbulent when loud, and exactly 0 — a true circle — in silence.
     const float wobble     = (0.095f + 0.19f * voice) * voice * R0;
     const float churn      = time * (1.f + 1.1f * voice);   // faster when loud
     const float spin       = time * 0.55f;           // the outline orbits
     const float rotation   = time * 0.33f;           // the colours drift round
-    const float rim_sigma  = 1.7f + 1.0f * level;    // the hot line itself
-    const float glow_sigma = 8.5f + 7.0f * level;    // coloured halo either side
-    const float gain       = 0.72f + 0.45f * level;
+    const float rim_sigma  = (1.7f + 1.0f * level) * (1.f - 0.20f * pause);
+    const float glow_sigma = (8.5f + 7.0f * level) * (1.f - 0.28f * pause);
+    const float gain       = (0.72f + 0.45f * level) * (1.f - 0.24f * pause);
 
     // Out-of-phase harmonics: circular enough to read as a ring, irregular enough
     // not to look machine-drawn. The high ones are scaled by the voice, so loud
@@ -220,7 +263,8 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade
                               h3 * std::sin(2 * ph + 0.47f * churn) +
                               h4 * std::sin(7 * ph + 1.90f * churn) +
                               h5 * std::sin(11 * ph - 2.40f * churn));
-        colour[a] = RimColour(std::fmod((th - rotation) / (2 * kPi) + 2.f, 1.f));
+        colour[a] = Mix(RimColour(std::fmod((th - rotation) / (2 * kPi) + 2.f, 1.f)),
+                        kSteel, 0.62f * pause);
     }
 
     const size_t n = static_cast<size_t>(S) * S;
@@ -270,12 +314,57 @@ void ComposeDot(uint32_t* pixels, int S, float level, float fade) {
     }
 }
 
-void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float time) {
-    if (g_orb_style == OrbStyle::Aurora) {
-        ComposeAurora(pixels, g_orb_size, level, voice, fade, time);
-    } else {
-        ComposeDot(pixels, g_orb_size, level, fade);
+// Source-over composite of one premultiplied pixel onto another.
+inline uint32_t BlendOver(uint32_t src, uint32_t dst) {
+    const uint32_t sa = src >> 24;
+    if (sa >= 254) return src;
+    const auto ch = [&](int shift) {
+        const uint32_t v = ((src >> shift) & 0xFF) +
+                           (((dst >> shift) & 0xFF) * (255 - sa) + 127) / 255;
+        return std::min(v, 255u);
+    };
+    return (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+// Two soft luminous bars at the centre — the one glyph everyone reads as "held".
+// Drawn over whatever the style composed, so both styles pause alike.
+void OverlayPauseGlyph(uint32_t* pixels, int S, float pause, float fade) {
+    if (pause <= 0.01f) return;
+    const float cx = S * 0.5f, cy = S * 0.5f;
+    const float hh   = S * 0.075f;    // half height of a bar
+    const float hw   = S * 0.017f;    // half width
+    const float gap  = S * 0.026f;    // half gap between the two bars
+    const float soft = std::max(1.f, S * 0.007f);
+    const Rgb   tint = Mix(kHot, kCyan, 0.22f);
+    // Eases in as it appears, so the bars grow out of the middle.
+    const float grow = SmoothStep(0.f, 1.f, pause);
+
+    const int y0 = std::max(0, static_cast<int>(cy - hh - soft - 1));
+    const int y1 = std::min(S, static_cast<int>(cy + hh + soft + 2));
+    for (int y = y0; y < y1; ++y) {
+        const float dy = std::fabs(y + 0.5f - cy);
+        const float ay = 1.f - SmoothStep(hh * grow - soft, hh * grow + soft, dy);
+        if (ay <= 0.f) continue;
+        for (int x = 0; x < S; ++x) {
+            const float dx = std::fabs(x + 0.5f - cx);
+            const float ax = 1.f - SmoothStep(hw - soft, hw + soft,
+                                              std::fabs(dx - (gap + hw)));
+            const float a = ax * ay * pause * fade;
+            if (a <= 0.004f) continue;
+            const size_t i = static_cast<size_t>(y) * S + x;
+            pixels[i] = BlendOver(Pack(tint, a), pixels[i]);
+        }
     }
+}
+
+void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float time,
+                float pause) {
+    if (g_orb_style == OrbStyle::Aurora) {
+        ComposeAurora(pixels, g_orb_size, level, voice, fade, time, pause);
+    } else {
+        ComposeDot(pixels, g_orb_size, level * (1.f - 0.4f * pause), fade);
+    }
+    OverlayPauseGlyph(pixels, g_orb_size, pause, fade);
 }
 
 // Pushes the composed frame to the layered window, parked just inside the
@@ -301,9 +390,11 @@ void OrbThread() {
     wc.lpszClassName = L"ClaudeSpeakOrb";
     RegisterClassExW(&wc);
 
+    // No WS_EX_TRANSPARENT: the ring has to receive clicks to be pausable. Clicks
+    // outside it are handed on via WM_NCHITTEST, so the square stays click-through.
+    // WS_EX_NOACTIVATE keeps the click from stealing focus from the user's window.
     HWND hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
-            WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"", WS_POPUP, 0, 0, g_orb_size, g_orb_size, nullptr,
         nullptr, wc.hInstance, nullptr);
     if (!hwnd) return;
@@ -324,7 +415,8 @@ void OrbThread() {
 
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
-    float voice = 0.f, level = 0.f, fade = 0.f;
+    float voice = 0.f, level = 0.f, fade = 0.f, pause = 0.f;
+    float anim = 0.f, breath_phase = 0.f;
     bool  closing = false;
     for (int frame = 0;; ++frame) {
         MSG msg;
@@ -340,21 +432,31 @@ void OrbThread() {
             std::lock_guard<std::mutex> lock(g_env_mtx);
             if (idx < g_env.size()) target = g_env[idx];
         }
+        // Pause: eased, so the transition is a settling rather than a switch.
+        pause += ((g_paused.load() ? 1.f : 0.f) - pause) * 0.16f;
+
         // Voice: the audio envelope alone, so silence really is silence and the
         // outline settles into a perfect circle. Decays a little slower than it
-        // rises, otherwise the ring snaps flat between syllables.
-        const float voice_target = Clamp01(target * 1.6f);
+        // rises, otherwise the ring snaps flat between syllables. Forced to zero
+        // while paused — the playback position is frozen, possibly mid-syllable,
+        // so the envelope there would otherwise hold the outline distorted.
+        const float voice_target = Clamp01(target * 1.6f) * (1.f - pause);
         voice += (voice_target - voice) * (voice_target > voice ? 0.35f : 0.12f);
 
-        // Level: keep it alive between words with a slow breath.
-        const float breath = 0.10f + 0.06f * std::sin(frame * 0.09f);
+        // Level: keep it alive between words with a slow breath, slower when held.
+        breath_phase += 0.09f - 0.055f * pause;
+        const float breath = 0.10f + 0.06f * std::sin(breath_phase);
         level += (std::max(voice, breath) - level) * 0.35f;
+
+        // Animation clock: nearly stops while paused, so the ring coasts to a
+        // standstill instead of freezing on the spot or spinning on regardless.
+        anim += (1.f - 0.94f * pause) / 60.f;
 
         if (g_audio_done.load()) closing = true;
         fade += ((closing ? 0.f : 1.f) - fade) * (closing ? 0.12f : 0.22f);
         if (closing && fade < 0.01f) break;
 
-        ComposeOrb(pixels, level, voice, fade, frame / 60.f);
+        ComposeOrb(pixels, level, voice, fade, anim, pause);
         PushOrb(hwnd, mem_dc);
         Sleep(16);
     }
@@ -705,8 +807,21 @@ bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audi
     std::vector<float> chunk;
     size_t             chunk_pos = 0;
     bool               source_done = false, started = false, chunk_is_tail = false;
+    bool               paused = false;
 
     while (true) {
+        // Paused (the orb was clicked): stop the device, which keeps whatever is
+        // already in its buffer and its position, and stop pulling from the
+        // source. Start() picks up exactly where it left off. Nothing else in the
+        // loop runs, so the playback position the orb reads stays put too.
+        const bool want_pause = g_paused.load();
+        if (want_pause != paused) {
+            if (want_pause) client->Stop(); else client->Start();
+            paused = want_pause;
+            std::fprintf(stderr, "speak: %s\n", paused ? "paused" : "resumed");
+        }
+        if (paused) { Sleep(16); continue; }
+
         UINT32 padding = 0;
         if (FAILED(client->GetCurrentPadding(&padding))) break;
         g_play_pos.store(written > padding ? written - padding : 0);
@@ -815,9 +930,10 @@ void WriteWav(const std::string& path, const std::vector<float>& samples) {
 
 // Renders a single orb frame to a 32-bit BMP, flattened over a dark backdrop.
 // Used to eyeball/regression-check the visuals without a screen recorder.
-void DumpOrbFrame(const std::string& path, float level, float voice, float time) {
+void DumpOrbFrame(const std::string& path, float level, float voice, float time,
+                  float pause = 0.f) {
     std::vector<uint32_t> px(static_cast<size_t>(g_orb_size) * g_orb_size);
-    ComposeOrb(px.data(), level, voice, 1.0f, time);
+    ComposeOrb(px.data(), level, voice, 1.0f, time, pause);
 
     const uint32_t data_bytes = static_cast<uint32_t>(px.size() * 4);
     BITMAPFILEHEADER fh{};
@@ -1031,6 +1147,7 @@ void Usage() {
         "  speak [options] \"text to speak\"\n"
         "  speak --serve [--port N]      run the resident daemon (fast speech)\n"
         "  speak --status | --stop       inspect or stop the daemon\n\n"
+        "  Click the orb to pause while speaking, click again to resume.\n\n"
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
@@ -1127,14 +1244,16 @@ int main() {
     }
     if (!opt.orb_preview.empty()) {
         // A strip across time and loudness, to review the look without a capture.
-        // Frame 0 is silence, so the "perfect circle when idle" case is visible.
-        constexpr int kFrames = 6;
-        constexpr float kVoices[kFrames] = {0.f, 0.25f, 0.6f, 1.f, 0.55f, 0.f};
+        // Frame 0 is silence, so the "perfect circle when idle" case is visible;
+        // the last two are the paused state easing in and fully held.
+        constexpr int kFrames = 8;
+        constexpr float kVoices[kFrames] = {0.f, 0.25f, 0.6f, 1.f, 0.55f, 0.f, 0.f, 0.f};
+        constexpr float kPauses[kFrames] = {0.f, 0.f,   0.f,  0.f, 0.f,   0.f, 0.5f, 1.f};
         for (int i = 0; i < kFrames; ++i) {
             const float t = i * 0.7f;
             const float v = kVoices[i];
             DumpOrbFrame(opt.orb_preview + std::to_string(i) + ".bmp",
-                         std::max(v, 0.13f), v, t);
+                         std::max(v, 0.13f), v, t, kPauses[i]);
         }
         std::printf("wrote %d frames to %s0..%d.bmp\n", kFrames,
                     opt.orb_preview.c_str(), kFrames - 1);

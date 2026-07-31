@@ -36,7 +36,8 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **~100 ms to first audio** with the resident daemon (vs ~5.7 s loading per call)
 - **No Python at build time or run time** — pre-exported ONNX weights, fetched by a script
 - **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
-- **Audio-reactive orb** — per-pixel-alpha layered window, click-through, always on top, parked above the taskbar
+- **Audio-reactive orb** — per-pixel-alpha layered window, always on top, parked above the taskbar
+- **Click the orb to pause**, click again to resume from the same word
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
 - **UTF-8 / accents** — arguments are read as wide chars, so `"Olá, tudo bem?"` works
@@ -114,9 +115,11 @@ speak.exe --no-orb "Speak with no overlay."
 speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 ```
 
+Click the orb while it is speaking to pause, and again to resume.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--voice <name\|path>` | `alba.wav` | Voice sample; bare names resolve inside `--voices-dir` |
+| `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `--voices-dir` |
 | `--save <file.wav>` | — | Also write the audio to a 32-bit float WAV |
 | `--no-orb` | — | Skip the on-screen indicator |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
@@ -289,6 +292,39 @@ cheap enough to ignore.
 `--orb-preview <prefix>` writes a strip of frames across time and loudness, which
 is how the image at the top of this README was made. Handy because the overlay is
 invisible to GDI screen capture (see below).
+
+### Click to pause
+
+Click the ring while it is speaking and playback holds exactly where it is; click
+again and it carries on from the same word.
+
+<p align="center">
+  <img src="docs/orb-paused.png" width="640" alt="the orb speaking, easing into the hold, and fully paused">
+</p>
+<p align="center"><em>speaking → easing into the hold → paused</em></p>
+
+The visual is the orb holding its breath: the outline settles into a true circle,
+the ring contracts slightly, cools from ember towards a dim steel blue, coasts to
+a near standstill, and two soft luminous bars grow out of the centre. Every part
+of that is a single eased `pause` value (0→1 at 0.16/frame), so it is a settling
+rather than a switch, and there is no separate "paused" drawing path.
+
+Three details make it behave:
+
+- **The square stays click-through.** The overlay window no longer sets
+  `WS_EX_TRANSPARENT` — it has to receive the click — so `WM_NCHITTEST` returns
+  `HTTRANSPARENT` for everything outside `0.36·S` of the centre, and the click
+  lands on whatever is underneath. `WS_EX_NOACTIVATE` keeps the click from
+  stealing focus from the window you were working in.
+- **Pausing is `IAudioClient::Stop()`**, which keeps the device's buffer contents
+  and position; `Start()` resumes on the very next sample. The writer also stops
+  pulling from the source, so a paused stream simply stops consuming.
+- **`voice` is forced to zero while held.** The playback position freezes wherever
+  it was, possibly mid-syllable, and the envelope at that position would otherwise
+  keep the outline distorted instead of letting it settle into a circle.
+
+A held utterance keeps `speak.exe` alive until you click again — which also means
+a caller with a timeout (an agent shell, for instance) may reap it while paused.
 
 ### Don't clip the last word
 
