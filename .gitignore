@@ -12,5 +12,12 @@ models/
 
 # voice samples and generated audio
 voices/
+samples/
 *.wav
 *.bmp
+
+# ...but the source clips voices are built from are tracked, so experiments are
+# reproducible (see voice-sources/<name>/README.md)
+!voice-sources/**/*.wav
+!voice-sources/**/*.mp3
+!voice-sources/**/*.flac
