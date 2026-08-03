@@ -37,7 +37,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **No Python at build time or run time** — pre-exported ONNX weights, fetched by a script
 - **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Audio-reactive orb** — per-pixel-alpha layered window, always on top, parked above the taskbar
-- **Caption card** — a title and a line of context beside the orb, so you also see *what* it is about
+- **Caption toast** — an icon, a title and a line of context beside the orb, in the Bootstrap variants, so you also see *what* it is about
 - **Click the orb to pause**, click again to resume from the same word
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
@@ -114,7 +114,7 @@ speak.exe "Hello world."
 speak.exe --voice narrator.wav "A different voice."
 speak.exe --save out.wav "Speak and keep a copy."
 speak.exe --no-orb "Speak with no overlay."
-speak.exe --caption-title "o-cli #85" --caption "CI green." "The pull request is ready."
+speak.exe --caption-title "o-cli #85" --caption "CI green." --caption-variant success "The pull request is ready."
 speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 ```
 
@@ -125,8 +125,10 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `--voices-dir` |
 | `--save <file.wav>` | — | Also write the audio to a 32-bit float WAV |
 | `--no-orb` | — | Skip the on-screen indicator |
-| `--caption <text>` | — | One short line of context, shown as a card left of the orb |
+| `--caption <text>` | — | One short line of context, shown as a toast left of the orb |
 | `--caption-title <t>` | — | The caption's title line, above that text |
+| `--caption-variant <v>` | `dark` | Toast colour: `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
+| `--caption-icon <i>` | per variant | Override the icon: `none`, `check`, `info`, `warn`, `ban`, `dot` |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
@@ -163,7 +165,7 @@ Paths default relative to the executable, not the working directory, so
 ## Captions
 
 <p align="center">
-  <img src="docs/caption.png" width="640" alt="a translucent card with a title and one line of context, beside the orb">
+  <img src="docs/caption.png" width="640" alt="a green success toast with an icon, a title and one line of context, beside the orb">
 </p>
 
 The orb says *something is speaking*. A caption says **what about**:
@@ -171,22 +173,48 @@ The orb says *something is speaking*. A caption says **what about**:
 ```bat
 speak.exe --caption-title "i35 - optiwork-forms" ^
           --caption "PRs 357-364 rebased on dev, tests green." ^
+          --caption-variant success ^
           "The forms batch is ready to merge."
 ```
 
-Both flags are optional and independent — a caption can be a title alone, a line
-alone, or both. The card sits to the left of the orb, which keeps its corner; the
-panel grows leftwards to fit the text, up to `340 px` wide, wrapping the body over
-at most three lines (a fourth is cut: this is a toast, not a paragraph). Sizes
-scale with `--orb-size`.
+Both text flags are optional and independent — a caption can be a title alone, a
+line alone, or both. The card sits to the left of the orb, which keeps its corner;
+it grows leftwards to fit the text, up to `360 px` wide, wrapping the body over at
+most three lines (a fourth is cut: this is a toast, not a paragraph). Sizes scale
+with `--orb-size`. Click the × to dismiss the card; the orb stays.
 
-It is drawn from the same material as the ring rather than as a separate widget:
-translucent dark glass, a hairline edge carrying the ring's ember→white→azure
-palette, and a soft halo around it. The palette **sweeps horizontally** across the
-panel and drifts at the ring's own rate, the whole thing brightens with the voice,
-and it cools to steel and dims when you pause playback — one object in two shapes.
-(Mapping the colour by angle around the panel was the first attempt; a rectangle's
-angle barely moves along its long edges, so it produced flat bands.)
+### Variants
+
+`--caption-variant` takes the Bootstrap set, in Bootstrap's own colours, each with
+an icon and with light or dark ink chosen for contrast:
+
+<p align="center">
+  <img src="docs/caption-variants.png" width="340" alt="the eight caption variants, one card each">
+</p>
+
+| Variant | Icon | Variant | Icon |
+|---|---|---|---|
+| `primary` | ⓘ | `warning` | ⚠ (ringed `!`) |
+| `secondary` | ⓘ | `info` | ⓘ |
+| `success` | ✓ | `light` | ⓘ |
+| `danger` | ⃠ | `dark` *(default)* | ⓘ |
+
+`--caption-icon none|check|info|warn|ban|dot` overrides the icon when the colour is
+right and the glyph is not. `dark` is the default: a coloured card would claim a
+meaning the caller never asked for.
+
+The card is deliberately **not** made of the same material as the ring. An earlier
+version was — translucent glass with a hairline edge carrying the ring's
+ember→white→azure palette sweeping across it, brightening with the voice — and next
+to a pulsing orb it read as two things throbbing at each other, with the moving hue
+fighting the text it framed. This one is flat and still: solid fill, a hairline
+edge (which is what gives `light` an edge on a pale desktop), and a soft drop
+shadow. Only the fade is shared with the orb, so the pair still arrives and leaves
+as one object.
+
+Every mark on it is a signed distance field: one rounded-rectangle field gives the
+silhouette, the hairline and — sampled a few rows up — the shadow, and the icons
+and the × are unions of line segments, so they stay crisp at any `--orb-size`.
 
 The text is rasterized once, when the process starts: GDI cannot draw into an
 alpha channel, so each string is drawn white-on-black into a scratch DIB and its

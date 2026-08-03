@@ -60,6 +60,10 @@ std::atomic<bool>     g_audio_done{false};
 // until the next click. The orb is the only way in, so there is nothing to do
 // here when running with --no-orb.
 std::atomic<bool>     g_paused{false};
+// Set by clicking the caption's ×, read by the renderer. The frame keeps its size
+// — the window's bitmap is allocated once — so a dismissed card simply stops
+// being drawn, leaving the orb where it was.
+std::atomic<bool>     g_cap_closed{false};
 std::mutex            g_env_mtx;
 std::vector<float>    g_env;             // peak amplitude per kEnvBlock frames
 
@@ -192,6 +196,7 @@ struct OrbGeometry {
 OrbGeometry g_geom;
 
 int CaptionStripWidth();
+bool InsideCaptionClose(HWND hwnd, POINT screen_pt);
 
 // True for points inside the ring, which is the only part that reacts to a click.
 // The overlay is a square window (wider with a caption) but mostly empty, so
@@ -213,10 +218,11 @@ LRESULT CALLBACK OrbWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PostQuitMessage(0);
             return 0;
 
-        // Everything but the ring itself is click-through.
+        // Everything but the ring and the caption's × is click-through.
         case WM_NCHITTEST: {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            return InsideOrb(hwnd, pt) ? HTCLIENT : HTTRANSPARENT;
+            return (InsideOrb(hwnd, pt) || InsideCaptionClose(hwnd, pt)) ? HTCLIENT
+                                                                        : HTTRANSPARENT;
         }
 
         case WM_SETCURSOR:
@@ -224,10 +230,15 @@ LRESULT CALLBACK OrbWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
             return TRUE;
 
-        // Click to pause, click again to resume.
-        case WM_LBUTTONDOWN:
-            g_paused.store(!g_paused.load());
+        // The × dismisses the caption; anywhere else that reaches us is the ring,
+        // where a click pauses and another resumes.
+        case WM_LBUTTONDOWN: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ClientToScreen(hwnd, &pt);
+            if (InsideCaptionClose(hwnd, pt)) g_cap_closed.store(true);
+            else                              g_paused.store(!g_paused.load());
             return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -394,30 +405,101 @@ void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float ti
 }
 
 // ── Caption ─────────────────────────────────────────────────────────────────
-// A toast to the left of the orb: a title and one short line of context, so the
-// orb says *what* it is about and not merely that something spoke. The card is
-// built once — the text cannot change mid-utterance — and blended into every
-// frame with the orb's own fade, so the two arrive and leave as one object.
+// A toast to the left of the orb: an icon, a title and one short line of
+// context, so the orb says *what* it is about and not merely that something
+// spoke. It is a flat Bootstrap-style card — solid variant colour, rounded
+// corners, a soft drop shadow, ink chosen light or dark for contrast — rather
+// than a second glowing object competing with the ring. The card is built once
+// (the text cannot change mid-utterance) and blended into every frame with the
+// orb's own fade, so the two arrive and leave together.
 
 std::string g_cap_title, g_cap_text;
 
-constexpr int kCapMaxWidth  = 340;   // panel width ceiling, at the default orb size
-constexpr int kCapGap       = 14;    // between the panel edge and the orb square
-constexpr int kCapPad       = 15;
-constexpr int kCapRadius    = 13;
-constexpr int kCapMargin    = 12;    // room around the panel for its outer glow
-constexpr int kCapLineGap   = 5;     // between title and body
-constexpr int kCapTitlePx   = 15;
-constexpr int kCapBodyPx    = 14;
+constexpr int kCapMaxWidth   = 360;  // panel width ceiling, at the default orb size
+constexpr int kCapGap        = 16;   // between the panel edge and the orb square
+constexpr int kCapPad        = 16;
+constexpr int kCapRadius     = 10;
+constexpr int kCapShadow     = 20;   // room around the panel for its drop shadow
+constexpr int kCapLineGap    = 3;    // between title and body
+constexpr int kCapTitlePx    = 16;
+constexpr int kCapBodyPx     = 14;
 constexpr int kCapTitleLines = 2;
 constexpr int kCapBodyLines  = 3;
+constexpr int kCapIcon       = 26;   // icon disc diameter
+constexpr int kCapIconGap    = 13;   // icon to text column
+constexpr int kCapClose      = 11;   // the ×, corner to corner
+constexpr int kCapCloseGap   = 14;   // text column to the ×
+constexpr int kCapStroke     = 2;    // icon and × line weight
 
-// Dark enough to read text against, translucent enough to be glass: the panel is
-// tinted by the same travelling rim colours as the orb rather than being a
-// flat-grey toast.
-constexpr float kCapFillAlpha = 0.62f;
-constexpr Rgb kCapGlass {0.035f, 0.045f, 0.065f};
-constexpr Rgb kCapBodyInk {0.90f, 0.93f, 0.97f};
+// Not fully opaque: a hair of translucency sits the card on the desktop instead
+// of on top of it, without costing any legibility.
+constexpr float kCapFillAlpha  = 0.97f;
+constexpr float kCapShadowA    = 0.34f;
+constexpr float kCapBodyFade   = 0.26f;   // body ink mixed back towards the fill
+constexpr float kCapCloseA     = 0.62f;
+constexpr Rgb   kCapDarkInk  {0.09f, 0.11f, 0.14f};
+constexpr Rgb   kCapLightInk {1.00f, 1.00f, 1.00f};
+
+enum class CapIcon { None, Check, Info, Warn, Ban, Dot };
+
+// The Bootstrap defaults, in Bootstrap's own colours. `dark_ink` is the contrast
+// choice their own utilities make for each background.
+struct CapVariant {
+    const char* name;
+    Rgb         bg;
+    bool        dark_ink;
+    CapIcon     icon;
+};
+
+constexpr CapVariant kCapVariants[] = {
+    {"primary",   {0.05f, 0.43f, 0.99f}, false, CapIcon::Info},   // #0d6efd
+    {"secondary", {0.42f, 0.46f, 0.49f}, false, CapIcon::Info},   // #6c757d
+    {"success",   {0.10f, 0.53f, 0.33f}, false, CapIcon::Check},  // #198754
+    {"danger",    {0.86f, 0.21f, 0.27f}, false, CapIcon::Ban},    // #dc3545
+    {"warning",   {1.00f, 0.76f, 0.03f}, true,  CapIcon::Warn},   // #ffc107
+    {"info",      {0.05f, 0.79f, 0.94f}, true,  CapIcon::Info},   // #0dcaf0
+    {"light",     {0.97f, 0.98f, 0.98f}, true,  CapIcon::Info},   // #f8f9fa
+    {"dark",      {0.13f, 0.15f, 0.16f}, false, CapIcon::Info},   // #212529
+};
+
+// Neutral by default: dark reads as a notification over any wallpaper, where a
+// green or red card would claim a meaning the caller never asked for.
+const CapVariant* g_cap_variant = &kCapVariants[7];
+// -1 keeps the variant's own icon; anything else overrides it.
+int g_cap_icon = -1;
+
+const CapVariant* FindCapVariant(const std::string& name) {
+    for (const CapVariant& v : kCapVariants) {
+        if (name == v.name) return &v;
+    }
+    return nullptr;
+}
+
+bool ParseCapIcon(const std::string& name, CapIcon* out) {
+    if (name == "none")       *out = CapIcon::None;
+    else if (name == "check") *out = CapIcon::Check;
+    else if (name == "info")  *out = CapIcon::Info;
+    else if (name == "warn")  *out = CapIcon::Warn;
+    else if (name == "ban")   *out = CapIcon::Ban;
+    else if (name == "dot")   *out = CapIcon::Dot;
+    else return false;
+    return true;
+}
+
+CapIcon CaptionIcon() {
+    return g_cap_icon < 0 ? g_cap_variant->icon : static_cast<CapIcon>(g_cap_icon);
+}
+
+Rgb CapInk()  { return g_cap_variant->dark_ink ? kCapDarkInk : kCapLightInk; }
+// The muted second line: the same ink pulled back towards the card, which keeps
+// the pair tonal instead of introducing a third grey.
+Rgb CapBodyInk() { return Mix(CapInk(), g_cap_variant->bg, kCapBodyFade); }
+// Barely there on a coloured card, but it is what gives the near-white ones an
+// edge to end on.
+Rgb CapBorder() {
+    return Mix(g_cap_variant->bg, g_cap_variant->dark_ink ? kCapDarkInk : kCapLightInk,
+               0.13f);
+}
 
 bool HaveCaption() { return !g_cap_title.empty() || !g_cap_text.empty(); }
 
@@ -494,24 +576,24 @@ TextMask RenderText(const std::wstring& text, int height_px, bool bold, int max_
     return mask;
 }
 
-// Geometry only, rasterized once. The colours are applied per frame, so the
-// panel's edge carries the same drifting ember→white→azure as the ring and dims
-// and brightens with it — one object, two shapes, rather than a toast parked next
-// to an orb.
+// Geometry only, rasterized once; the colours are applied per frame so the card
+// can fade with the orb. Everything drawn on it — text, icon, × — is a coverage
+// mask over the same card-sized grid, which makes compositing one pass.
 struct CaptionCard {
-    int                  w = 0, h = 0;   // panel plus the glow margin around it
+    int                  w = 0, h = 0;   // panel plus the shadow margin around it
     std::vector<float>   dist;           // signed distance to the panel edge, <0 inside
-    std::vector<uint8_t> title_ink, body_ink;   // text coverage, card-sized
+    std::vector<uint8_t> title_ink, body_ink, icon_ink, close_ink;
+    RECT                 close_hit{};    // the ×'s click target, in card coordinates
 };
 
 CaptionCard g_card;
-int g_cap_panel_w = 0;   // the glass itself, without the margin
+int g_cap_panel_w = 0;   // the card itself, without the margin
 
 // Width the caption adds to the left of the orb square, 0 when there is none. The
-// right-hand glow margin is allowed to overlap the orb square, so the gap is
-// measured from the glass edge.
+// right-hand shadow margin is allowed to overlap the orb square, so the gap is
+// measured from the card edge.
 int CaptionStripWidth() {
-    return g_card.w ? g_cap_panel_w + CapScale(kCapMargin) + CapScale(kCapGap) : 0;
+    return g_card.w ? g_cap_panel_w + CapScale(kCapShadow) + CapScale(kCapGap) : 0;
 }
 
 void StampMask(std::vector<uint8_t>* layer, int layer_w, int layer_h,
@@ -528,13 +610,88 @@ void StampMask(std::vector<uint8_t>* layer, int layer_w, int layer_h,
     }
 }
 
+// Distance from a point to a line segment: every stroke of every glyph below is
+// one of these, so the icons are resolution-independent and antialias for free.
+float SegDist(float px, float py, float ax, float ay, float bx, float by) {
+    const float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+    const float len2 = vx * vx + vy * vy;
+    const float t = len2 > 0.f ? Clamp01((wx * vx + wy * vy) / len2) : 0.f;
+    const float dx = wx - vx * t, dy = wy - vy * t;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// Rasterizes a shape given as a signed-distance function over a box, into a
+// coverage mask. `sdf` is called in box-local pixel coordinates.
+template <class Sdf>
+void StampSdf(std::vector<uint8_t>* layer, int layer_w, int layer_h, int x0, int y0,
+              int bw, int bh, Sdf sdf) {
+    for (int y = -1; y <= bh; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= layer_h) continue;
+        for (int x = -1; x <= bw; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= layer_w) continue;
+            const float a = 1.f - SmoothStep(-0.6f, 0.6f, sdf(x + 0.5f, y + 0.5f));
+            if (a <= 0.002f) continue;
+            uint8_t& dst = (*layer)[static_cast<size_t>(cy) * layer_w + cx];
+            dst = std::max(dst, static_cast<uint8_t>(a * 255.f + 0.5f));
+        }
+    }
+}
+
+// A ringed glyph, the shape every variant's icon shares: an outlined circle with
+// one or two strokes inside it, drawn to fill a box of `d` pixels.
+void StampCapIcon(CaptionCard* card, CapIcon icon, int x0, int y0, int d) {
+    if (icon == CapIcon::None || d <= 0) return;
+    const float w = std::max(1.f, static_cast<float>(CapScale(kCapStroke)));
+    const float c = d * 0.5f, r = c - w * 0.5f - 0.5f;
+    const float s = static_cast<float>(d);
+    StampSdf(&card->icon_ink, card->w, card->h, x0, y0, d, d,
+             [=](float px, float py) {
+        const float ring = std::fabs(std::sqrt((px - c) * (px - c) + (py - c) * (py - c)) - r)
+                           - w * 0.5f;
+        float inner = 1e9f;
+        switch (icon) {
+            case CapIcon::Check:
+                inner = std::min(SegDist(px, py, 0.28f * s, 0.52f * s, 0.44f * s, 0.68f * s),
+                                 SegDist(px, py, 0.44f * s, 0.68f * s, 0.74f * s, 0.34f * s))
+                        - w * 0.5f;
+                break;
+            case CapIcon::Info:
+                inner = std::min(SegDist(px, py, c, 0.45f * s, c, 0.72f * s) - w * 0.5f,
+                                 SegDist(px, py, c, 0.30f * s, c, 0.30f * s) - w * 0.62f);
+                break;
+            case CapIcon::Warn:
+                inner = std::min(SegDist(px, py, c, 0.27f * s, c, 0.56f * s) - w * 0.5f,
+                                 SegDist(px, py, c, 0.71f * s, c, 0.71f * s) - w * 0.62f);
+                break;
+            case CapIcon::Ban: {
+                const float k = r * 0.66f * 0.7071f;
+                inner = SegDist(px, py, c - k, c - k, c + k, c + k) - w * 0.5f;
+                break;
+            }
+            case CapIcon::Dot:
+                inner = SegDist(px, py, c, c, c, c) - d * 0.17f;
+                break;
+            default:
+                break;
+        }
+        return std::min(ring, inner);
+    });
+}
+
 void BuildCaptionCard() {
     g_card = {};
     g_cap_panel_w = 0;
     if (!HaveCaption()) return;
 
     const int pad       = CapScale(kCapPad);
-    const int max_inner = CapScale(kCapMaxWidth) - 2 * pad;
+    const int icon      = CaptionIcon() == CapIcon::None ? 0 : CapScale(kCapIcon);
+    const int icon_gap  = icon ? CapScale(kCapIconGap) : 0;
+    const int close     = CapScale(kCapClose);
+    const int close_gap = CapScale(kCapCloseGap);
+    const int max_inner = CapScale(kCapMaxWidth) - 2 * pad - icon - icon_gap -
+                          close_gap - close;
     const TextMask title = RenderText(Wide(g_cap_title), CapScale(kCapTitlePx), true,
                                       max_inner, kCapTitleLines);
     const TextMask body  = RenderText(Wide(g_cap_text), CapScale(kCapBodyPx), false,
@@ -544,8 +701,9 @@ void BuildCaptionCard() {
     const int inner_h = title.h + gap + body.h;
     if (inner_w <= 0 || inner_h <= 0) return;
 
-    const int margin = CapScale(kCapMargin);
-    const int panel_w = inner_w + 2 * pad, panel_h = inner_h + 2 * pad;
+    const int margin  = CapScale(kCapShadow);
+    const int panel_w = pad + icon + icon_gap + inner_w + close_gap + close + pad;
+    const int panel_h = std::max(inner_h, icon) + 2 * pad;
     g_cap_panel_w = panel_w;
     g_card.w = panel_w + 2 * margin;
     g_card.h = panel_h + 2 * margin;
@@ -553,16 +711,18 @@ void BuildCaptionCard() {
     g_card.dist.resize(n);
     g_card.title_ink.assign(n, 0);
     g_card.body_ink.assign(n, 0);
+    g_card.icon_ink.assign(n, 0);
+    g_card.close_ink.assign(n, 0);
 
     // Signed distance to a rounded rectangle: negative inside. One expression then
-    // gives the antialiased silhouette, the hairline on its edge and the halo
-    // outside it — exactly how the ring is drawn from its own radius.
+    // gives the antialiased silhouette, the hairline on its edge and the shadow
+    // cast below it — exactly how the ring is drawn from its own radius.
     const float radius = static_cast<float>(CapScale(kCapRadius));
     const float hw = panel_w * 0.5f, hh = panel_h * 0.5f;
-    const float cx = g_card.w * 0.5f, cy = g_card.h * 0.5f;
+    const float ccx = g_card.w * 0.5f, ccy = g_card.h * 0.5f;
     for (int y = 0; y < g_card.h; ++y) {
         for (int x = 0; x < g_card.w; ++x) {
-            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+            const float dx = x + 0.5f - ccx, dy = y + 0.5f - ccy;
             const float qx = std::max(std::fabs(dx) - (hw - radius), 0.f);
             const float qy = std::max(std::fabs(dy) - (hh - radius), 0.f);
             g_card.dist[static_cast<size_t>(y) * g_card.w + x] =
@@ -570,9 +730,28 @@ void BuildCaptionCard() {
         }
     }
 
-    StampMask(&g_card.title_ink, g_card.w, g_card.h, title, margin + pad, margin + pad);
-    StampMask(&g_card.body_ink, g_card.w, g_card.h, body, margin + pad,
-              margin + pad + title.h + gap);
+    const int text_x = margin + pad + icon + icon_gap;
+    const int text_y = margin + (panel_h - inner_h) / 2;
+    StampMask(&g_card.title_ink, g_card.w, g_card.h, title, text_x, text_y);
+    StampMask(&g_card.body_ink, g_card.w, g_card.h, body, text_x, text_y + title.h + gap);
+    StampCapIcon(&g_card, CaptionIcon(), margin + pad, margin + (panel_h - icon) / 2, icon);
+
+    // The × rides on the title's own centre line rather than the card's, which is
+    // what keeps it looking hung off the first line when the body wraps.
+    const float cw    = std::max(1.f, CapScale(kCapStroke) * 0.9f);
+    const int   close_x = margin + panel_w - pad - close;
+    const int   close_y = text_y + (title.h ? title.h : inner_h) / 2 - close / 2;
+    StampSdf(&g_card.close_ink, g_card.w, g_card.h, close_x, close_y, close, close,
+             [=](float px, float py) {
+        const float e = static_cast<float>(close) - 0.5f;
+        return std::min(SegDist(px, py, 0.5f, 0.5f, e, e),
+                        SegDist(px, py, e, 0.5f, 0.5f, e)) - cw * 0.5f;
+    });
+    // Generous around the mark itself: this is a small target on a card the user
+    // is not looking at when they reach for it.
+    const int slop = CapScale(9);
+    g_card.close_hit = RECT{close_x - slop, close_y - slop,
+                            close_x + close + slop, close_y + close + slop};
 }
 
 int FrameWidth()  { return CaptionStripWidth() + g_orb_size; }
@@ -586,70 +765,73 @@ inline uint32_t ScaleAlpha(uint32_t p, float f) {
     return (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
 }
 
-// Draws the caption into the frame: coloured halo, glass, luminous hairline, text.
-// `level`, `time` and `pause` are the orb's own drives, so the panel breathes and
-// cools with the ring instead of sitting there statically.
-void OverlayCaption(uint32_t* frame, int W, int H, float level, float fade,
-                    float time, float pause) {
-    if (!g_card.w || fade <= 0.004f) return;
+// Where the card sits in the frame: hard against the left edge (its shadow
+// margin included) and centred on the orb.
+int CaptionOriginY(int H) { return (H - g_card.h) / 2; }
 
-    const float rotation  = time * 0.33f;                    // as the ring's colours drift
-    // The title is one colour at a time, sampled from the same cycle: per-pixel
-    // rim colour turns a five-word title into five differently coloured words.
-    const Rgb title_col = Mix(Mix(RimColour(std::fmod(0.62f - rotation + 2.f, 1.f)),
-                                  kSteel, 0.62f * pause), kHot, 0.28f);
-    const float rim_sigma = std::max(0.9f, CapScale(1) * 1.1f);
-    const float glow_sigma = static_cast<float>(CapScale(kCapMargin));
-    const float lit  = (0.80f + 0.42f * level) * (1.f - 0.30f * pause);
-    const float x0   = 0.f;
-    const int   y0   = (H - g_card.h) / 2;
+// The one clickable thing on the card. Once it has been used the card is gone, so
+// the region stops claiming clicks and the desktop underneath gets them back.
+bool InsideCaptionClose(HWND hwnd, POINT screen_pt) {
+    if (!g_card.w || g_cap_closed.load()) return false;
+    POINT p = screen_pt;
+    ScreenToClient(hwnd, &p);
+    p.y -= CaptionOriginY(FrameHeight());
+    const RECT& r = g_card.close_hit;
+    return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+}
 
-    // The ring maps the palette around its circumference; a panel is not a circle,
-    // so the same palette sweeps across it horizontally instead — three quarters of
-    // a cycle, drifting at the ring's own rate. Angle-mapping was tried first and
-    // gives long flat bands along the top and bottom, where the angle barely moves.
-    static std::vector<Rgb> sweep;
-    sweep.resize(g_card.w);
-    for (int x = 0; x < g_card.w; ++x) {
-        const float u = 0.72f * (x + 0.5f) / g_card.w - rotation;
-        sweep[x] = Mix(RimColour(std::fmod(u + 2.f, 1.f)), kSteel, 0.62f * pause);
-    }
+// Draws the caption into the frame: drop shadow, solid fill, hairline edge, icon,
+// text, ×. Deliberately static — a toast that pulsed along with the ring would
+// read as two things throbbing at each other. Only `fade` is shared, so the pair
+// still arrives and leaves as one object.
+void OverlayCaption(uint32_t* frame, int W, int H, float fade) {
+    if (!g_card.w || fade <= 0.004f || g_cap_closed.load()) return;
+
+    const Rgb   fill   = g_cap_variant->bg;
+    const Rgb   border = CapBorder();
+    const Rgb   ink    = CapInk();
+    const Rgb   body   = CapBodyInk();
+    constexpr Rgb kShadowInk {0.01f, 0.02f, 0.04f};
+    const float sigma  = std::max(1.f, CapScale(kCapShadow) * 0.52f);
+    const int   drop   = CapScale(5);       // the shadow falls below the card
+    const int   y0     = CaptionOriginY(H);
 
     for (int y = 0; y < g_card.h; ++y) {
         const int fy = y0 + y;
         if (fy < 0 || fy >= H) continue;
-        for (int x = 0; x < g_card.w && x + x0 < W; ++x) {
+        for (int x = 0; x < g_card.w && x < W; ++x) {
             const size_t ci = static_cast<size_t>(y) * g_card.w + x;
             const float  d  = g_card.dist[ci];
-            const float  inside = 1.f - SmoothStep(-1.f, 0.5f, d);
-            // Deliberately capped: unlike the ring's, this line traces text, and a
-            // white-hot outline both washes its own hue out and shouts over the
-            // words it is framing.
-            const float  line = std::exp(-(d / rim_sigma) * (d / rim_sigma) * 1.6f) *
-                                (0.50f + 0.14f * level) * (1.f - 0.35f * pause);
-            const float  halo = 0.34f * std::exp(-(d / glow_sigma) * (d / glow_sigma)) * lit;
-            const uint8_t tink = g_card.title_ink[ci];
-            const uint8_t bink = g_card.body_ink[ci];
-            if (inside <= 0.004f && line <= 0.004f && halo <= 0.004f) continue;
+            const float  inside = 1.f - SmoothStep(-0.7f, 0.7f, d);
 
-            const Rgb col = sweep[x];   // same palette, same drift, cooling when held
+            // The same silhouette, sampled a few rows up, is the shape of the
+            // shadow: one distance field, two uses.
+            float shadow = 0.f;
+            const int sy = y - drop;
+            if (sy >= 0) {
+                const float sd = std::max(g_card.dist[static_cast<size_t>(sy) * g_card.w + x],
+                                          0.f);
+                shadow = kCapShadowA * std::exp(-(sd / sigma) * (sd / sigma));
+            }
+            if (inside <= 0.004f && shadow <= 0.004f) continue;
 
             uint32_t p = 0;
-            if (halo > 0.004f) p = Pack(col, Clamp01(halo));
+            if (shadow > 0.004f) p = Pack(kShadowInk, Clamp01(shadow));
             if (inside > 0.004f) {
-                // Glass, tinted by the light spilling in from its own edge.
-                const float bleed = 0.10f + 0.22f * SmoothStep(-glow_sigma, 0.f, d);
-                p = BlendOver(Pack(Mix(kCapGlass, col, bleed),
-                                   inside * kCapFillAlpha * (0.92f + 0.14f * level)),
-                              p);
+                p = BlendOver(Pack(fill, inside * kCapFillAlpha), p);
+                // A band a pixel or two wide just inside the edge. Invisible on the
+                // saturated variants; on `light` it is the only thing separating the
+                // card from a pale desktop behind it.
+                const float edge = inside * (1.f - SmoothStep(-1.8f, -0.3f, d));
+                if (edge > 0.004f) p = BlendOver(Pack(border, edge * kCapFillAlpha), p);
             }
-            if (line > 0.004f) {
-                p = BlendOver(Pack(Mix(col, kHot, 0.28f), Clamp01(line)), p);
-            }
-            if (tink) p = BlendOver(Pack(title_col, tink / 255.f), p);
-            if (bink) p = BlendOver(Pack(kCapBodyInk, bink / 255.f * 0.94f), p);
+            if (const uint8_t a = g_card.icon_ink[ci])  p = BlendOver(Pack(ink, a / 255.f), p);
+            if (const uint8_t a = g_card.title_ink[ci]) p = BlendOver(Pack(ink, a / 255.f), p);
+            if (const uint8_t a = g_card.body_ink[ci])  p = BlendOver(Pack(body, a / 255.f), p);
+            if (const uint8_t a = g_card.close_ink[ci])
+                p = BlendOver(Pack(ink, a / 255.f * kCapCloseA), p);
 
-            const size_t i = static_cast<size_t>(fy) * W + static_cast<int>(x0) + x;
+            const size_t i = static_cast<size_t>(fy) * W + x;
             frame[i] = BlendOver(ScaleAlpha(p, fade), frame[i]);
         }
     }
@@ -676,7 +858,7 @@ void ComposeFrame(uint32_t* frame, float level, float voice, float fade, float t
                     static_cast<size_t>(S) * 4);
     }
 
-    OverlayCaption(frame, W, S, level, fade, time, pause);
+    OverlayCaption(frame, W, S, fade);
 }
 
 // Pushes the composed frame to the layered window, parked just inside the
@@ -2060,13 +2242,18 @@ void Usage() {
         "  speak --status | --stop       inspect or stop the daemon\n"
         "  speak --point [--title T]     ring out a window so a human can find it\n"
         "  speak --list-targets          the windows --title can match, as JSON\n\n"
-        "  Click the orb to pause while speaking, click again to resume.\n\n"
+        "  Click the orb to pause while speaking, click again to resume.\n"
+        "  Click the caption's × to dismiss it.\n\n"
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
-        "  --caption <text>      one short line of context shown as a card to the\n"
+        "  --caption <text>      one short line of context shown as a toast to the\n"
         "                        left of the orb (the repo, the issue, the task)\n"
         "  --caption-title <t>   the caption's title line, above that text\n"
+        "  --caption-variant <v> the toast's colour: primary, secondary, success,\n"
+        "                        danger, warning, info, light or dark (default dark)\n"
+        "  --caption-icon <i>    override the variant's icon: none, check, info,\n"
+        "                        warn, ban or dot\n"
         "  --orb-style <s>       aurora (default) or dot\n"
         "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
@@ -2191,6 +2378,27 @@ int main() {
         else if (a == "--no-point-server") opt.point_server = false;
         else if (a == "--caption")       g_cap_text  = next("--caption");
         else if (a == "--caption-title") g_cap_title = next("--caption-title");
+        else if (a == "--caption-variant") {
+            const std::string name = next("--caption-variant");
+            const CapVariant* v = FindCapVariant(name);
+            if (!v) {
+                std::fprintf(stderr, "speak: unknown caption variant '%s' (primary|"
+                             "secondary|success|danger|warning|info|light|dark)\n",
+                             name.c_str());
+                return 2;
+            }
+            g_cap_variant = v;
+        }
+        else if (a == "--caption-icon") {
+            const std::string name = next("--caption-icon");
+            CapIcon icon{};
+            if (!ParseCapIcon(name, &icon)) {
+                std::fprintf(stderr, "speak: unknown caption icon '%s' (none|check|"
+                             "info|warn|ban|dot)\n", name.c_str());
+                return 2;
+            }
+            g_cap_icon = static_cast<int>(icon);
+        }
         else if (a == "--orb-size")    g_orb_size = std::max(60, std::atoi(next("--orb-size").c_str()));
         else if (a == "--orb-style") {
             const std::string style = next("--orb-style");

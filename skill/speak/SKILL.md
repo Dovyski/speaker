@@ -76,13 +76,14 @@ warms a new daemon automatically.
 ## Captions: say what it is about, on screen
 
 Speech is heard once and gone, and the orb alone does not say *which* piece of work
-just finished. A caption puts that on screen beside the orb — a title and one short
-line, styled from the same palette as the ring:
+just finished. A caption puts that on screen beside the orb as a toast — an icon, a
+title and one short line:
 
 ```bash
 "C:/Dev/www/claude-speak/speak.exe" \
     --caption-title "i35 - optiwork-forms" \
     --caption "PRs 357-364 rebased on dev, tests green." \
+    --caption-variant success \
     "The forms batch is ready to merge, sir."
 ```
 
@@ -93,6 +94,23 @@ place the sentence they just heard when several sessions are running.
 |---|---|---|
 | `--caption-title` | The subject: initiative, repository, issue, PR — `i35 - optiwork-forms`, `o-cli #85`, `optiwork-api-gateway` | one line, ~34 characters |
 | `--caption` | The state in a fragment: `PRs 357-364 rebased, tests green.`, `Deploy blocked on #1470.` | one sentence, ~2 lines |
+| `--caption-variant` | The outcome, as colour and icon (below) | one word |
+
+### Variants
+
+The Bootstrap set, each with its own icon. Pick by **what happened**, not by mood:
+
+| Variant | Use it for |
+|---|---|
+| `success` | work finished and green — merged, deployed, tests passing |
+| `danger` | broken and blocking — CI red, deploy failed, build down |
+| `warning` | finished but needs a look — flaky test, conflict resolved by hand |
+| `info` | plain progress, nothing at stake |
+| `primary` | a question or a request for the user, when they must act |
+| `secondary`, `light`, `dark` | neutral. `dark` is the default and always safe |
+
+`--caption-icon none|check|info|warn|ban|dot` overrides the variant's icon on the
+rare occasion the colour is right and the glyph is not.
 
 Rules that matter:
 
@@ -101,9 +119,10 @@ Rules that matter:
 - **Written, not spoken.** Unlike the text you speak, this is read: `#85`,
   `optiwork-forms`, `2.4×` and `→` are all fine, and preferred over spelling
   things out.
-- Body text wraps to at most three lines and the panel is at most `340 px` wide;
+- Body text wraps to at most three lines and the card is at most `360 px` wide;
   anything past that is cut, so write it short rather than trusting the wrap.
 - Either flag works alone. `--no-orb` removes the caption with the orb.
+- The user can dismiss the card by clicking its ×; the orb stays.
 - Quote each value as one argument — a bare `--caption-title i35 - optiwork-forms`
   keeps only `i35`.
 
@@ -219,8 +238,10 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `voices/` |
 | `--save <file.wav>` | — | Also write the audio to a WAV |
 | `--no-orb` | — | Speak without the on-screen orb |
-| `--caption <text>` | — | One short line of context on a card left of the orb |
+| `--caption <text>` | — | One short line of context on a toast left of the orb |
 | `--caption-title <t>` | — | The caption's title line, above that text |
+| `--caption-variant <v>` | `dark` | `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
+| `--caption-icon <i>` | per variant | `none`, `check`, `info`, `warn`, `ban`, `dot` |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--timing` | — | Report ms to first audio and which path served it |
