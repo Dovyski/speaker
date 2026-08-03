@@ -127,8 +127,9 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--no-orb` | — | Skip the on-screen indicator |
 | `--caption <text>` | — | One short line of context, shown as a toast left of the orb |
 | `--caption-title <t>` | — | The caption's title line, above that text |
-| `--caption-variant <v>` | `dark` | Toast colour: `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
+| `--caption-variant <v>` | `light` | Toast colour: `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
 | `--caption-icon <i>` | per variant | Override the icon: `none`, `check`, `info`, `warn`, `ban`, `dot` |
+| `--caption-opacity <n>` | `100` | How solid the toast is, `0`–`100` |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
@@ -196,12 +197,19 @@ an icon and with light or dark ink chosen for contrast:
 |---|---|---|---|
 | `primary` | ⓘ | `warning` | ⚠ (ringed `!`) |
 | `secondary` | ⓘ | `info` | ⓘ |
-| `success` | ✓ | `light` | ⓘ |
-| `danger` | ⃠ | `dark` *(default)* | ⓘ |
+| `success` | ✓ | `light` *(default)* | ⓘ |
+| `danger` | ⃠ | `dark` | ⓘ |
 
 `--caption-icon none|check|info|warn|ban|dot` overrides the icon when the colour is
-right and the glyph is not. `dark` is the default: a coloured card would claim a
-meaning the caller never asked for.
+right and the glyph is not. `light` is the default: a coloured card would claim a
+meaning the caller never asked for. Worth knowing that on a dark desktop the
+near-white card is the **loudest** of the eight, louder than `danger`, purely from
+tonal contrast — which is what you want from a notification, and why `dark` is
+there for when it should recede instead.
+
+`--caption-opacity <0-100>` scales the whole card — fill, shadow, text and all —
+so it can sit further back on a busy desktop without changing its colour. It
+stays legible well below `70`.
 
 The card is deliberately **not** made of the same material as the ring. An earlier
 version was — translucent glass with a hairline edge carrying the ring's

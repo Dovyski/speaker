@@ -462,11 +462,16 @@ constexpr CapVariant kCapVariants[] = {
     {"dark",      {0.13f, 0.15f, 0.16f}, false, CapIcon::Info},   // #212529
 };
 
-// Neutral by default: dark reads as a notification over any wallpaper, where a
-// green or red card would claim a meaning the caller never asked for.
-const CapVariant* g_cap_variant = &kCapVariants[7];
+// Neutral by default: `light` is the one to live with all day, where a green or
+// red card would claim a meaning the caller never asked for. Note that on a dark
+// desktop a near-white card is the *loudest* of the eight — which is the point
+// for a notification, and why `dark` is there for when it should recede.
+const CapVariant* g_cap_variant = &kCapVariants[6];
 // -1 keeps the variant's own icon; anything else overrides it.
 int g_cap_icon = -1;
+// Whole-card alpha, 0..1: the fill, the shadow, the text, all of it. 1 is a solid
+// toast; lower lets the desktop through and sits it further back.
+float g_cap_opacity = 1.f;
 
 const CapVariant* FindCapVariant(const std::string& name) {
     for (const CapVariant& v : kCapVariants) {
@@ -772,7 +777,8 @@ int CaptionOriginY(int H) { return (H - g_card.h) / 2; }
 // The one clickable thing on the card. Once it has been used the card is gone, so
 // the region stops claiming clicks and the desktop underneath gets them back.
 bool InsideCaptionClose(HWND hwnd, POINT screen_pt) {
-    if (!g_card.w || g_cap_closed.load()) return false;
+    // A card at zero opacity is not drawn, so it must not swallow clicks either.
+    if (!g_card.w || g_cap_closed.load() || g_cap_opacity <= 0.004f) return false;
     POINT p = screen_pt;
     ScreenToClient(hwnd, &p);
     p.y -= CaptionOriginY(FrameHeight());
@@ -785,6 +791,7 @@ bool InsideCaptionClose(HWND hwnd, POINT screen_pt) {
 // read as two things throbbing at each other. Only `fade` is shared, so the pair
 // still arrives and leaves as one object.
 void OverlayCaption(uint32_t* frame, int W, int H, float fade) {
+    fade *= g_cap_opacity;
     if (!g_card.w || fade <= 0.004f || g_cap_closed.load()) return;
 
     const Rgb   fill   = g_cap_variant->bg;
@@ -2251,9 +2258,10 @@ void Usage() {
         "                        left of the orb (the repo, the issue, the task)\n"
         "  --caption-title <t>   the caption's title line, above that text\n"
         "  --caption-variant <v> the toast's colour: primary, secondary, success,\n"
-        "                        danger, warning, info, light or dark (default dark)\n"
+        "                        danger, warning, info, light or dark (default light)\n"
         "  --caption-icon <i>    override the variant's icon: none, check, info,\n"
         "                        warn, ban or dot\n"
+        "  --caption-opacity <n> how solid the toast is, 0..100 (default 100)\n"
         "  --orb-style <s>       aurora (default) or dot\n"
         "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
@@ -2388,6 +2396,16 @@ int main() {
                 return 2;
             }
             g_cap_variant = v;
+        }
+        else if (a == "--caption-opacity") {
+            const std::string v = next("--caption-opacity");
+            const int pct = std::atoi(v.c_str());
+            if (pct < 0 || pct > 100) {
+                std::fprintf(stderr, "speak: --caption-opacity wants 0..100, got '%s'\n",
+                             v.c_str());
+                return 2;
+            }
+            g_cap_opacity = pct / 100.f;
         }
         else if (a == "--caption-icon") {
             const std::string name = next("--caption-icon");

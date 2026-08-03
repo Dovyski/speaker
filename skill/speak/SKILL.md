@@ -107,10 +107,19 @@ The Bootstrap set, each with its own icon. Pick by **what happened**, not by moo
 | `warning` | finished but needs a look — flaky test, conflict resolved by hand |
 | `info` | plain progress, nothing at stake |
 | `primary` | a question or a request for the user, when they must act |
-| `secondary`, `light`, `dark` | neutral. `dark` is the default and always safe |
+| `light` | **the default.** Anything with nothing to signal — omit the flag |
+| `secondary`, `dark` | neutral and quieter than `light`; `dark` recedes furthest |
+
+**Signal something only when there is something to signal.** Reach for a coloured
+variant when the outcome is the point — green for done, red for blocked — and
+otherwise say nothing and let it default to `light`. A wall of green cards teaches
+the user to stop reading them.
 
 `--caption-icon none|check|info|warn|ban|dot` overrides the variant's icon on the
 rare occasion the colour is right and the glyph is not.
+
+`--caption-opacity <0-100>` sets how solid the card is (default `100`). Lower it to
+sit the toast further back on a busy desktop; `70` is still perfectly legible.
 
 Rules that matter:
 
@@ -240,8 +249,9 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--no-orb` | — | Speak without the on-screen orb |
 | `--caption <text>` | — | One short line of context on a toast left of the orb |
 | `--caption-title <t>` | — | The caption's title line, above that text |
-| `--caption-variant <v>` | `dark` | `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
+| `--caption-variant <v>` | `light` | `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
 | `--caption-icon <i>` | per variant | `none`, `check`, `info`, `warn`, `ban`, `dot` |
+| `--caption-opacity <n>` | `100` | How solid the toast is, `0`–`100` |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--timing` | — | Report ms to first audio and which path served it |
