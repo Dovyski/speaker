@@ -166,7 +166,7 @@ Paths default relative to the executable, not the working directory, so
 ## Captions
 
 <p align="center">
-  <img src="docs/caption.png" width="640" alt="a green success toast with an icon, a title and one line of context, beside the orb">
+  <img src="docs/caption.png" width="640" alt="a light toast with an icon, a title and one line of context, beside the orb">
 </p>
 
 The orb says *something is speaking*. A caption says **what about**:
@@ -174,9 +174,11 @@ The orb says *something is speaking*. A caption says **what about**:
 ```bat
 speak.exe --caption-title "i35 - optiwork-forms" ^
           --caption "PRs 357-364 rebased on dev, tests green." ^
-          --caption-variant success ^
           "The forms batch is ready to merge."
 ```
+
+That is the default card, above: `light`, with the neutral `ⓘ`. Colour is opt-in
+(see below), so a caption never claims a meaning you did not ask for.
 
 Both text flags are optional and independent — a caption can be a title alone, a
 line alone, or both. The card sits to the left of the orb, which keeps its corner;
