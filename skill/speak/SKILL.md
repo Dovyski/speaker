@@ -83,12 +83,20 @@ title and one short line:
 "C:/Dev/www/claude-speak/speak.exe" \
     --caption-title "i35 - optiwork-forms" \
     --caption "PRs 357-364 rebased on dev, tests green." \
-    --caption-variant success \
+    --caption-variant light \
     "The forms batch is ready to merge, sir."
 ```
 
 **Caption almost every utterance.** It costs nothing, and it is what lets the user
 place the sentence they just heard when several sessions are running.
+
+**Always pass `--caption-variant light`.** It is the only variant to use for
+ordinary work — done, merged, deployed, tests green, progress, questions. Do not
+reach for `success`, `warning`, `info`, `primary`, `secondary` or `dark`.
+
+**The one exception is `danger`, and only when something is broken** — CI red,
+deploy failed, build down, data at risk. If the work succeeded, it is `light`,
+however large the milestone.
 
 | Part | Put here | Keep to |
 |---|---|---|
@@ -98,22 +106,17 @@ place the sentence they just heard when several sessions are running.
 
 ### Variants
 
-The Bootstrap set, each with its own icon. Pick by **what happened**, not by mood:
+Two are in use. The rest exist in the binary but must not be used:
 
 | Variant | Use it for |
 |---|---|
-| `success` | work finished and green — merged, deployed, tests passing |
-| `danger` | broken and blocking — CI red, deploy failed, build down |
-| `warning` | finished but needs a look — flaky test, conflict resolved by hand |
-| `info` | plain progress, nothing at stake |
-| `primary` | a question or a request for the user, when they must act |
-| `light` | **the default.** Anything with nothing to signal — omit the flag |
-| `secondary`, `dark` | neutral and quieter than `light`; `dark` recedes furthest |
+| `light` | **everything.** Done, merged, deployed, in progress, a question — all of it |
+| `danger` | **broken only** — CI red, deploy failed, build down, data at risk |
 
-**Signal something only when there is something to signal.** Reach for a coloured
-variant when the outcome is the point — green for done, red for blocked — and
-otherwise say nothing and let it default to `light`. A wall of green cards teaches
-the user to stop reading them.
+`success`, `warning`, `info`, `primary`, `secondary` and `dark` are accepted by
+`speak.exe` but are **not to be used**. A wall of coloured cards teaches the user
+to stop reading them; keeping every card `light` is what makes a red one mean
+something.
 
 `--caption-icon none|check|info|warn|ban|dot` overrides the variant's icon on the
 rare occasion the colour is right and the glyph is not.
@@ -249,7 +252,7 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--no-orb` | — | Speak without the on-screen orb |
 | `--caption <text>` | — | One short line of context on a toast left of the orb |
 | `--caption-title <t>` | — | The caption's title line, above that text |
-| `--caption-variant <v>` | `light` | `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
+| `--caption-variant <v>` | `light` | Always pass `light`; `danger` only when something is broken. Other Bootstrap values are accepted but not to be used |
 | `--caption-icon <i>` | per variant | `none`, `check`, `info`, `warn`, `ban`, `dot` |
 | `--caption-opacity <n>` | `100` | How solid the toast is, `0`–`100` |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
