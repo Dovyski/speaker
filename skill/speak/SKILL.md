@@ -1,13 +1,13 @@
 ---
 name: speak
-description: "Low-latency text-to-speech via speak.exe. Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, can caption it with the initiative/repo/issue the utterance is about, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
+description: "Low-latency text-to-speech via speak.exe. Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, can subtitle it with the initiative/repo/issue the utterance is about, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
 ---
 
 # speak — Text-to-Speech via speak.exe
 
 Speaks text out loud using a single self-contained native binary. No Python, no
 `ffplay` pipeline. A glowing orb appears in the bottom-right corner of the screen
-while the audio plays, optionally captioned with what the utterance is about.
+while the audio plays, subtitled with what the utterance is about.
 
 Source: `C:\Dev\www\claude-speak` (published at https://github.com/Dovyski/speaker).
 This skill lives in that repo under `skill/speak/`; every path below assumes
@@ -73,36 +73,70 @@ first call after a few idle minutes takes ~500 ms instead of ~100 ms. Pass
 The daemon does not survive a reboot — after one, the first call is slow and
 warms a new daemon automatically.
 
-## Captions: say what it is about, on screen
+## Subtitles: say what it is about, on screen
 
 Speech is heard once and gone, and the orb alone does not say *which* piece of work
-just finished. A caption puts that on screen beside the orb as a toast — an icon, a
-title and one short line:
+just finished. `--subtitle` puts that on screen beside the orb: one bare block of
+text, right-aligned against the ring, no card and no colour.
+
+```bash
+"C:/Dev/www/claude-speak/speak.exe" \
+    --subtitle "i35 optiwork-forms — PRs 357-364 rebased, tests green." \
+    "The forms batch is ready to merge, sir."
+```
+
+**Subtitle almost every utterance.** It costs nothing, and it is what lets the user
+place the sentence they just heard when several sessions are running. It is the
+default way to put context on screen — reach for the toast below only for the two
+cases that need it.
+
+Write it as **the subject first, then the state**: `i35 optiwork-forms — PRs
+357-364 rebased, tests green.`, `o-cli #85 — merged.`, `optiwork-api-gateway —
+deploy blocked on #1470.` The initiative, repository or issue leads, because that
+is what the user is scanning for.
+
+Rules that matter:
+
+- **Not a transcript.** The subtitle is the label, the speech is the message —
+  never the same words twice.
+- **Written, not spoken.** Unlike the text you speak, this is read: `#85`,
+  `optiwork-forms`, `2.4×` and `→` are all fine, and preferred over spelling
+  things out.
+- It wraps to at most three lines within `360 px`; anything past that is cut, so
+  keep it to **one short sentence** rather than trusting the wrap.
+- `--no-orb` removes the subtitle with the orb.
+- Quote the whole value as one argument — a bare `--subtitle i35 optiwork-forms`
+  keeps only `i35`.
+
+## The caption toast: for alerts, and when asked
+
+The toast is the older form and is still fully supported: an icon, a title and one
+short line on a coloured card. Use it in exactly two cases:
+
+1. **Something is broken** — CI red, deploy failed, build down, data at risk. The
+   subtitle has no variants and no colour, so a `danger` toast is the alert
+   channel. It may be sent alongside a subtitle or instead of one.
+2. **The user asked for the toast.** Then it is theirs to ask for; give them what
+   they asked for.
 
 ```bash
 "C:/Dev/www/claude-speak/speak.exe" \
     --caption-title "i35 - optiwork-forms" \
-    --caption "PRs 357-364 rebased on dev, tests green." \
-    --caption-variant light \
-    "The forms batch is ready to merge, sir."
+    --caption "Deploy failed, dev is down." \
+    --caption-variant danger \
+    "The deployment did not complete, sir. Dev is down."
 ```
-
-**Caption almost every utterance.** It costs nothing, and it is what lets the user
-place the sentence they just heard when several sessions are running.
-
-**Always pass `--caption-variant light`.** It is the only variant to use for
-ordinary work — done, merged, deployed, tests green, progress, questions. Do not
-reach for `success`, `warning`, `info`, `primary`, `secondary` or `dark`.
-
-**The one exception is `danger`, and only when something is broken** — CI red,
-deploy failed, build down, data at risk. If the work succeeded, it is `light`,
-however large the milestone.
 
 | Part | Put here | Keep to |
 |---|---|---|
 | `--caption-title` | The subject: initiative, repository, issue, PR — `i35 - optiwork-forms`, `o-cli #85`, `optiwork-api-gateway` | one line, ~34 characters |
-| `--caption` | The state in a fragment: `PRs 357-364 rebased, tests green.`, `Deploy blocked on #1470.` | one sentence, ~2 lines |
+| `--caption` | The state in a fragment: `Deploy failed, dev is down.`, `Deploy blocked on #1470.` | one sentence, ~2 lines |
 | `--caption-variant` | The outcome, as colour and icon (below) | one word |
+
+The subtitle's content rules apply to the toast unchanged: it is the label and not
+a transcript, written rather than spoken, three lines at `360 px`, each value
+quoted as one argument. The user can dismiss the card by clicking its ×; the orb
+and the subtitle stay.
 
 ### Variants
 
@@ -118,25 +152,17 @@ Two are in use. The rest exist in the binary but must not be used:
 to stop reading them; keeping every card `light` is what makes a red one mean
 something.
 
+Since routine context now goes to the subtitle, a toast that is not `danger` is
+almost always one the user asked for — and that one is `light`.
+
 `--caption-icon none|check|info|warn|ban|dot` overrides the variant's icon on the
 rare occasion the colour is right and the glyph is not.
 
 `--caption-opacity <0-100>` sets how solid the card is (default `100`). Lower it to
 sit the toast further back on a busy desktop; `70` is still perfectly legible.
 
-Rules that matter:
-
-- **Not a transcript.** The caption is the label, the speech is the message —
-  never the same words twice.
-- **Written, not spoken.** Unlike the text you speak, this is read: `#85`,
-  `optiwork-forms`, `2.4×` and `→` are all fine, and preferred over spelling
-  things out.
-- Body text wraps to at most three lines and the card is at most `360 px` wide;
-  anything past that is cut, so write it short rather than trusting the wrap.
-- Either flag works alone. `--no-orb` removes the caption with the orb.
-- The user can dismiss the card by clicking its ×; the orb stays.
-- Quote each value as one argument — a bare `--caption-title i35 - optiwork-forms`
-  keeps only `i35`.
+Both can be given at once: the toast keeps the top of the strip and the subtitle
+sits under it.
 
 ## Pointing at the window you spoke from
 
@@ -146,13 +172,13 @@ of it and fade, three times over ~3.5 s, then vanish. The call is synchronous an
 returns when the animation ends. The overlay is click-through and does not raise
 or focus anything.
 
-A caption and a pointing gesture answer different questions — *what* it is about
+A subtitle and a pointing gesture answer different questions — *what* it is about
 and *where* to go — so the full form of a milestone utterance carries both.
 
 ```bash
 # speak, then point at the window whose title contains this text
 "C:/Dev/www/claude-speak/speak.exe" --title "reviewer worker" \
-    --caption-title "i11 - reviewer worker" --caption "PR #451 reviewed, CI green." \
+    --subtitle "i11 reviewer worker — PR #451 reviewed, CI green." \
     "Tests are green."
 
 # point without speaking
@@ -250,7 +276,8 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--voice <name\|path>` | `jarvis.wav` | Voice sample; bare names resolve inside `voices/` |
 | `--save <file.wav>` | — | Also write the audio to a WAV |
 | `--no-orb` | — | Speak without the on-screen orb |
-| `--caption <text>` | — | One short line of context on a toast left of the orb |
+| `--subtitle <text>` | — | **The default.** One bare line of context beside the orb, no card |
+| `--caption <text>` | — | One short line of context on a toast left of the orb (alerts, or on request) |
 | `--caption-title <t>` | — | The caption's title line, above that text |
 | `--caption-variant <v>` | `light` | Always pass `light`; `danger` only when something is broken. Other Bootstrap values are accepted but not to be used |
 | `--caption-icon <i>` | per variant | `none`, `check`, `info`, `warn`, `ban`, `dot` |
