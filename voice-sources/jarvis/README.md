@@ -9,7 +9,7 @@ jarvis-clean-few-seconds.mp3  3.79 s   clean
 jarvis-low-battery.mp3        3.89 s   clean
 jarvis-as-you-wish-sir.mp3    0.88 s   clean
 jarvis-intro-1.mp3           22.71 s   background noise — see below
-jarvis-restaurant.wav        25.38 s   synthesized clip, 2026-08-15 — awaiting audition
+jarvis-restaurant.wav        25.38 s   synthesized clip, 2026-08-15 — the chosen voice (I)
 ```
 
 Durations are after trimming. Rebuild with:
@@ -32,17 +32,16 @@ Each candidate was auditioned on the same lines and judged by ear:
 | D | intro + clean clips, denoised | 27.9 s | no |
 | E | 3 clean clips | 9.05 s | good — best before the new clip arrived |
 | F | clean clips first, then denoised intro | 30.0 s | "not good at all" |
-| **G** | **4 clean clips** | **15.78 s** | **chosen — beats E by a small margin** |
+| G | 4 clean clips | 15.78 s | former choice — beat E by a small margin |
 | H | `voice-message` alone | 6.48 s | very good on its own |
-| I | `restaurant` alone | 25.38 s | awaiting audition |
-| J | `restaurant` first, then G's clips (capped) | 30.0 s | awaiting audition |
-| K | G's clips first, then `restaurant` (capped) | 30.0 s | awaiting audition |
+| **I** | **`restaurant` alone** | **25.38 s** | **chosen — beats G, J and K by ear** |
+| J | `restaurant` first, then G's clips (capped) | 30.0 s | no — merging diluted it |
+| K | G's clips first, then `restaurant` (capped) | 30.0 s | no — merging diluted it |
 
-Candidates I–K add the new `jarvis-restaurant.wav` clip. I isolates it (the
-audition-alone check from the conclusions below); J and K differ only in order,
-since the 30 s cap truncates whatever comes last. Rendered samples of each are
-in `samples/sample-jarvis-{I,J,K}.wav`. None is installed as `jarvis.wav` yet —
-G remains the chosen voice until they are judged by ear.
+Candidates I–K added the new `jarvis-restaurant.wav` clip (a synthesized take,
+2026-08-15). I isolates it; J and K merge it with G's clips in each order,
+since the 30 s cap truncates whatever comes last. I won the audition, so one
+long clean clip beat every merge of it with the older, shorter material.
 
 ## Conclusions
 
@@ -59,8 +58,12 @@ G remains the chosen voice until they are judged by ear.
   ened the sample without blending in a second voice. Worth doing for any new
   clip: audition it alone before merging it, or a mismatch will quietly degrade
   the merged voice in a way that looks like a noise problem but is not.
-- **Next step: keep growing the clean pile.** The trend has not flattened yet;
-  more short, dry clips should keep helping up to the 30 s conditioning cap.
+- **Longer is not additive across takes.** The A→E→G trend suggested more clean
+  material always helps, but I (one 25.4 s clip) beat both merges of it with G's
+  clips (J, K). A single long, consistent take beats stitched short ones — the
+  gaps and delivery changes between takes apparently cost more than the extra
+  seconds gain. Next upgrade: an even longer *single* clean take, not more
+  short clips.
 - Cheap thing to try before hunting more audio: `--temperature` (default 0.7).
   Lower is flatter and more measured, higher is livelier. It changes delivery
   rather than timbre, so it can fix "right voice, wrong performance".

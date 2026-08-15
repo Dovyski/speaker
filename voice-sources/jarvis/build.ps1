@@ -36,10 +36,10 @@ function Build([string] $name, [string[]] $clips, [switch] $Denoise) {
     else          { & pwsh -NoProfile -File $make -Out $out @clips }
 }
 
-# The chosen voice: clean sources only, longest clip first. The intro clip is
-# deliberately excluded — see README.md.
-$chosen = 'jarvis-G'
-Build $chosen @($message, $clean, $battery, $aswish)
+# The chosen voice: the restaurant clip alone beat every merged candidate by
+# ear. The intro clip stays deliberately excluded — see README.md.
+$chosen = 'jarvis-I'
+Build $chosen @($restaurant)
 Copy-Item (Join-Path $voices "$chosen.wav") (Join-Path $voices 'jarvis.wav') -Force
 Write-Host "`ninstalled voices/jarvis.wav (= $chosen)" -ForegroundColor Green
 
@@ -50,8 +50,8 @@ if ($All) {
     Build 'jarvis-D' @($intro, $aswish, $battery) -Denoise
     Build 'jarvis-E' @($clean, $battery, $aswish)
     Build 'jarvis-F' @($clean, $battery, $aswish, $intro) -Denoise
+    Build 'jarvis-G' @($message, $clean, $battery, $aswish)
     Build 'jarvis-H' @($message)
-    Build 'jarvis-I' @($restaurant)
     Build 'jarvis-J' @($restaurant, $message, $clean, $battery, $aswish)
     Build 'jarvis-K' @($message, $clean, $battery, $aswish, $restaurant)
 }
