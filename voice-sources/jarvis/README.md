@@ -9,6 +9,7 @@ jarvis-clean-few-seconds.mp3  3.79 s   clean
 jarvis-low-battery.mp3        3.89 s   clean
 jarvis-as-you-wish-sir.mp3    0.88 s   clean
 jarvis-intro-1.mp3           22.71 s   background noise — see below
+jarvis-restaurant.wav        25.38 s   synthesized clip, 2026-08-15 — awaiting audition
 ```
 
 Durations are after trimming. Rebuild with:
@@ -33,6 +34,15 @@ Each candidate was auditioned on the same lines and judged by ear:
 | F | clean clips first, then denoised intro | 30.0 s | "not good at all" |
 | **G** | **4 clean clips** | **15.78 s** | **chosen — beats E by a small margin** |
 | H | `voice-message` alone | 6.48 s | very good on its own |
+| I | `restaurant` alone | 25.38 s | awaiting audition |
+| J | `restaurant` first, then G's clips (capped) | 30.0 s | awaiting audition |
+| K | G's clips first, then `restaurant` (capped) | 30.0 s | awaiting audition |
+
+Candidates I–K add the new `jarvis-restaurant.wav` clip. I isolates it (the
+audition-alone check from the conclusions below); J and K differ only in order,
+since the 30 s cap truncates whatever comes last. Rendered samples of each are
+in `samples/sample-jarvis-{I,J,K}.wav`. None is installed as `jarvis.wav` yet —
+G remains the chosen voice until they are judged by ear.
 
 ## Conclusions
 

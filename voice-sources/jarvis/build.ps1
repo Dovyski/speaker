@@ -27,6 +27,7 @@ $clean   = Join-Path $here 'jarvis-clean-few-seconds.mp3'
 $battery = Join-Path $here 'jarvis-low-battery.mp3'
 $aswish  = Join-Path $here 'jarvis-as-you-wish-sir.mp3'
 $intro   = Join-Path $here 'jarvis-intro-1.mp3'   # noisy: excluded on purpose
+$restaurant = Join-Path $here 'jarvis-restaurant.wav'
 
 function Build([string] $name, [string[]] $clips, [switch] $Denoise) {
     Write-Host "`n=== $name ===" -ForegroundColor Cyan
@@ -50,6 +51,9 @@ if ($All) {
     Build 'jarvis-E' @($clean, $battery, $aswish)
     Build 'jarvis-F' @($clean, $battery, $aswish, $intro) -Denoise
     Build 'jarvis-H' @($message)
+    Build 'jarvis-I' @($restaurant)
+    Build 'jarvis-J' @($restaurant, $message, $clean, $battery, $aswish)
+    Build 'jarvis-K' @($message, $clean, $battery, $aswish, $restaurant)
 }
 
 if ($Render) {
@@ -59,7 +63,8 @@ if ($Render) {
     foreach ($v in Get-ChildItem (Join-Path $voices 'jarvis-*.wav')) {
         $wav = Join-Path $dir ("sample-" + $v.BaseName + ".wav")
         Write-Host "rendering $($v.BaseName) ..."
-        & $speak --no-orb --local --voice $v.FullName --save $wav $line | Out-Null
+        # --voice resolves against the voices dir, so pass the bare filename.
+        & $speak --no-orb --local --voice $v.Name --save $wav $line | Out-Null
     }
     Write-Host "`nsamples in $dir" -ForegroundColor Green
 }
