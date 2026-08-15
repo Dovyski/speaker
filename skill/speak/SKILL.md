@@ -255,6 +255,7 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--caption-variant <v>` | `light` | Always pass `light`; `danger` only when something is broken. Other Bootstrap values are accepted but not to be used |
 | `--caption-icon <i>` | per variant | `none`, `check`, `info`, `warn`, `ban`, `dot` |
 | `--caption-opacity <n>` | `100` | How solid the toast is, `0`–`100` |
+| `--subtitle <text>` | — | Alternative to the toast: bare text beside the orb, no card or colour. Use only when asked for it |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--timing` | — | Report ms to first audio and which path served it |
