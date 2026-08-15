@@ -243,8 +243,8 @@ speak.exe --subtitle "Rebasing the forms PRs on dev." "Give me a minute."
 
 `--subtitle <text>` puts the words in the same strip of screen as the toast, but
 bare: no card, no icon, no title, no ×. White text with a dark contour and a soft
-shadow under it, centred lines wrapped to at most three, right-aligned against the
-orb — legible over whatever the desktop happens to be showing, without a panel
+shadow under it, wrapped to at most three lines, each one flush against the orb so
+the ragged edge falls on the left — legible over whatever the desktop happens to be showing, without a panel
 announcing itself. Where `--caption` is a notification, this is a caption in the
 film sense: the words that go with the voice.
 

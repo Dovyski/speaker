@@ -521,7 +521,7 @@ struct TextMask {
     std::vector<uint8_t> a;
 };
 
-// `extra` adds DrawText format bits — DT_CENTER for the subtitle, nothing for the
+// `extra` adds DrawText format bits — DT_RIGHT for the subtitle, nothing for the
 // caption, which is what keeps the two callers on one rasterizer.
 TextMask RenderText(const std::wstring& text, int height_px, bool bold, int max_w,
                     int max_lines, UINT extra = 0) {
@@ -803,7 +803,7 @@ void BuildSubtitle() {
     const int pad  = halo + drop;   // room for the contour and the shadow
     const TextMask text = RenderText(Wide(g_sub_text), CapScale(kSubPx), true,
                                      CapScale(kCapMaxWidth) - 2 * pad, kSubLines,
-                                     DT_CENTER);
+                                     DT_RIGHT);
     if (text.w <= 0 || text.h <= 0) return;
 
     g_sub.w = text.w + 2 * pad;
