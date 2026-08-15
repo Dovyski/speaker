@@ -521,8 +521,10 @@ struct TextMask {
     std::vector<uint8_t> a;
 };
 
+// `extra` adds DrawText format bits — DT_CENTER for the subtitle, nothing for the
+// caption, which is what keeps the two callers on one rasterizer.
 TextMask RenderText(const std::wstring& text, int height_px, bool bold, int max_w,
-                    int max_lines) {
+                    int max_lines, UINT extra = 0) {
     TextMask mask;
     if (text.empty() || max_w <= 0) return mask;
 
@@ -536,7 +538,7 @@ TextMask RenderText(const std::wstring& text, int height_px, bool bold, int max_
                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     HGDIOBJ old_font = SelectObject(dc, font);
 
-    constexpr UINT kFlags = DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX;
+    const UINT kFlags = (DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX) | extra;
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
     RECT measure{0, 0, max_w, 0};
@@ -759,7 +761,96 @@ void BuildCaptionCard() {
                             close_x + close + slop, close_y + close + slop};
 }
 
-int FrameWidth()  { return CaptionStripWidth() + g_orb_size; }
+// ── Subtitle ────────────────────────────────────────────────────────────────
+// The same strip of screen as the caption toast, but bare: no card, no icon, no
+// title, no ×. Just the line itself, white with a dark contour so it stays
+// readable over whatever the desktop happens to be showing underneath. Where the
+// toast is a notification, this is a caption in the film sense — the words that
+// go with the voice — so it is deliberately the quieter of the two.
+//
+// Built once, like the card, and composited with the same `fade`: it arrives and
+// leaves with the orb.
+
+std::string g_sub_text;
+
+constexpr int   kSubPx      = 19;   // a touch above the toast's body line
+constexpr int   kSubLines   = 3;
+constexpr int   kSubHalo    = 2;    // contour radius, in pixels at the default size
+constexpr int   kSubDrop    = 2;    // how far the soft shadow falls
+constexpr float kSubHaloA   = 0.78f;
+constexpr float kSubDropA   = 0.42f;
+constexpr int   kSubStackGap = 4;   // between the toast and the subtitle below it
+constexpr Rgb   kSubInk   {1.00f, 1.00f, 1.00f};
+constexpr Rgb   kSubShade {0.02f, 0.03f, 0.05f};
+
+bool HaveSubtitle() { return !g_sub_text.empty(); }
+
+// Geometry-only again: `ink` is the glyph coverage, `halo` the dilated silhouette
+// that becomes the contour, `drop` the same silhouette pushed downwards.
+struct SubtitleBlock {
+    int                  w = 0, h = 0;
+    std::vector<uint8_t> ink, halo, drop;
+};
+
+SubtitleBlock g_sub;
+
+void BuildSubtitle() {
+    g_sub = {};
+    if (!HaveSubtitle()) return;
+
+    const int halo = std::max(1, CapScale(kSubHalo));
+    const int drop = std::max(1, CapScale(kSubDrop));
+    const int pad  = halo + drop;   // room for the contour and the shadow
+    const TextMask text = RenderText(Wide(g_sub_text), CapScale(kSubPx), true,
+                                     CapScale(kCapMaxWidth) - 2 * pad, kSubLines,
+                                     DT_CENTER);
+    if (text.w <= 0 || text.h <= 0) return;
+
+    g_sub.w = text.w + 2 * pad;
+    g_sub.h = text.h + 2 * pad;
+    const size_t n = static_cast<size_t>(g_sub.w) * g_sub.h;
+    g_sub.ink.assign(n, 0);
+    g_sub.halo.assign(n, 0);
+    g_sub.drop.assign(n, 0);
+    StampMask(&g_sub.ink, g_sub.w, g_sub.h, text, pad, pad);
+
+    // Contour: the maximum coverage inside a small disc around each pixel. A
+    // dilation rather than a blur, so thin strokes keep a solid edge instead of
+    // dissolving into grey.
+    const int   r  = halo;
+    const float r2 = static_cast<float>(r * r) + 0.25f;
+    for (int y = 0; y < g_sub.h; ++y) {
+        for (int x = 0; x < g_sub.w; ++x) {
+            uint8_t best = 0;
+            for (int dy = -r; dy <= r && best < 255; ++dy) {
+                const int sy = y + dy;
+                if (sy < 0 || sy >= g_sub.h) continue;
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (dx * dx + dy * dy > r2) continue;
+                    const int sx = x + dx;
+                    if (sx < 0 || sx >= g_sub.w) continue;
+                    best = std::max(best, g_sub.ink[static_cast<size_t>(sy) * g_sub.w + sx]);
+                    if (best == 255) break;
+                }
+            }
+            g_sub.halo[static_cast<size_t>(y) * g_sub.w + x] = best;
+        }
+    }
+
+    // Shadow: the contour again, a couple of rows down. Cheap, and it is what
+    // lifts the line off a busy background.
+    for (int y = g_sub.h - 1; y >= drop; --y) {
+        std::memcpy(&g_sub.drop[static_cast<size_t>(y) * g_sub.w],
+                    &g_sub.halo[static_cast<size_t>(y - drop) * g_sub.w], g_sub.w);
+    }
+}
+
+// Width the subtitle claims to the left of the orb square, gap included.
+int SubtitleStripWidth() { return g_sub.w ? g_sub.w + CapScale(kCapGap) : 0; }
+
+int FrameWidth()  {
+    return std::max(CaptionStripWidth(), SubtitleStripWidth()) + g_orb_size;
+}
 int FrameHeight() { return g_orb_size; }
 
 // Dims a premultiplied pixel — all four channels scale together.
@@ -770,9 +861,31 @@ inline uint32_t ScaleAlpha(uint32_t p, float f) {
     return (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
 }
 
-// Where the card sits in the frame: hard against the left edge (its shadow
-// margin included) and centred on the orb.
-int CaptionOriginY(int H) { return (H - g_card.h) / 2; }
+// Where the card and the subtitle sit in the frame. Both hang off the orb: they
+// are right-aligned against it and the stack as a whole is centred on it, so with
+// only one of the two present this is exactly the old placement. With both, the
+// toast keeps the top and the subtitle sits under it.
+int OverlayStackHeight() {
+    const int gap = (g_card.h && g_sub.h) ? CapScale(kSubStackGap) : 0;
+    return g_card.h + gap + g_sub.h;
+}
+
+int OverlayStackTop(int H) { return std::max(0, (H - OverlayStackHeight()) / 2); }
+
+int CaptionOriginY(int H) { return OverlayStackTop(H); }
+
+int SubtitleOriginY(int H) {
+    return OverlayStackTop(H) +
+           (g_card.h ? g_card.h + CapScale(kSubStackGap) : 0);
+}
+
+// The strip is as wide as the wider of the two, so each block is pushed right
+// until it touches the gap in front of the orb.
+int CaptionOriginX(int W) {
+    return W - g_orb_size - CapScale(kCapGap) - CapScale(kCapShadow) - g_cap_panel_w;
+}
+
+int SubtitleOriginX(int W) { return W - g_orb_size - CapScale(kCapGap) - g_sub.w; }
 
 // The one clickable thing on the card. Once it has been used the card is gone, so
 // the region stops claiming clicks and the desktop underneath gets them back.
@@ -781,6 +894,7 @@ bool InsideCaptionClose(HWND hwnd, POINT screen_pt) {
     if (!g_card.w || g_cap_closed.load() || g_cap_opacity <= 0.004f) return false;
     POINT p = screen_pt;
     ScreenToClient(hwnd, &p);
+    p.x -= CaptionOriginX(FrameWidth());
     p.y -= CaptionOriginY(FrameHeight());
     const RECT& r = g_card.close_hit;
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
@@ -802,11 +916,14 @@ void OverlayCaption(uint32_t* frame, int W, int H, float fade) {
     const float sigma  = std::max(1.f, CapScale(kCapShadow) * 0.52f);
     const int   drop   = CapScale(5);       // the shadow falls below the card
     const int   y0     = CaptionOriginY(H);
+    const int   x0     = CaptionOriginX(W);
 
     for (int y = 0; y < g_card.h; ++y) {
         const int fy = y0 + y;
         if (fy < 0 || fy >= H) continue;
-        for (int x = 0; x < g_card.w && x < W; ++x) {
+        for (int x = 0; x < g_card.w; ++x) {
+            const int fx = x0 + x;
+            if (fx < 0 || fx >= W) continue;
             const size_t ci = static_cast<size_t>(y) * g_card.w + x;
             const float  d  = g_card.dist[ci];
             const float  inside = 1.f - SmoothStep(-0.7f, 0.7f, d);
@@ -838,7 +955,38 @@ void OverlayCaption(uint32_t* frame, int W, int H, float fade) {
             if (const uint8_t a = g_card.close_ink[ci])
                 p = BlendOver(Pack(ink, a / 255.f * kCapCloseA), p);
 
-            const size_t i = static_cast<size_t>(fy) * W + x;
+            const size_t i = static_cast<size_t>(fy) * W + fx;
+            frame[i] = BlendOver(ScaleAlpha(p, fade), frame[i]);
+        }
+    }
+}
+
+// The subtitle: shadow, contour, then the words. Three coverage masks over the
+// same grid, so this is one pass with no card underneath it.
+void OverlaySubtitle(uint32_t* frame, int W, int H, float fade) {
+    if (!g_sub.w || fade <= 0.004f) return;
+
+    const int y0 = SubtitleOriginY(H);
+    const int x0 = SubtitleOriginX(W);
+
+    for (int y = 0; y < g_sub.h; ++y) {
+        const int fy = y0 + y;
+        if (fy < 0 || fy >= H) continue;
+        for (int x = 0; x < g_sub.w; ++x) {
+            const int fx = x0 + x;
+            if (fx < 0 || fx >= W) continue;
+            const size_t si = static_cast<size_t>(y) * g_sub.w + x;
+            const uint8_t ink = g_sub.ink[si];
+            const uint8_t halo = g_sub.halo[si];
+            const uint8_t shade = g_sub.drop[si];
+            if (!ink && !halo && !shade) continue;
+
+            uint32_t p = 0;
+            if (shade) p = Pack(kSubShade, shade / 255.f * kSubDropA);
+            if (halo)  p = BlendOver(Pack(kSubShade, halo / 255.f * kSubHaloA), p);
+            if (ink)   p = BlendOver(Pack(kSubInk, ink / 255.f), p);
+
+            const size_t i = static_cast<size_t>(fy) * W + fx;
             frame[i] = BlendOver(ScaleAlpha(p, fade), frame[i]);
         }
     }
@@ -866,6 +1014,7 @@ void ComposeFrame(uint32_t* frame, float level, float voice, float fade, float t
     }
 
     OverlayCaption(frame, W, S, fade);
+    OverlaySubtitle(frame, W, S, fade);
 }
 
 // Pushes the composed frame to the layered window, parked just inside the
@@ -2262,6 +2411,9 @@ void Usage() {
         "  --caption-icon <i>    override the variant's icon: none, check, info,\n"
         "                        warn, ban or dot\n"
         "  --caption-opacity <n> how solid the toast is, 0..100 (default 100)\n"
+        "  --subtitle <text>     bare text in the same strip as the toast — no card,\n"
+        "                        no icon, no title. Stacks under a --caption if both\n"
+        "                        are given\n"
         "  --orb-style <s>       aurora (default) or dot\n"
         "  --orb-size <px>       orb square size (default 220)\n"
         "  --dump-orb <f.bmp>    render one orb frame to a BMP and exit\n"
@@ -2386,6 +2538,7 @@ int main() {
         else if (a == "--no-point-server") opt.point_server = false;
         else if (a == "--caption")       g_cap_text  = next("--caption");
         else if (a == "--caption-title") g_cap_title = next("--caption-title");
+        else if (a == "--subtitle")      g_sub_text  = next("--subtitle");
         else if (a == "--caption-variant") {
             const std::string name = next("--caption-variant");
             const CapVariant* v = FindCapVariant(name);
@@ -2442,6 +2595,7 @@ int main() {
     // Rasterized once here, before anything can render a frame: --orb-size is
     // settled by now and the text never changes after this point.
     BuildCaptionCard();
+    BuildSubtitle();
 
     if (!opt.dump_orb.empty()) {
         DumpOrbFrame(opt.dump_orb, 0.65f, 0.65f, 0.f);

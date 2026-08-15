@@ -38,6 +38,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **Voice cloning** — any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Audio-reactive orb** — per-pixel-alpha layered window, always on top, parked above the taskbar
 - **Caption toast** — an icon, a title and a line of context beside the orb, in the Bootstrap variants, so you also see *what* it is about
+- **Subtitle** — `--subtitle` puts the same line there bare: white text with a dark contour, no card
 - **Click the orb to pause**, click again to resume from the same word
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
@@ -115,6 +116,7 @@ speak.exe --voice narrator.wav "A different voice."
 speak.exe --save out.wav "Speak and keep a copy."
 speak.exe --no-orb "Speak with no overlay."
 speak.exe --caption-title "o-cli #85" --caption "CI green." --caption-variant success "The pull request is ready."
+speak.exe --subtitle "Rebasing the forms PRs on dev." "Give me a minute."
 speak.exe --dump-orb orb.bmp          rem render one orb frame and exit
 ```
 
@@ -130,6 +132,7 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--caption-variant <v>` | `light` | Toast colour: `primary`, `secondary`, `success`, `danger`, `warning`, `info`, `light`, `dark` |
 | `--caption-icon <i>` | per variant | Override the icon: `none`, `check`, `info`, `warn`, `ban`, `dot` |
 | `--caption-opacity <n>` | `100` | How solid the toast is, `0`–`100` |
+| `--subtitle <text>` | — | Bare text in the same strip as the toast — no card, icon or title (see [Subtitle](#subtitle)) |
 | `--orb-style <s>` | `aurora` | `aurora` (glowing ring) or `dot` (solid core) |
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--dump-orb <file.bmp>` | — | Render a single orb frame to a BMP and exit |
@@ -231,6 +234,28 @@ alpha channel, so each string is drawn white-on-black into a scratch DIB and its
 luminance becomes the coverage mask that the per-frame colours are applied
 through. `ANTIALIASED_QUALITY` matters here — ClearType's subpixel antialiasing
 would leave colour fringes once luminance is reinterpreted as alpha.
+
+## Subtitle
+
+```bat
+speak.exe --subtitle "Rebasing the forms PRs on dev." "Give me a minute."
+```
+
+`--subtitle <text>` puts the words in the same strip of screen as the toast, but
+bare: no card, no icon, no title, no ×. White text with a dark contour and a soft
+shadow under it, centred lines wrapped to at most three, right-aligned against the
+orb — legible over whatever the desktop happens to be showing, without a panel
+announcing itself. Where `--caption` is a notification, this is a caption in the
+film sense: the words that go with the voice.
+
+The contour is a dilation of the glyph coverage — the maximum alpha inside a small
+disc around each pixel — rather than a blur, so thin strokes keep a solid edge
+instead of dissolving into grey. Like the card it is rasterized once and
+composited with the orb's own fade, so it arrives and leaves with the ring.
+
+`--caption` and `--subtitle` can be given together: the toast keeps the top of the
+strip and the subtitle sits under it, the pair centred on the orb. `--no-orb`
+suppresses both, as it always has.
 
 ## Low latency: the daemon
 
