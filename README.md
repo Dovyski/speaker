@@ -41,6 +41,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **Subtitle** — `--subtitle` puts the same line there bare: white text with a dark contour, no card
 - **Click the orb to pause**, click again to resume from the same word
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
+- **Attention panel** — a clickable list of the PRs, issues and work dirs a terminal is on, parked in its corner
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
 - **UTF-8 / accents** — arguments are read as wide chars, so `"Olá, tudo bem?"` works
@@ -147,6 +148,9 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--size <px>` | `320` | Square size of the pointer overlay |
 | `--point-preview <prefix>` | — | Render a strip of pointer frames and exit |
 | `--list-targets` | — | Print the pointable windows as JSON and exit |
+| `--panel-preview <pfx>` | — | Render the panel expanded, hovered and collapsed to PNGs, and exit |
+| `--panel-demo` | — | Park a sample panel in the `--title` window (see [The attention panel](#the-attention-panel)) |
+| `--panel-seconds <s>` | `20` | How long `--panel-demo` lasts |
 | `--point-port <n>` | `port+1` | Daemon: port for the pointing endpoint |
 | `--no-point-server` | — | Daemon: do not serve the pointing endpoint |
 | `--serve` | — | Run as the resident daemon (see below) |
@@ -443,6 +447,151 @@ hint, not a hijack), and point at a *tab*. Windows Terminal's tab headers do tur
 up in the UI Automation tree with their own bounding rectangles, so tab-level
 pointing is possible later, but it needs UIA in the binary and a way to tell
 which tab is which.
+
+## The attention panel
+
+Speech says *that* something happened, the rings say *where* — and both are over
+in a few seconds. The panel is the part that stays: a small card parked inside
+the bottom-right corner of one terminal window, listing what the session running
+in it is working on.
+
+```console
+$ curl -s -X POST http://127.0.0.1:8124/panel -d '{
+    "session": "0a7f…",
+    "title": "◑ Floating window for PR context",
+    "summary": "i47 — wiring the panel into the daemon",
+    "items": [
+      {"kind":"pr","repo":"optidatacloud/laravel-opticloud","number":1375,
+       "url":"https://github.com/optidatacloud/laravel-opticloud/pull/1375",
+       "title":"feat: calendar event reminder as a toast","status":"checks_failing"},
+      {"kind":"path","url":"C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast",
+       "title":"1372-toast"}
+    ]}'
+{"ok":true,"hwnd":1968562}
+```
+
+Each row is a badge, a short handle (`repo#1375`, or a path's last segment) and
+the title, cut with an ellipsis. **Click a row** and it opens: pull requests and
+issues in the browser, paths in Explorer — one `ShellExecute` does both, which is
+why the two can sit in the same list. Six rows are shown; anything past that
+becomes a `+N more` line, since the point is the top of a ranked list, not the
+whole backlog.
+
+| Status | Badge | Status | Badge |
+|---|---|---|---|
+| `open` | blue | `merged` | purple |
+| `approved` | green | `closed` | grey |
+| `changes_requested` | orange | `draft` | grey, hollow |
+| `checks_failing` | red | `unknown` | pale grey |
+
+The card is the caption toast's material — same rounded silhouette from one
+distance field, same hairline, same soft shadow, same fonts, the `light` variant's
+fill and ink — so the two read as one product. It stays `light` whatever
+`--caption-variant` a passing utterance set: this thing is on screen for hours,
+and a coloured card would claim the meaning that belongs to the badges.
+
+### Collapse
+
+The header is the summary line, with a `−` at the right. Click either and the
+card becomes a one-line pill: how many items, and the **worst** badge among them.
+That is enough to know whether the window wants attention, while giving the
+terminal underneath its corner back.
+
+Collapsed state belongs to the *window*, not to the payload: a new `POST` on a
+collapsed panel bumps the pill and nothing else. A card unfolding itself while
+you read the terminal is exactly what collapsing it was meant to stop. Right
+click anywhere on the card toggles it too, so the gesture does not require
+finding the header.
+
+### Following the window
+
+The panel is bound to an `hwnd`, and one thread owns every panel window — they
+are created, drawn and clicked there, so no panel state needs a lock. Forty
+times a second that thread checks each target and moves the card to the bottom
+right of its **client** area, inset 12 px, so it never rides the tab bar or hangs
+off a maximized window onto the taskbar:
+
+- the target is minimized, cloaked to another virtual desktop or hidden → the
+  panel hides, and comes back on restore
+- the target moved, resized or changed monitor → the card follows; a different
+  DPI rebuilds it, so it stays the same physical size on a scaled display
+- `IsWindow` goes false → the panel is destroyed. Nothing else cleans these up
+
+Polling rather than an `EVENT_OBJECT_LOCATIONCHANGE` hook: that hook fires for
+every child of the terminal as it lays out and still says nothing about
+minimizing, cloaking or death, all of which the same pass has to check anyway.
+There *is* one `SetWinEventHook`, on `EVENT_SYSTEM_FOREGROUND`, and it does one
+thing — re-assert `HWND_TOPMOST`, because a foreground change is when a topmost
+window can end up behind something.
+
+Hover is read from the cursor in the same pass, which needs no `WM_MOUSELEAVE`
+tracking and gets occlusion for free: `WindowFromPoint` is the test, so a row
+does not light up through whatever is covering it.
+
+The window is layered, topmost, `WS_EX_NOACTIVATE` and a tool window — but
+deliberately **not** `WS_EX_TRANSPARENT`, unlike the pointer: it has to receive
+the clicks. `WM_NCHITTEST` returns `HTTRANSPARENT` for everything outside the
+card itself, so the shadow margin does not swallow a click meant for the terminal
+behind it, and `WS_EX_NOACTIVATE` keeps a click on a row from taking focus off
+whatever you were typing in.
+
+### The contract
+
+`POST /panel` and `DELETE /panel` live on the same loopback listener as
+`/point` — the next port, `8124` by default.
+
+| Field | |
+|---|---|
+| `session` | required; the key a panel is remembered and deleted by |
+| `title` | the window, matched as below |
+| `summary` | optional; the header line, ellipsized. Falls back to `N items` |
+| `items[]` | `kind` (`pr`, `issue`, `path`), `repo`, `number`, `url`, `title`, `status` |
+
+`url` is optional for a `pr` or an `issue` with a `repo` and a `number` — the
+daemon builds the GitHub URL — and it is the only thing a row click uses, so it
+is checked before being handed to the shell: `http(s)://`, a drive-letter path or
+a UNC path, and nothing else.
+
+- Replies `{"ok":true,"hwnd":N}`, or `{"ok":false,"error":"…","candidates":[…]}`
+  with the same window list `--list-targets` prints.
+- **Empty `items` removes the panel**, so a producer never has to remember to
+  `DELETE` when its last pull request merges. `DELETE /panel?session=<id>` also
+  removes it.
+- A session that posts a different `title` takes its panel to the new window;
+  a title that already has a panel from another session is taken over. Latest
+  wins, one panel per window.
+- It answers as soon as the panel is queued. Unlike `/point`, this is a thing
+  that stays on screen rather than a gesture to wait out.
+
+**Which window** is the same problem `--title` solves for pointing, with the same
+answer: Windows Terminal serves every session from one process, so the title the
+agent sets is the only discriminator there is. Two refinements here. The title
+carries a spinner glyph that changes while the session works (`◐ …`, `✳ …`), so a
+leading non-ASCII glyph *and the space behind it* are stripped from both sides
+before comparing — the space is the test, so a title that merely starts with a
+non-ASCII word keeps its first letter. And an exact match wins over a containing
+one, so a session whose title is a prefix of another's still binds to its own
+window. Windows Terminal windows are searched first and everything else second,
+which is what makes `--panel-demo` usable against any window while developing.
+
+### Seeing it without a daemon
+
+```bat
+speak.exe --panel-preview p                        rem three PNGs, then exit
+speak.exe --panel-demo --title "reviewer worker"    rem a real panel for 20 s
+```
+
+`--panel-preview <prefix>` writes `<prefix>-expanded.png`, `-hover.png` and
+`-collapsed.png` from sample data covering every badge, a path row, a title long
+enough to be cut and one item too many so the `+N more` row appears. Layered
+windows are invisible to GDI screen capture, so rendering them is the only way to
+review the look — same reason `--orb-preview` exists. (PNG rather than the
+previews' BMP, and with no zlib linked: a deflate stream of *stored* blocks is
+legal, so the encoder is a CRC, an Adler and some framing.)
+
+`--panel-demo` parks that same sample data in the window `--title` matches, for
+`--panel-seconds` (default 20), with no daemon and no producer — which is how you
+check that it follows a move, hides on minimize and opens a row.
 
 ## Performance
 
