@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -2460,6 +2461,11 @@ constexpr int kPanRuleGap   = 5;    // header rule to the first row
 constexpr int kPanStroke    = 2;
 constexpr int kPanMaxRows   = 6;    // past this, the rest collapse into "+N more"
 constexpr int kPanTick      = 40;   // ms between follow/hover passes
+constexpr int kPanResolveMs = 500;  // ms between title→window resolver passes
+// A registration is dropped this long after its last POST. Long enough that a
+// session left alone overnight still has its panel in the morning, short enough
+// that a machine left running for a week is not carrying last week's windows.
+constexpr double kPanTtlSeconds = 48.0 * 3600.0;
 
 constexpr float kPanFillAlpha = 0.97f;
 constexpr float kPanShadowA   = 0.34f;
@@ -2784,12 +2790,19 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
 constexpr int kPanHitNone   = -2;
 constexpr int kPanHitHeader = -1;
 
+// A *registration*, not a window: a session says what it is working on and which
+// window title to look for, and that outlives any particular window. Windows
+// Terminal windows have tabs and the window title is the active tab's, so the
+// window a session belongs to comes and goes as Fernando switches tabs — the
+// card follows, the registration does not.
 struct Panel {
     std::string            session;
-    HWND                   target = nullptr;
-    HWND                   hwnd   = nullptr;
+    std::string            title;    // what to look for, re-matched every ~500 ms
+    HWND                   target = nullptr;   // the window it matches *now*, or none
+    HWND                   hwnd   = nullptr;   // our card, created on the first bind
     std::string            summary;
     std::vector<PanelItem> items;
+    time_t    updated_at = 0;        // last POST; registrations expire 48 h after it
     bool      collapsed = false;
     bool      dirty     = true;      // content changed: the card needs rebuilding
     int       hover     = kPanHitNone;
@@ -2981,11 +2994,21 @@ float PanelScaleFor(HWND target) {
 // ── which window does this panel belong to? ─────────────────────────────────
 // Same problem `--title` solves for pointing, and the same answer: Windows
 // Terminal serves every session from one process, so the title Claude Code sets
-// is the only discriminator there is. Two differences here. The title carries a
-// spinner glyph that changes while the session works (`◐ …`, `✳ …`, `⠐ …`), so
-// it is stripped from both sides before comparing; and an exact match wins over
-// a containing one, so a session whose title is a prefix of another's still
-// binds to its own window.
+// is the only discriminator there is. Three differences here.
+//
+// The title carries a spinner glyph that changes while the session works
+// (`◐ …`, `✳ …`, `⠐ …`), so a leading glyph is stripped from *both* sides before
+// comparing — the registered title was captured at one instant and the window is
+// read at another, and the two will disagree about the glyph.
+//
+// An exact match wins over a containing one, so a session whose title is a
+// prefix of another's still binds to its own window.
+//
+// And the answer changes over time. A Windows Terminal window shows the *active
+// tab's* title, so a session in a background tab does not match any window at
+// all until its tab comes forward. That is not a failure — it is the normal
+// state of a terminal with tabs — so this is re-run on a timer rather than once,
+// per registration, and a no-match hides the card instead of dropping anything.
 
 std::string PanTrim(const std::string& s) {
     size_t a = 0, b = s.size();
@@ -3006,70 +3029,97 @@ std::string PanStripGlyph(const std::string& s) {
     return s.substr(i);
 }
 
-// Exact first, then contains-after-stripping. Fills `hits` either way, so the
-// caller can hand the candidates back when it is more than one.
-bool PanPickWindow(const std::vector<WindowTarget>& pool, const std::string& title,
-                   HWND* out, std::vector<WindowTarget>* hits) {
-    const std::string want = LowerAscii(PanTrim(title));
+// Comparable form: trimmed, lowercased, leading glyph gone.
+std::string PanKey(const std::string& title) {
+    return PanStripGlyph(LowerAscii(PanTrim(title)));
+}
+
+// 2 = a unique exact match, 1 = a unique containing one, 0 = none or several (in
+// which case `hits` holds the candidates). The quality is what breaks a tie when
+// two registrations land on the same window.
+int PanPickWindow(const std::vector<WindowTarget>& pool, const std::string& title,
+                  HWND* out, std::vector<WindowTarget>* hits) {
+    const std::string want = PanKey(title);
+    if (want.empty()) return 0;
+    int quality = 2;
     for (const WindowTarget& t : pool) {
-        if (LowerAscii(PanTrim(t.title)) == want) hits->push_back(t);
+        if (PanKey(t.title) == want) hits->push_back(t);
     }
     if (hits->empty()) {
-        const std::string needle = PanStripGlyph(want);
-        if (!needle.empty()) {
-            for (const WindowTarget& t : pool) {
-                const std::string hay = PanStripGlyph(LowerAscii(PanTrim(t.title)));
-                if (hay.find(needle) != std::string::npos) hits->push_back(t);
-            }
+        quality = 1;
+        for (const WindowTarget& t : pool) {
+            if (PanKey(t.title).find(want) != std::string::npos) hits->push_back(t);
         }
     }
-    if (hits->size() != 1) return false;
+    if (hits->size() != 1) return 0;
     *out = (*hits)[0].hwnd;
-    return true;
+    return quality;
 }
+
+// One pass over the desktop, reused for every registration in a resolver tick:
+// enumerating windows per session would be the same work several times over.
+struct PanelPools {
+    std::vector<WindowTarget> terminals;
+    std::vector<WindowTarget> all;
+
+    static PanelPools Snapshot() {
+        PanelPools pools;
+        pools.all = EnumTargets();
+        for (const WindowTarget& t : pools.all) {
+            if (t.process == "windowsterminal.exe") pools.terminals.push_back(t);
+        }
+        return pools;
+    }
+};
 
 // Terminals first, everything else second. The producer is a terminal hook, so a
 // Windows Terminal window is what a panel is *for*; falling back to any window
 // afterwards is what makes --panel-demo usable against, say, a browser while
 // developing.
-bool ResolvePanelTarget(const std::string& title, HWND* out, std::string* err,
-                        std::string* candidates) {
+int PanelResolve(const PanelPools& pools, const std::string& title, HWND* out,
+                 std::string* err, std::string* candidates) {
     if (PanTrim(title).empty()) {
-        *err = "name the window the panel belongs to: title";
-        return false;
+        if (err) *err = "name the window the panel belongs to: title";
+        return 0;
     }
-    const std::vector<WindowTarget> all = EnumTargets();
-    std::vector<WindowTarget>       terminals;
-    for (const WindowTarget& t : all) {
-        if (t.process == "windowsterminal.exe") terminals.push_back(t);
-    }
-
-    const std::vector<WindowTarget>* pools[2] = {&terminals, &all};
-    for (const std::vector<WindowTarget>* pool : pools) {
+    const std::vector<WindowTarget>* order[2] = {&pools.terminals, &pools.all};
+    for (const std::vector<WindowTarget>* pool : order) {
         if (pool->empty()) continue;
         std::vector<WindowTarget> hits;
-        if (PanPickWindow(*pool, title, out, &hits)) return true;
+        const int quality = PanPickWindow(*pool, title, out, &hits);
+        if (quality) return quality;
         if (hits.size() > 1) {
-            *err = "'" + title + "' matches " + std::to_string(hits.size()) + " windows";
+            if (err) {
+                *err = "'" + title + "' matches " + std::to_string(hits.size()) +
+                       " windows";
+            }
             if (candidates) *candidates = TargetsJson(hits);
-            return false;
+            return 0;
         }
     }
-    *err = "no window title matches '" + title + "'";
-    if (candidates) *candidates = TargetsJson(terminals.empty() ? all : terminals);
-    return false;
+    if (err) *err = "no window title matches '" + title + "' right now";
+    if (candidates) {
+        *candidates = TargetsJson(pools.terminals.empty() ? pools.all : pools.terminals);
+    }
+    return 0;
+}
+
+// For the endpoint, which answers one request and takes its own snapshot.
+int ResolvePanelTarget(const std::string& title, HWND* out, std::string* err,
+                       std::string* candidates) {
+    return PanelResolve(PanelPools::Snapshot(), title, out, err, candidates);
 }
 
 // ── the panel thread ────────────────────────────────────────────────────────
-// One thread owns every panel window: they are created there, drawn there and
-// their clicks are handled there, so nothing about a panel needs a lock. The
-// endpoint only resolves the target (which it must, to answer with the hwnd) and
-// leaves a command behind.
+// One thread owns every panel window: they are created there, drawn there, bound
+// to a target there and their clicks are handled there, so nothing about a panel
+// needs a lock. The endpoint registers a session and leaves a command behind; it
+// resolves the title too, but only to be able to say what it resolved to *now*.
 
 struct PanelCmd {
     bool                   remove = false;
     std::string            session;
-    HWND                   target = nullptr;
+    std::string            title;
     std::string            summary;
     std::vector<PanelItem> items;
 };
@@ -3078,6 +3128,12 @@ std::mutex            g_pan_queue_mtx;
 std::vector<PanelCmd> g_pan_queue;
 std::atomic<bool>     g_pan_reassert{false};
 std::atomic<bool>     g_pan_trace{false};   // --panel-demo: report what it is doing
+
+// What GET /panels answers with, rebuilt on each resolver tick. Publishing a
+// snapshot rather than locking the live registrations keeps the panel thread the
+// only thing that ever touches them.
+std::mutex  g_pan_snapshot_mtx;
+std::string g_pan_snapshot = "[]";
 
 void PanelEnqueue(PanelCmd cmd) {
     std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
@@ -3103,55 +3159,157 @@ void PanelDestroy(std::unique_ptr<Panel>* slot) {
     slot->reset();
 }
 
+// Registering is keyed by session and never touches the binding: which window a
+// session is showing in is the resolver's business, and a POST that arrives while
+// the session's tab is in the background must still be remembered.
+//
+// The collapse state is *not* taken from the payload either. New items on a
+// collapsed panel bump the pill and nothing else: being interrupted by a card
+// unfolding itself is the thing collapsing it was meant to stop.
 void PanelApply(std::vector<std::unique_ptr<Panel>>* panels, PanelCmd&& cmd) {
-    const auto drop = [panels](const std::function<bool(const Panel&)>& pred) {
-        for (size_t i = panels->size(); i-- > 0;) {
-            if (pred(*(*panels)[i])) {
-                PanelDestroy(&(*panels)[i]);
-                panels->erase(panels->begin() + i);
-            }
-        }
-    };
-
-    if (cmd.remove) {
-        drop([&](const Panel& p) { return p.session == cmd.session; });
-        return;
-    }
-    // A session that moved to another window takes its panel with it.
-    drop([&](const Panel& p) { return p.session == cmd.session && p.target != cmd.target; });
-
-    Panel* found = nullptr;
-    for (auto& up : *panels) {
-        if (up->target == cmd.target) { found = up.get(); break; }
-    }
-    if (!found) {
-        auto up = std::make_unique<Panel>();
-        up->session = cmd.session;
-        up->target  = cmd.target;
-        up->scale   = PanelScaleFor(cmd.target);
-        up->hwnd = CreateWindowExW(
-            // No WS_EX_TRANSPARENT: unlike the pointer, this one is clicked on.
-            // WS_EX_NOACTIVATE keeps that click from stealing focus from the
-            // terminal the panel is sitting in.
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            L"ClaudeSpeakPanel", L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr,
-            GetModuleHandleW(nullptr), nullptr);
-        if (!up->hwnd) {
-            std::fprintf(stderr, "speak: could not create a panel window\n");
+    for (size_t i = panels->size(); i-- > 0;) {
+        Panel* p = (*panels)[i].get();
+        if (p->session != cmd.session) continue;
+        if (cmd.remove) {
+            PanelDestroy(&(*panels)[i]);
+            panels->erase(panels->begin() + i);
             return;
         }
-        SetWindowLongPtrW(up->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(up.get()));
-        found = up.get();
-        panels->push_back(std::move(up));
+        p->title      = std::move(cmd.title);
+        p->summary    = std::move(cmd.summary);
+        p->items      = std::move(cmd.items);
+        p->updated_at = std::time(nullptr);
+        p->dirty      = true;
+        return;
     }
-    // Latest writer wins the window, but the collapse state belongs to the
-    // *window*, not to the payload: new items on a collapsed panel bump the pill
-    // and nothing else. Being interrupted by a card unfolding itself is the thing
-    // collapsing it was meant to stop.
-    found->session = cmd.session;
-    found->summary = std::move(cmd.summary);
-    found->items   = std::move(cmd.items);
-    found->dirty   = true;
+    if (cmd.remove) return;
+
+    auto up = std::make_unique<Panel>();
+    up->session    = std::move(cmd.session);
+    up->title      = std::move(cmd.title);
+    up->summary    = std::move(cmd.summary);
+    up->items      = std::move(cmd.items);
+    up->updated_at = std::time(nullptr);
+    panels->push_back(std::move(up));
+}
+
+// The card window, created on the first bind rather than on registration: a
+// session whose tab never comes forward should cost nothing on screen.
+bool PanelEnsureWindow(Panel* p) {
+    if (p->hwnd) return true;
+    p->hwnd = CreateWindowExW(
+        // No WS_EX_TRANSPARENT: unlike the pointer, this one is clicked on.
+        // WS_EX_NOACTIVATE keeps that click from stealing focus from the terminal
+        // the panel is sitting in.
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        L"ClaudeSpeakPanel", L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!p->hwnd) {
+        std::fprintf(stderr, "speak: could not create a panel window\n");
+        return false;
+    }
+    SetWindowLongPtrW(p->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(p));
+    return true;
+}
+
+void PanelHide(Panel* p, const char* why) {
+    if (!p->shown) return;
+    ShowWindow(p->hwnd, SW_HIDE);
+    p->shown = false;
+    if (g_pan_trace.load()) std::fprintf(stderr, "speak: panel hidden (%s)\n", why);
+}
+
+std::string PanelIso8601(time_t t) {
+    char buf[32]{};
+    tm   utc{};
+    if (gmtime_s(&utc, &t) == 0) std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    return buf;
+}
+
+// Re-match every registration against the desktop as it is now, then decide who
+// gets which window. Two registrations can name the same window over time — that
+// is what a tab switch looks like — so at most one card is shown per hwnd and the
+// better match takes it.
+void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
+    const PanelPools pools = PanelPools::Snapshot();
+    const time_t     now   = std::time(nullptr);
+
+    // Expire first: a session that stopped posting two days ago is not a session.
+    for (size_t i = panels->size(); i-- > 0;) {
+        const Panel& p = *(*panels)[i];
+        if (p.updated_at && std::difftime(now, p.updated_at) > kPanTtlSeconds) {
+            if (g_pan_trace.load()) {
+                std::fprintf(stderr, "speak: registration '%s' expired\n",
+                             p.session.c_str());
+            }
+            PanelDestroy(&(*panels)[i]);
+            panels->erase(panels->begin() + i);
+        }
+    }
+
+    struct Claim {
+        HWND hwnd    = nullptr;
+        int  quality = 0;
+    };
+    std::vector<Claim> claims(panels->size());
+    for (size_t i = 0; i < panels->size(); ++i) {
+        Claim& c = claims[i];
+        c.quality = PanelResolve(pools, (*panels)[i]->title, &c.hwnd, nullptr, nullptr);
+        if (!c.quality) c.hwnd = nullptr;
+    }
+
+    std::unordered_map<HWND, size_t> best;
+    for (size_t i = 0; i < claims.size(); ++i) {
+        if (!claims[i].hwnd) continue;
+        const auto it = best.find(claims[i].hwnd);
+        if (it == best.end()) {
+            best.emplace(claims[i].hwnd, i);
+            continue;
+        }
+        const size_t k = it->second;
+        const bool   i_wins =
+            claims[i].quality > claims[k].quality ||
+            (claims[i].quality == claims[k].quality &&
+             (*panels)[i]->updated_at > (*panels)[k]->updated_at);
+        if (i_wins) {
+            claims[k].hwnd = nullptr;
+            it->second     = i;
+        } else {
+            claims[i].hwnd = nullptr;
+        }
+    }
+
+    std::string json = "[";
+    for (size_t i = 0; i < panels->size(); ++i) {
+        Panel* p = (*panels)[i].get();
+        if (p->target != claims[i].hwnd) {
+            p->target = claims[i].hwnd;
+            p->pos    = POINT{-32000, -32000};   // force a push at the new place
+            if (!p->target) {
+                PanelHide(p, "no window matches its title now");
+            } else if (g_pan_trace.load()) {
+                std::fprintf(stderr, "speak: '%s' bound to hwnd %llu\n",
+                             p->session.c_str(),
+                             static_cast<unsigned long long>(
+                                 reinterpret_cast<uintptr_t>(p->target)));
+            }
+        }
+        if (i) json += ",";
+        json += "{\"session\":\"" + JsonEscape(p->session) + "\"" +
+                ",\"title\":\"" + JsonEscape(p->title) + "\"" +
+                ",\"hwnd\":" +
+                (p->target ? std::to_string(reinterpret_cast<uintptr_t>(p->target))
+                           : "null") +
+                ",\"resolved\":" + (p->target ? "true" : "false") +
+                ",\"items\":" + std::to_string(p->items.size()) +
+                ",\"collapsed\":" + (p->collapsed ? "true" : "false") +
+                ",\"updated_at\":\"" + PanelIso8601(p->updated_at) + "\"}";
+    }
+    json += "]";
+    {
+        std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+        g_pan_snapshot = std::move(json);
+    }
 }
 
 // Runs until the process ends, or for `seconds` when --panel-demo drives it.
@@ -3172,6 +3330,7 @@ void PanelThread(float seconds) {
 
     std::vector<std::unique_ptr<Panel>> panels;
     const DWORD started = GetTickCount();
+    int         until_resolve = 0;   // ticks left before the next resolver pass
 
     for (;;) {
         MSG msg;
@@ -3180,13 +3339,24 @@ void PanelThread(float seconds) {
             DispatchMessageW(&msg);
         }
 
+        bool registered = false;
         {
             std::vector<PanelCmd> batch;
             {
                 std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
                 batch.swap(g_pan_queue);
             }
+            registered = !batch.empty();
             for (PanelCmd& cmd : batch) PanelApply(&panels, std::move(cmd));
+        }
+
+        // Twice a second, and immediately after a POST so a card appears as soon
+        // as it is registered rather than up to half a second later. Skipped
+        // entirely with nothing registered, so an idle daemon does not enumerate
+        // the desktop for a living.
+        if (registered || (!panels.empty() && --until_resolve <= 0)) {
+            PanelResolveAll(&panels);
+            until_resolve = std::max(1, kPanResolveMs / kPanTick);
         }
 
         const bool reassert = g_pan_reassert.exchange(false);
@@ -3196,13 +3366,11 @@ void PanelThread(float seconds) {
         for (size_t i = panels.size(); i-- > 0;) {
             Panel* p = panels[i].get();
 
-            // The terminal is gone: so is the panel. Nothing else cleans these up.
-            if (!IsWindow(p->target)) {
-                if (g_pan_trace.load()) {
-                    std::fprintf(stderr, "speak: panel target vanished, dropping panel\n");
-                }
-                PanelDestroy(&panels[i]);
-                panels.erase(panels.begin() + i);
+            // Unbound: the session's tab is in the background, or its window is
+            // gone. The registration stays either way — the card is what comes
+            // and goes.
+            if (!p->target || !IsWindow(p->target)) {
+                PanelHide(p, "target gone or unbound");
                 continue;
             }
 
@@ -3214,15 +3382,10 @@ void PanelThread(float seconds) {
             if (!visible) {
                 // Minimized, cloaked to another virtual desktop, or hidden: the
                 // panel goes with it and comes back on restore.
-                if (p->shown) {
-                    ShowWindow(p->hwnd, SW_HIDE);
-                    p->shown = false;
-                    if (g_pan_trace.load()) {
-                        std::fprintf(stderr, "speak: target not showing, panel hidden\n");
-                    }
-                }
+                PanelHide(p, "target not showing");
                 continue;
             }
+            if (!PanelEnsureWindow(p)) continue;
 
             const float scale = PanelScaleFor(p->target);
             if (std::fabs(scale - p->scale) > 0.001f) {
@@ -3413,24 +3576,45 @@ void HandlePanelPost(SOCKET fd, const std::string& body,
         return;
     }
 
-    HWND        target = nullptr;
-    std::string err, candidates;
-    if (!ResolvePanelTarget(root.GetStr("title"), &target, &err, &candidates)) {
-        std::string out = "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"";
-        if (!candidates.empty()) out += ",\"candidates\":" + candidates;
-        respond(fd, 400, out + "}");
+    const std::string title = PanTrim(root.GetStr("title"));
+    if (title.empty()) {
+        respond(fd, 400,
+                "{\"ok\":false,\"error\":\"name the window the panel belongs to: title\"}");
         return;
     }
 
+    // Registering always succeeds. Whether the title matches a window *right now*
+    // is a separate question, and one whose answer changes: a Windows Terminal
+    // window shows its active tab's title, so a session sitting in a background
+    // tab matches nothing until its tab comes forward. Failing the POST for that
+    // would throw the payload away over a transient — so this reports it and the
+    // resolver keeps trying.
+    HWND        target = nullptr;
+    std::string err, candidates;
+    ResolvePanelTarget(title, &target, &err, &candidates);
+
     PanelCmd cmd;
     cmd.session = session;
-    cmd.target  = target;
+    cmd.title   = title;
     cmd.summary = PanTrim(root.GetStr("summary"));
     cmd.items   = std::move(items);
     PanelEnqueue(std::move(cmd));
     EnsurePanelThread();
-    respond(fd, 200, "{\"ok\":true,\"hwnd\":" +
-                         std::to_string(reinterpret_cast<uintptr_t>(target)) + "}");
+
+    std::string out = "{\"ok\":true,\"hwnd\":";
+    if (target) {
+        out += std::to_string(reinterpret_cast<uintptr_t>(target)) + ",\"resolved\":true}";
+    } else {
+        out += "null,\"resolved\":false,\"error\":\"" + JsonEscape(err) + "\"";
+        if (!candidates.empty()) out += ",\"candidates\":" + candidates;
+        out += "}";
+    }
+    respond(fd, 200, out);
+}
+
+void HandlePanelList(SOCKET fd, void (*respond)(SOCKET, int, const std::string&)) {
+    std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+    respond(fd, 200, g_pan_snapshot);
 }
 
 void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& body,
@@ -3528,22 +3712,29 @@ void PanelPreview(const std::string& prefix) {
 // only way to check that it follows a move, hides on minimize and opens a row.
 int PanelDemo(const std::string& title, float seconds) {
     MakeThreadDpiAware();
+    if (PanTrim(title).empty()) {
+        std::fprintf(stderr, "speak: --panel-demo needs --title\n");
+        return 2;
+    }
+    // Resolved here only so the run says what it started on; the demo goes
+    // through the same resolver as a real panel, so a title that matches nothing
+    // yet is not an error — retitle the window and the card turns up.
     HWND        target = nullptr;
     std::string err, candidates;
-    if (!ResolvePanelTarget(title, &target, &err, &candidates)) {
-        std::fprintf(stderr, "speak: %s\n", err.c_str());
-        if (!candidates.empty()) std::printf("%s\n", candidates.c_str());
-        return 3;
+    if (ResolvePanelTarget(title, &target, &err, &candidates)) {
+        wchar_t got[512]{};
+        GetWindowTextW(target, got, 512);
+        std::printf("panel demo on hwnd %llu (\"%s\") for %.0f s\n",
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target)),
+                    Utf8(got).c_str(), seconds);
+    } else {
+        std::printf("panel demo waiting for a window matching \"%s\" (%s), %.0f s\n",
+                    title.c_str(), err.c_str(), seconds);
     }
-    wchar_t got[512]{};
-    GetWindowTextW(target, got, 512);
-    std::printf("panel demo on hwnd %llu (\"%s\") for %.0f s\n",
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target)),
-                Utf8(got).c_str(), seconds);
 
     PanelCmd cmd;
     cmd.session = "panel-demo";
-    cmd.target  = target;
+    cmd.title   = title;
     cmd.summary = kPanSampleSummary;
     cmd.items   = SamplePanelItems();
     PanelEnqueue(std::move(cmd));
@@ -3605,6 +3796,10 @@ void HandlePointRequest(SOCKET fd) {
     }
     // The attention panel. Unlike /point this returns as soon as the panel is
     // queued: it is a thing that stays on screen, not a gesture to wait out.
+    if (req.method == "GET" && PanelPathOnly(req.path) == "/panels") {
+        HandlePanelList(fd, PointHttpRespond);
+        return;
+    }
     if (PanelPathOnly(req.path) == "/panel") {
         if (req.method == "POST") {
             HandlePanelPost(fd, req.body, PointHttpRespond);
@@ -3618,7 +3813,7 @@ void HandlePointRequest(SOCKET fd) {
     }
     if (req.method != "POST" || req.path != "/point") {
         PointHttpRespond(fd, 404, "{\"ok\":false,\"error\":\"try GET /targets, "
-                                  "POST /point or POST /panel\"}");
+                                  "GET /panels, POST /point or POST /panel\"}");
         return;
     }
 

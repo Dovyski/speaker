@@ -467,7 +467,7 @@ $ curl -s -X POST http://127.0.0.1:8124/panel -d '{
       {"kind":"path","url":"C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast",
        "title":"1372-toast"}
     ]}'
-{"ok":true,"hwnd":1968562}
+{"ok":true,"hwnd":1968562,"resolved":true}
 ```
 
 Each row is a badge, a short handle (`repo#1375`, or a path's last segment) and
@@ -497,32 +497,76 @@ card becomes a one-line pill: how many items, and the **worst** badge among them
 That is enough to know whether the window wants attention, while giving the
 terminal underneath its corner back.
 
-Collapsed state belongs to the *window*, not to the payload: a new `POST` on a
-collapsed panel bumps the pill and nothing else. A card unfolding itself while
-you read the terminal is exactly what collapsing it was meant to stop. Right
-click anywhere on the card toggles it too, so the gesture does not require
+Collapsed state belongs to the *session*, not to the payload: a new `POST` on a
+collapsed panel bumps the pill and nothing else, and a card that hides because
+its tab went to the background comes back collapsed. A card unfolding itself
+while you read the terminal is exactly what collapsing it was meant to stop.
+Right click anywhere on the card toggles it too, so the gesture does not require
 finding the header.
+
+### Which window? (it changes)
+
+A Windows Terminal window has **tabs**, and its title is the *active tab's*
+title. So the window a session lives in is not a fact you can look up once: the
+session whose title is `◑ Floating window for PR context` matches no window at
+all while another tab is in front, and matches one again the moment its tab
+comes back. Nothing in the process tree or in Windows Terminal's UI Automation
+tree says which window hosts which pane, so the title is still the only handle
+there is — it just has to be re-asked.
+
+So `/panel` registers a **session**, not a window. The registration holds the
+title, the items, the summary and the collapse state; the *card* is what comes
+and goes:
+
+- the title matches a window → the card is created if needed, bound to it and
+  shown
+- it matches nothing, or several windows → the card hides. The registration is
+  untouched, and the next pass tries again
+- the window is minimized, cloaked to another virtual desktop or closed → the
+  card hides. Same rule, same recovery
+
+That pass runs every ~500 ms (and immediately after a `POST`, so a card appears
+at once rather than up to half a second later), enumerating the desktop once and
+matching every registration against it. With nothing registered it does not run
+at all, so an idle daemon does not enumerate windows for a living.
+
+Matching is: trim, lowercase, drop a leading non-ASCII glyph *and the space
+behind it* — from **both** sides, because the registered title was captured at
+one instant and the window is read at another, and the two will disagree about
+which way the spinner was pointing (`◐ ◑ ◒ ◓ ✳`). The space is the test, so a
+title that merely starts with a non-ASCII word keeps its first letter. Then an
+exact match, and only failing that a containing one, so a session whose title is
+a prefix of another's still binds to its own window. Windows Terminal windows
+are searched first and everything else second, which is what makes
+`--panel-demo` usable against any window while developing.
+
+Two sessions can name the same window — that is what a tab switch looks like
+from here, and both registrations are perfectly valid. At most one card is shown
+per window: the better match wins, and the more recently posted one breaks a tie.
+The loser hides and keeps its registration, so switching back is a rebind rather
+than a re-POST.
+
+Registrations expire 48 hours after their last `POST` — long enough that a
+session left alone overnight still has its panel in the morning, short enough
+that a machine left running for a week is not carrying last week's windows.
+`DELETE /panel?session=<id>`, and a `POST` with empty `items`, remove one at once.
 
 ### Following the window
 
-The panel is bound to an `hwnd`, and one thread owns every panel window — they
-are created, drawn and clicked there, so no panel state needs a lock. Forty
-times a second that thread checks each target and moves the card to the bottom
-right of its **client** area, inset 12 px, so it never rides the tab bar or hangs
-off a maximized window onto the taskbar:
-
-- the target is minimized, cloaked to another virtual desktop or hidden → the
-  panel hides, and comes back on restore
-- the target moved, resized or changed monitor → the card follows; a different
-  DPI rebuilds it, so it stays the same physical size on a scaled display
-- `IsWindow` goes false → the panel is destroyed. Nothing else cleans these up
+One thread owns every panel window — they are created, drawn, bound and clicked
+there, so no panel state needs a lock, and the endpoint only leaves a command
+behind. Forty times a second that thread moves each bound card to the bottom
+right of its target's **client** area, inset 12 px, so it never rides the tab bar
+or hangs off a maximized window onto the taskbar. A move, a resize, a different
+monitor or a different DPI all just work; a DPI change rebuilds the card, so it
+stays the same physical size on a scaled display.
 
 Polling rather than an `EVENT_OBJECT_LOCATIONCHANGE` hook: that hook fires for
 every child of the terminal as it lays out and still says nothing about
-minimizing, cloaking or death, all of which the same pass has to check anyway.
-There *is* one `SetWinEventHook`, on `EVENT_SYSTEM_FOREGROUND`, and it does one
-thing — re-assert `HWND_TOPMOST`, because a foreground change is when a topmost
-window can end up behind something.
+minimizing, cloaking, retitling or death, all of which the same pass has to check
+anyway. There *is* one `SetWinEventHook`, on `EVENT_SYSTEM_FOREGROUND`, and it
+does one thing — re-assert `HWND_TOPMOST`, because a foreground change is when a
+topmost window can end up behind something.
 
 Hover is read from the cursor in the same pass, which needs no `WM_MOUSELEAVE`
 tracking and gets occlusion for free: `WindowFromPoint` is the test, so a row
@@ -537,13 +581,13 @@ whatever you were typing in.
 
 ### The contract
 
-`POST /panel` and `DELETE /panel` live on the same loopback listener as
-`/point` — the next port, `8124` by default.
+`POST /panel`, `DELETE /panel` and `GET /panels` live on the same loopback
+listener as `/point` — the next port, `8124` by default.
 
 | Field | |
 |---|---|
-| `session` | required; the key a panel is remembered and deleted by |
-| `title` | the window, matched as below |
+| `session` | required; the key a registration is remembered and deleted by |
+| `title` | required; the window title to look for, matched as above |
 | `summary` | optional; the header line, ellipsized. Falls back to `N items` |
 | `items[]` | `kind` (`pr`, `issue`, `path`), `repo`, `number`, `url`, `title`, `status` |
 
@@ -552,27 +596,22 @@ daemon builds the GitHub URL — and it is the only thing a row click uses, so i
 is checked before being handed to the shell: `http(s)://`, a drive-letter path or
 a UNC path, and nothing else.
 
-- Replies `{"ok":true,"hwnd":N}`, or `{"ok":false,"error":"…","candidates":[…]}`
-  with the same window list `--list-targets` prints.
-- **Empty `items` removes the panel**, so a producer never has to remember to
-  `DELETE` when its last pull request merges. `DELETE /panel?session=<id>` also
-  removes it.
-- A session that posts a different `title` takes its panel to the new window;
-  a title that already has a panel from another session is taken over. Latest
-  wins, one panel per window.
-- It answers as soon as the panel is queued. Unlike `/point`, this is a thing
-  that stays on screen rather than a gesture to wait out.
-
-**Which window** is the same problem `--title` solves for pointing, with the same
-answer: Windows Terminal serves every session from one process, so the title the
-agent sets is the only discriminator there is. Two refinements here. The title
-carries a spinner glyph that changes while the session works (`◐ …`, `✳ …`), so a
-leading non-ASCII glyph *and the space behind it* are stripped from both sides
-before comparing — the space is the test, so a title that merely starts with a
-non-ASCII word keeps its first letter. And an exact match wins over a containing
-one, so a session whose title is a prefix of another's still binds to its own
-window. Windows Terminal windows are searched first and everything else second,
-which is what makes `--panel-demo` usable against any window while developing.
+- Registering **always succeeds**: `{"ok":true,"hwnd":N,"resolved":true}`, or
+  `{"ok":true,"hwnd":null,"resolved":false,"error":"…","candidates":[…]}` when
+  the title matches nothing (or several) *at that moment*. A background tab is
+  the normal case, not a failure, and throwing the payload away over it would be
+  the wrong trade. `400` is kept for the things that really are wrong: a body
+  that is not a JSON object, a missing `session`, a missing `title`, malformed
+  `items`.
+- **Empty `items` removes the registration**, so a producer never has to remember
+  to `DELETE` when its last pull request merges. `DELETE /panel?session=<id>`
+  does the same.
+- `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
+  `resolved`, the item count, `collapsed` and `updated_at` — which is the first
+  thing to look at when a card is not where it should be. It is a snapshot
+  published by the resolver, so it is at most half a second stale.
+- Everything answers immediately. Unlike `/point`, this is a thing that stays on
+  screen rather than a gesture to wait out.
 
 ### Seeing it without a daemon
 
@@ -589,9 +628,11 @@ review the look — same reason `--orb-preview` exists. (PNG rather than the
 previews' BMP, and with no zlib linked: a deflate stream of *stored* blocks is
 legal, so the encoder is a CRC, an Adler and some framing.)
 
-`--panel-demo` parks that same sample data in the window `--title` matches, for
-`--panel-seconds` (default 20), with no daemon and no producer — which is how you
-check that it follows a move, hides on minimize and opens a row.
+`--panel-demo` registers that same sample data against `--title` for
+`--panel-seconds` (default 20), with no daemon and no producer, and goes through
+the same resolver a real panel does — so a title that matches nothing yet is not
+an error, and retitling a window mid-run is a fair way to watch the card arrive.
+Which is how you check that it follows a move, hides on minimize and opens a row.
 
 ## Performance
 
