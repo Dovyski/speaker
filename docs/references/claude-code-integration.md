@@ -12,8 +12,8 @@ listing what the Claude Code session running in that window is working on: open
 pull requests, issues, work directories, and questions the agent is waiting on an
 answer for. Rows are clickable — PRs and issues open in the browser, paths in
 Explorer, a question copies itself to the clipboard. See
-[The attention panel](../../README.md#the-attention-panel) in the README for the
-card itself, its tabs, the collapsed pill and the `POST /panel` contract. This
+[attention-panel.md](attention-panel.md) for the card itself, its tabs, the
+collapsed pill and the `POST /panel` contract. This
 document covers only the producer chain that feeds it.
 
 ## The chain, end to end
@@ -328,9 +328,9 @@ Prerequisites:
   not run them.
 - **`gh` authenticated** (`gh auth status`) for the enricher, with access to the
   repositories the sessions talk about.
-- **`speak.exe` built**, with its `models/` and `voices/` populated — see the
-  README's [Build](../../README.md#build), [Get the models](../../README.md#get-the-models)
-  and [Get a voice](../../README.md#get-a-voice). The panel itself needs no
+- **`speak.exe` built**, with its `models/` and `voices/` populated — see
+  [build.md](build.md) and [speech.md](speech.md#voices), or
+  [install.md](install.md) for a release build. The panel itself needs no
   model, but the daemon that draws it loads one at `--serve` time.
 - **`claude` on `PATH`** for the optional Haiku layer. Without it the panel still
   works; it just has no `summary`, no `Pending` tab and no relevance pruning.
