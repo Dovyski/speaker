@@ -21,3 +21,6 @@ samples/
 !voice-sources/**/*.wav
 !voice-sources/**/*.mp3
 !voice-sources/**/*.flac
+
+# release artifacts (scripts/package-release.ps1)
+dist/
