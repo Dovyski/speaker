@@ -2377,38 +2377,25 @@ void WritePng(const std::string& path, const std::vector<uint32_t>& px, int w, i
 
 // ── what a panel is made of ─────────────────────────────────────────────────
 
-// The state a row's badge reports, in the order that decides which one a
-// collapsed pill shows: the pill carries the *worst* of them, so a red dot on a
-// one-line pill is enough to know that window wants attention.
+// The state a row reports, in the order that decides which one a collapsed pill
+// shows: the pill carries the *worst* of them, so a red mark on a one-line pill
+// is enough to know that window wants attention.
 enum class PanStatus {
     Unknown = 0, Closed, Merged, Draft, Open, Approved, ChangesRequested, ChecksFailing
 };
 
-struct PanBadge {
-    const char* name;
-    Rgb         colour;
-    bool        outline;
-};
-
-const PanBadge& BadgeOf(PanStatus s) {
-    // Bootstrap's palette again, so the badges belong to the same family as the
-    // caption variants.
-    static const PanBadge kBadges[] = {
-        {"unknown",           {0.68f, 0.71f, 0.74f}, false},   // #adb5bd, a lighter grey
-        {"closed",            {0.42f, 0.46f, 0.49f}, false},   // #6c757d
-        {"merged",            {0.44f, 0.26f, 0.76f}, false},   // #6f42c1
-        {"draft",             {0.42f, 0.46f, 0.49f}, true},    // the same grey, hollow
-        {"open",              {0.05f, 0.43f, 0.99f}, false},   // #0d6efd
-        {"approved",          {0.10f, 0.53f, 0.33f}, false},   // #198754
-        {"changes_requested", {0.99f, 0.49f, 0.08f}, false},   // #fd7e14
-        {"checks_failing",    {0.86f, 0.21f, 0.27f}, false},   // #dc3545
-    };
-    return kBadges[static_cast<int>(s)];
+const char* PanStatusName(PanStatus s) {
+    static const char* kNames[] = {"unknown", "closed",   "merged",
+                                   "draft",   "open",     "approved",
+                                   "changes_requested",   "checks_failing"};
+    return kNames[static_cast<int>(s)];
 }
 
 PanStatus ParsePanStatus(const std::string& name) {
     for (int i = 0; i <= static_cast<int>(PanStatus::ChecksFailing); ++i) {
-        if (name == BadgeOf(static_cast<PanStatus>(i)).name) return static_cast<PanStatus>(i);
+        if (name == PanStatusName(static_cast<PanStatus>(i))) {
+            return static_cast<PanStatus>(i);
+        }
     }
     return PanStatus::Unknown;
 }
@@ -2438,6 +2425,349 @@ struct PanelItem {
     }
 };
 
+// ── Octicons ────────────────────────────────────────────────────────────────
+// A coloured dot said "this needs attention" but not *what the thing is*, and a
+// row that leads with `repo#1375` is otherwise indistinguishable from a
+// directory. So each row is marked with GitHub's own icon for its type — the
+// same glyph the row's page shows — tinted with GitHub's own status colour. Two
+// pieces of information in the space one dot took.
+//
+// The icons are the 16×16 Octicons (github.com/primer/octicons, MIT), verbatim
+// path data, rasterized here. No font and no image: the path is parsed, its
+// curves and arcs are flattened to polygons, and a nonzero-winding scanline fill
+// with four subsample rows per pixel and analytic horizontal coverage turns it
+// into an alpha mask. That is what keeps the hole in `issue-opened` a hole at
+// every DPI, where a bitmap would smear at 1.5× and a font would need shipping.
+
+struct PanPt { float x, y; };
+using PanPolys = std::vector<std::vector<PanPt>>;
+
+// SVG path number/flag reader. Path data omits separators before a sign or a
+// decimal point ("0-3", ".5.5"), which strtof happens to handle exactly right.
+struct SvgReader {
+    const char* p;
+
+    void Space() {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    }
+    bool Num(float* out) {
+        Space();
+        char*       end = nullptr;
+        const float v   = std::strtof(p, &end);
+        if (!end || end == p) return false;
+        p    = end;
+        *out = v;
+        return true;
+    }
+    // Arc flags may be written without a separator ("1 1", "11"), and only ever
+    // appear where a single 0 or 1 is the whole value.
+    bool Flag(bool* out) {
+        Space();
+        if (*p == '0' || *p == '1') {
+            *out = (*p == '1');
+            ++p;
+            return true;
+        }
+        float v = 0;
+        if (!Num(&v)) return false;
+        *out = v != 0.f;
+        return true;
+    }
+};
+
+void PanCubic(std::vector<PanPt>* sub, PanPt p0, PanPt p1, PanPt p2, PanPt p3, int steps) {
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / steps, u = 1.f - t;
+        const float a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+        sub->push_back(PanPt{a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+                             a * p0.y + b * p1.y + c * p2.y + d * p3.y});
+    }
+}
+
+// Endpoint parameterization to centre parameterization, straight out of the SVG
+// spec's appendix, then sampled. Octicons draw every dot and every ring as an
+// arc — including the degenerate `a.75.75 0 1 0 0 .005` trick for a full circle,
+// which this handles because the large-arc flag makes the sweep ~360°.
+void PanArc(std::vector<PanPt>* sub, PanPt from, float rx, float ry, float phi_deg,
+            bool large, bool sweep, PanPt to) {
+    if (rx == 0.f || ry == 0.f) {
+        sub->push_back(to);
+        return;
+    }
+    rx = std::fabs(rx);
+    ry = std::fabs(ry);
+    const float phi = phi_deg * 3.14159265f / 180.f;
+    const float cp = std::cos(phi), sp = std::sin(phi);
+    const float dx = (from.x - to.x) * 0.5f, dy = (from.y - to.y) * 0.5f;
+    const float x1 = cp * dx + sp * dy, y1 = -sp * dx + cp * dy;
+
+    const float lambda = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+    if (lambda > 1.f) {
+        const float s = std::sqrt(lambda);
+        rx *= s;
+        ry *= s;
+    }
+    const float num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+    const float den = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+    const float co  = (den > 0.f ? std::sqrt(std::max(0.f, num / den)) : 0.f) *
+                     ((large != sweep) ? 1.f : -1.f);
+    const float cxp = co * rx * y1 / ry, cyp = -co * ry * x1 / rx;
+    const float cx = cp * cxp - sp * cyp + (from.x + to.x) * 0.5f;
+    const float cy = sp * cxp + cp * cyp + (from.y + to.y) * 0.5f;
+
+    const float t1 = std::atan2((y1 - cyp) / ry, (x1 - cxp) / rx);
+    const float t2 = std::atan2((-y1 - cyp) / ry, (-x1 - cxp) / rx);
+    float       dt = t2 - t1;
+    if (!sweep && dt > 0.f)  dt -= 2.f * 3.14159265f;
+    if (sweep && dt < 0.f)   dt += 2.f * 3.14159265f;
+
+    const int steps = std::max(4, static_cast<int>(std::ceil(std::fabs(dt) / 0.18f)));
+    for (int i = 1; i <= steps; ++i) {
+        const float t = t1 + dt * i / steps;
+        sub->push_back(PanPt{cx + rx * std::cos(t) * cp - ry * std::sin(t) * sp,
+                             cy + rx * std::cos(t) * sp + ry * std::sin(t) * cp});
+    }
+}
+
+// The subset of the path grammar Octicons actually use: M L H V C A Z, absolute
+// and relative. Anything else is a data error rather than a silent gap.
+bool PanSvgPath(const char* d, float scale, PanPolys* out) {
+    SvgReader r{d};
+    PanPt     cur{0, 0}, start{0, 0};
+    char      cmd = 0;
+    r.Space();
+    while (*r.p) {
+        if (std::isalpha(static_cast<unsigned char>(*r.p))) {
+            cmd = *r.p++;
+        } else if (!cmd) {
+            return false;
+        }
+        const bool rel = std::islower(static_cast<unsigned char>(cmd)) != 0;
+        const char op  = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+        const auto abs2 = [&](float x, float y) {
+            return rel ? PanPt{cur.x + x, cur.y + y} : PanPt{x, y};
+        };
+        if (op == 'Z') {
+            cur = start;
+            r.Space();
+            continue;
+        }
+        if (out->empty() && op != 'M') return false;
+
+        float a = 0, b = 0, c = 0, e = 0, f = 0, g = 0;
+        switch (op) {
+            case 'M': {
+                if (!r.Num(&a) || !r.Num(&b)) return false;
+                cur = abs2(a, b);
+                start = cur;
+                out->push_back({cur});
+                // A repeated M coordinate pair means an implicit L.
+                cmd = rel ? 'l' : 'L';
+                break;
+            }
+            case 'L':
+                if (!r.Num(&a) || !r.Num(&b)) return false;
+                cur = abs2(a, b);
+                out->back().push_back(cur);
+                break;
+            case 'H':
+                if (!r.Num(&a)) return false;
+                cur = PanPt{rel ? cur.x + a : a, cur.y};
+                out->back().push_back(cur);
+                break;
+            case 'V':
+                if (!r.Num(&a)) return false;
+                cur = PanPt{cur.x, rel ? cur.y + a : a};
+                out->back().push_back(cur);
+                break;
+            case 'C': {
+                if (!r.Num(&a) || !r.Num(&b) || !r.Num(&c) || !r.Num(&e) ||
+                    !r.Num(&f) || !r.Num(&g)) {
+                    return false;
+                }
+                const PanPt c1 = abs2(a, b), c2 = abs2(c, e), p3 = abs2(f, g);
+                PanCubic(&out->back(), cur, c1, c2, p3, 12);
+                cur = p3;
+                break;
+            }
+            case 'A': {
+                bool large = false, sweep = false;
+                if (!r.Num(&a) || !r.Num(&b) || !r.Num(&c) || !r.Flag(&large) ||
+                    !r.Flag(&sweep) || !r.Num(&f) || !r.Num(&g)) {
+                    return false;
+                }
+                const PanPt to = abs2(f, g);
+                PanArc(&out->back(), cur, a, b, c, large, sweep, to);
+                cur = to;
+                break;
+            }
+            default:
+                return false;
+        }
+        r.Space();
+    }
+    for (std::vector<PanPt>& sub : *out) {
+        for (PanPt& pt : sub) {
+            pt.x *= scale;
+            pt.y *= scale;
+        }
+    }
+    return true;
+}
+
+void PanAddSpan(std::vector<float>* acc, int w, float x0, float x1, float weight) {
+    x0 = std::max(x0, 0.f);
+    x1 = std::min(x1, static_cast<float>(w));
+    if (x1 <= x0) return;
+    const int first = static_cast<int>(std::floor(x0));
+    const int last  = std::min(w, static_cast<int>(std::ceil(x1)));
+    for (int x = std::max(0, first); x < last; ++x) {
+        const float l = std::max(x0, static_cast<float>(x));
+        const float rr = std::min(x1, static_cast<float>(x) + 1.f);
+        if (rr > l) (*acc)[x] += (rr - l) * weight;
+    }
+}
+
+// Nonzero winding, which is what keeps a counter-wound inner ring a hole.
+// Vertical coverage is sampled (four rows per pixel), horizontal coverage is
+// exact — the cheap half of analytic antialiasing where it matters most, since
+// these glyphs are mostly vertical strokes and circles.
+void PanFillPolys(const PanPolys& polys, std::vector<uint8_t>* mask, int w, int h) {
+    constexpr int kSub = 4;
+    struct Cross { float x; int dir; };
+    std::vector<float> acc(w, 0.f);
+    std::vector<Cross> xs;
+    for (int py = 0; py < h; ++py) {
+        std::fill(acc.begin(), acc.end(), 0.f);
+        for (int s = 0; s < kSub; ++s) {
+            const float y = py + (s + 0.5f) / kSub;
+            xs.clear();
+            for (const std::vector<PanPt>& sub : polys) {
+                const size_t n = sub.size();
+                if (n < 2) continue;
+                for (size_t i = 0; i < n; ++i) {
+                    const PanPt& a = sub[i];
+                    const PanPt& b = sub[(i + 1) % n];
+                    if (a.y == b.y) continue;
+                    if (y < std::min(a.y, b.y) || y >= std::max(a.y, b.y)) continue;
+                    const float t = (y - a.y) / (b.y - a.y);
+                    xs.push_back(Cross{a.x + t * (b.x - a.x), b.y > a.y ? 1 : -1});
+                }
+            }
+            if (xs.empty()) continue;
+            std::sort(xs.begin(), xs.end(),
+                      [](const Cross& l, const Cross& r) { return l.x < r.x; });
+            int   wind = 0;
+            float span = 0.f;
+            for (const Cross& c : xs) {
+                const int prev = wind;
+                wind += c.dir;
+                if (prev == 0 && wind != 0) span = c.x;
+                else if (prev != 0 && wind == 0) PanAddSpan(&acc, w, span, c.x, 1.f / kSub);
+            }
+        }
+        for (int x = 0; x < w; ++x) {
+            (*mask)[static_cast<size_t>(py) * w + x] =
+                static_cast<uint8_t>(std::lround(Clamp01(acc[x]) * 255.f));
+        }
+    }
+}
+
+// Rasterizes one icon into the card's colour layer. Small and few, so it is not
+// worth a cache: a rebuild happens only when the content changes.
+void StampOcticon(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int size,
+                  const char* path, const Rgb& colour) {
+    if (size <= 0) return;
+    PanPolys polys;
+    if (!PanSvgPath(path, size / 16.f, &polys)) {
+        std::fprintf(stderr, "speak: bad octicon path data\n");
+        return;
+    }
+    std::vector<uint8_t> mask(static_cast<size_t>(size) * size, 0);
+    PanFillPolys(polys, &mask, size, size);
+    for (int y = 0; y < size; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < size; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const uint8_t a = mask[static_cast<size_t>(y) * size + x];
+            if (!a) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(Pack(colour, a / 255.f), dst);
+        }
+    }
+}
+
+// ── which icon, and what colour ─────────────────────────────────────────────
+// GitHub's own pairing, so a row means on this card what it means on the page it
+// came from. `approved` is left plain green rather than given a tick overlay:
+// at 14 px a second mark inside the glyph turns into grit, and the row's job is
+// "which thing, roughly how is it doing" — the exact review state is one click
+// away.
+
+constexpr Rgb kOctGreen  {0x34 / 255.f, 0x7d / 255.f, 0x39 / 255.f};   // #347d39
+constexpr Rgb kOctPurple {0x82 / 255.f, 0x56 / 255.f, 0xd0 / 255.f};   // #8256d0
+constexpr Rgb kOctRed    {0xc9 / 255.f, 0x3c / 255.f, 0x37 / 255.f};   // #c93c37
+constexpr Rgb kOctAmber  {0xc6 / 255.f, 0x90 / 255.f, 0x26 / 255.f};   // #c69026
+constexpr Rgb kOctGrey   {0x76 / 255.f, 0x83 / 255.f, 0x90 / 255.f};   // #768390
+
+// Octicons 16px, verbatim (MIT).
+constexpr const char* kOctIssueOpened =
+    "M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"
+    "M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z";
+constexpr const char* kOctIssueClosed =
+    "M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"
+    "M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z";
+constexpr const char* kOctPullRequest =
+    "M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Z"
+    "m5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z"
+    "M3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z";
+constexpr const char* kOctPullRequestDraft =
+    "M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Z"
+    "m9.5 14a2.25 2.25 0 1 1 0-4.5 2.25 2.25 0 0 1 0 4.5ZM2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM14 7.5a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Zm0-4.25a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Z";
+constexpr const char* kOctPullRequestClosed =
+    "M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Z"
+    "m9.5 5.5a.75.75 0 0 1 .75.75v3.378a2.251 2.251 0 1 1-1.5 0V7.25a.75.75 0 0 1 .75-.75Z"
+    "m-2.03-5.273a.75.75 0 0 1 1.06 0l.97.97.97-.97a.748.748 0 0 1 1.265.332.75.75 0 0 1-.205.729l-.97.97.97.97a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-.97-.97-.97.97a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734l.97-.97-.97-.97a.75.75 0 0 1 0-1.06Z"
+    "M2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z";
+constexpr const char* kOctMerge =
+    "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z";
+constexpr const char* kOctFileDirectory =
+    "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
+    "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
+
+struct PanGlyph {
+    const char* path;
+    Rgb         colour;
+};
+
+PanGlyph PanelGlyphFor(const PanelItem& item) {
+    const bool issue = item.kind == "issue";
+    const bool pr    = item.kind == "pr";
+    if (!issue && !pr) return {kOctFileDirectory, kOctGrey};   // a work dir
+
+    switch (item.status) {
+        case PanStatus::Merged: return {kOctMerge, kOctPurple};
+        case PanStatus::Draft:  return {kOctPullRequestDraft, kOctGrey};
+        case PanStatus::Closed:
+            // GitHub's split: a closed issue is "completed" (purple), a closed
+            // pull request is abandoned (red).
+            return issue ? PanGlyph{kOctIssueClosed, kOctPurple}
+                         : PanGlyph{kOctPullRequestClosed, kOctRed};
+        default:
+            break;
+    }
+    const char* path = issue ? kOctIssueOpened : kOctPullRequest;
+    switch (item.status) {
+        case PanStatus::Open:
+        case PanStatus::Approved:         return {path, kOctGreen};
+        case PanStatus::ChangesRequested: return {path, kOctAmber};
+        case PanStatus::ChecksFailing:    return {path, kOctRed};
+        default:                          return {path, kOctGrey};
+    }
+}
+
 // ── geometry ────────────────────────────────────────────────────────────────
 // Everything is expressed at 96 dpi and multiplied by the target window's scale,
 // so the card is the same physical size on a 4K laptop panel and on a 1080p
@@ -2450,8 +2780,8 @@ constexpr int kPanShadow    = 20;   // room around the card for its drop shadow
 constexpr int kPanPad       = 12;
 constexpr int kPanRadius    = 10;
 constexpr int kPanRowGap    = 6;    // padding added to each row's tallest mark
-constexpr int kPanBadge     = 9;    // badge disc diameter
-constexpr int kPanBadgeGap  = 10;   // badge to label
+constexpr int kPanIcon      = 14;   // octicon box, at 96 dpi
+constexpr int kPanIconGap   = 9;    // icon to label
 constexpr int kPanLabelGap  = 8;    // label to title
 constexpr int kPanTextPx    = 13;
 constexpr int kPanToggle    = 11;   // the − / + mark, corner to corner
@@ -2468,10 +2798,18 @@ constexpr int kPanResolveMs = 500;  // ms between title→window resolver passes
 constexpr double kPanTtlSeconds = 48.0 * 3600.0;
 
 constexpr float kPanFillAlpha = 0.97f;
-constexpr float kPanShadowA   = 0.34f;
-constexpr float kPanHoverA    = 0.085f;
-constexpr float kPanRuleA     = 0.11f;
-constexpr float kPanDimFade   = 0.42f;   // row title / summary ink, mixed back to the fill
+constexpr float kPanShadowA   = 0.40f;   // a dark card needs a darker shadow to read
+
+// GitHub's own dark surface, so the card sits in the same world as the icons and
+// the pages the rows lead to. The caption toast's *material* is still shared —
+// one rounded-rect distance field, its hairline, its shadow, the same fonts — but
+// not its palette: the toast is a light notification that appears for a sentence,
+// this is a dark panel that lives on a dark terminal for hours.
+constexpr Rgb kPanBg    {0x21 / 255.f, 0x28 / 255.f, 0x30 / 255.f};   // #212830
+constexpr Rgb kPanLine  {0x3d / 255.f, 0x44 / 255.f, 0x4d / 255.f};   // #3d444d
+constexpr Rgb kPanTextA {0xd1 / 255.f, 0xd7 / 255.f, 0xe0 / 255.f};   // #d1d7e0
+constexpr Rgb kPanTextB {0x91 / 255.f, 0x98 / 255.f, 0xa1 / 255.f};   // #9198a1
+constexpr Rgb kPanHover {0x2a / 255.f, 0x31 / 255.f, 0x3c / 255.f};   // #2a313c
 
 // The scale the card currently being built is drawn at. Panels are only ever
 // built on the panel thread (or on the main thread by --panel-preview), so a
@@ -2481,25 +2819,27 @@ float g_pan_scale = 1.f;
 
 int PanScale(int v) { return std::max(1, static_cast<int>(std::lround(v * g_pan_scale))); }
 
-// The panel wears the caption's `light` card unconditionally, rather than
-// whatever --caption-variant a passing utterance happened to set: it is on
-// screen for hours, and a colour would claim a meaning that belongs to the
-// badges.
-Rgb PanFill()   { return kCapVariants[6].bg; }
-Rgb PanInk()    { return kCapDarkInk; }
-Rgb PanDimInk() { return Mix(PanInk(), PanFill(), kPanDimFade); }
-Rgb PanBorder() { return Mix(PanFill(), PanInk(), 0.13f); }
+// Fixed, rather than following whatever --caption-variant a passing utterance
+// happened to set: the panel is on screen for hours, and a colour on the card
+// would claim the meaning that belongs to the icons.
+Rgb PanFill()   { return kPanBg; }
+Rgb PanInk()    { return kPanTextA; }
+Rgb PanDimInk() { return kPanTextB; }
+Rgb PanBorder() { return kPanLine; }
 
 std::string PanCountText(size_t n) {
     return std::to_string(n) + (n == 1 ? " item" : " items");
 }
 
-// The pill shows the worst state on the list, which is what makes a collapsed
-// panel still worth glancing at. PanStatus is declared in that order.
-PanStatus PanWorst(const std::vector<PanelItem>& items) {
-    PanStatus worst = PanStatus::Unknown;
+// The pill shows the worst item on the list — its icon and its colour — which
+// is what makes a collapsed panel still worth glancing at. PanStatus is declared
+// in that order.
+const PanelItem* PanWorstItem(const std::vector<PanelItem>& items) {
+    const PanelItem* worst = nullptr;
     for (const PanelItem& it : items) {
-        if (static_cast<int>(it.status) > static_cast<int>(worst)) worst = it.status;
+        if (!worst || static_cast<int>(it.status) > static_cast<int>(worst->status)) {
+            worst = &it;
+        }
     }
     return worst;
 }
@@ -2514,7 +2854,7 @@ struct PanelCard {
     float                 radius = 0.f;
     std::vector<float>    dist;              // signed distance to the card edge
     std::vector<uint8_t>  ink, dim;          // text coverage, full and muted
-    std::vector<uint32_t> deco;              // premultiplied: the badges carry colour
+    std::vector<uint32_t> deco;              // premultiplied: the icons carry colour
     RECT                  header{};          // the collapse toggle's click target
     int                   rule_y = -1;       // hairline under the header, -1 for none
     struct Row {
@@ -2523,27 +2863,6 @@ struct PanelCard {
     };
     std::vector<Row> rows;
 };
-
-// A badge. Filled for a real state, hollow for `draft` — the one status that is
-// about a thing not being ready rather than about how it is doing.
-void StampDisc(std::vector<uint32_t>* deco, int w, int h, float cx, float cy, float r,
-               const Rgb& colour, bool outline, float stroke) {
-    const int x0 = std::max(0, static_cast<int>(std::floor(cx - r - 2)));
-    const int x1 = std::min(w - 1, static_cast<int>(std::ceil(cx + r + 2)));
-    const int y0 = std::max(0, static_cast<int>(std::floor(cy - r - 2)));
-    const int y1 = std::min(h - 1, static_cast<int>(std::ceil(cy + r + 2)));
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
-            const float d  = std::sqrt(dx * dx + dy * dy) - r;
-            const float sd = outline ? std::fabs(d + stroke * 0.5f) - stroke * 0.5f : d;
-            const float a  = 1.f - SmoothStep(-0.6f, 0.6f, sd);
-            if (a <= 0.004f) continue;
-            uint32_t& dst = (*deco)[static_cast<size_t>(y) * w + x];
-            dst = BlendOver(Pack(colour, a), dst);
-        }
-    }
-}
 
 // One line, cut with an ellipsis rather than wrapped: a row is a handle, not a
 // paragraph. DT_SINGLELINE turns off the rasterizer's word breaking, and the
@@ -2562,18 +2881,18 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
     const int margin = PanScale(kPanShadow);
     const int toggle = PanScale(kPanToggle);
     const int tgap   = PanScale(kPanToggleGap);
-    const int badge  = PanScale(kPanBadge);
-    const int bgap   = PanScale(kPanBadgeGap);
+    const int icon   = PanScale(kPanIcon);
+    const int igap   = PanScale(kPanIconGap);
 
     // ── the collapsed pill ──
-    // A one-line lozenge: the worst badge and how many things are behind it. It
+    // A one-line lozenge: the worst item's icon and how many things are behind it. It
     // fits its text rather than keeping the expanded width, so a collapsed panel
     // gives the terminal underneath almost all of its corner back.
     if (collapsed) {
         const TextMask count = PanLine(PanCountText(items.size()), false,
                                        PanScale(kPanWidth) - 2 * pad);
-        const int panel_w = pad + badge + bgap + count.w + tgap + toggle + pad;
-        const int panel_h = std::max({count.h, toggle, badge}) + 2 * PanScale(8);
+        const int panel_w = pad + icon + igap + count.w + tgap + toggle + pad;
+        const int panel_h = std::max({count.h, toggle, icon}) + 2 * PanScale(7);
         out->margin  = margin;
         out->panel_w = panel_w;
         out->panel_h = panel_h;
@@ -2587,13 +2906,11 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         out->deco.assign(n, 0);
         out->header = RECT{margin, margin, margin + panel_w, margin + panel_h};
         StampMask(&out->dim, out->w, out->h, count,
-                  margin + pad + badge + bgap, margin + (panel_h - count.h) / 2);
-        if (!items.empty()) {
-            const PanBadge& b = BadgeOf(PanWorst(items));
-            StampDisc(&out->deco, out->w, out->h,
-                      margin + pad + badge * 0.5f, margin + panel_h * 0.5f,
-                      badge * 0.5f, b.colour, b.outline,
-                      std::max(1.f, static_cast<float>(PanScale(kPanStroke)) * 0.9f));
+                  margin + pad + icon + igap, margin + (panel_h - count.h) / 2);
+        if (const PanelItem* worst = PanWorstItem(items)) {
+            const PanGlyph g = PanelGlyphFor(*worst);
+            StampOcticon(&out->deco, out->w, out->h, margin + pad,
+                         margin + (panel_h - icon) / 2, icon, g.path, g.colour);
         }
         // A `+`, because from here the gesture is to unfold it.
         const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
@@ -2621,7 +2938,7 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             int      h = 0, item = 0;
         };
         std::vector<RowBuild> built;
-        const int text_w = inner - badge - bgap;
+        const int text_w = inner - icon - igap;
         const size_t shown = std::min<size_t>(items.size(), kPanMaxRows);
         for (size_t i = 0; i < shown; ++i) {
             RowBuild r;
@@ -2633,7 +2950,7 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             std::string title = items[i].title;
             if (title == items[i].Label()) title.clear();
             if (!title.empty() && rest >= PanScale(56)) r.title = PanLine(title, false, rest);
-            r.h = std::max({r.label.h, r.title.h, badge}) + PanScale(kPanRowGap);
+            r.h = std::max({r.label.h, r.title.h, icon}) + PanScale(kPanRowGap);
             built.push_back(std::move(r));
         }
         if (items.size() > shown) {
@@ -2689,11 +3006,10 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
                 StampMask(&out->dim, out->w, out->h, r.label, margin + pad,
                           y + (r.h - r.label.h) / 2);
             } else {
-                const PanBadge& b = BadgeOf(items[r.item].status);
-                StampDisc(&out->deco, out->w, out->h, margin + pad + badge * 0.5f,
-                          y + r.h * 0.5f, badge * 0.5f, b.colour, b.outline,
-                          std::max(1.f, static_cast<float>(PanScale(kPanStroke)) * 0.9f));
-                const int lx = margin + pad + badge + bgap;
+                const PanGlyph g = PanelGlyphFor(items[r.item]);
+                StampOcticon(&out->deco, out->w, out->h, margin + pad,
+                             y + (r.h - icon) / 2, icon, g.path, g.colour);
+                const int lx = margin + pad + icon + igap;
                 StampMask(&out->ink, out->w, out->h, r.label, lx,
                           y + (r.h - r.label.h) / 2);
                 if (r.title.w) {
@@ -2759,7 +3075,7 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
                 if (edge > 0.004f) p = BlendOver(Pack(border, edge * kPanFillAlpha), p);
                 if (card.rule_y >= 0 && y == card.rule_y &&
                     x > card.margin && x < card.margin + card.panel_w) {
-                    p = BlendOver(Pack(ink, kPanRuleA), p);
+                    p = BlendOver(Pack(kPanLine, 1.f), p);
                 }
                 if (hover) {
                     const float bw = (hover->right - hover->left) * 0.5f;
@@ -2771,7 +3087,7 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
                     const float qy = std::max(by - (bh - r), 0.f);
                     const float hd = std::sqrt(qx * qx + qy * qy) - r;
                     const float ha = (1.f - SmoothStep(-0.7f, 0.7f, hd)) * inside;
-                    if (ha > 0.004f) p = BlendOver(Pack(ink, ha * kPanHoverA), p);
+                    if (ha > 0.004f) p = BlendOver(Pack(kPanHover, ha), p);
                 }
             }
             if (const uint32_t b = card.deco[ci]) p = BlendOver(ScaleAlpha(b, inside), p);
@@ -3681,6 +3997,10 @@ std::vector<PanelItem> SamplePanelItems() {
 }
 
 void PanelPreview(const std::string& prefix) {
+    // Per-monitor aware first, so the preview is drawn at the scale the screen
+    // actually uses rather than at a virtualized 96 dpi — the point is to review
+    // what will be on the glass.
+    MakeThreadDpiAware();
     const float scale = PanelScaleFor(nullptr);
     const std::vector<PanelItem> items = SamplePanelItems();
     struct Shot {

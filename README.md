@@ -470,30 +470,53 @@ $ curl -s -X POST http://127.0.0.1:8124/panel -d '{
 {"ok":true,"hwnd":1968562,"resolved":true}
 ```
 
-Each row is a badge, a short handle (`repo#1375`, or a path's last segment) and
+Each row is an icon, a short handle (`repo#1375`, or a path's last segment) and
 the title, cut with an ellipsis. **Click a row** and it opens: pull requests and
 issues in the browser, paths in Explorer — one `ShellExecute` does both, which is
 why the two can sit in the same list. Six rows are shown; anything past that
 becomes a `+N more` line, since the point is the top of a ranked list, not the
 whole backlog.
 
-| Status | Badge | Status | Badge |
-|---|---|---|---|
-| `open` | blue | `merged` | purple |
-| `approved` | green | `closed` | grey |
-| `changes_requested` | orange | `draft` | grey, hollow |
-| `checks_failing` | red | `unknown` | pale grey |
+Each row is marked with **GitHub's own icon for its type**, tinted with GitHub's
+own colour for its state — two pieces of information in the space a status dot
+took, and the same glyph the row's page shows:
 
-The card is the caption toast's material — same rounded silhouette from one
-distance field, same hairline, same soft shadow, same fonts, the `light` variant's
-fill and ink — so the two read as one product. It stays `light` whatever
-`--caption-variant` a passing utterance set: this thing is on screen for hours,
-and a coloured card would claim the meaning that belongs to the badges.
+| Row | Icon | Colour |
+|---|---|---|
+| issue, any live state | `issue-opened` | green `#347d39`, amber `#c69026` for `changes_requested`, red `#c93c37` for `checks_failing` |
+| pull request, any live state | `git-pull-request` | as above; `approved` stays plain green |
+| `draft` | `git-pull-request-draft` | grey `#768390` |
+| `merged` | `git-merge` | purple `#8256d0` |
+| closed issue | `issue-closed` | purple `#8256d0` — GitHub's "completed" |
+| closed pull request | `git-pull-request-closed` | red `#c93c37` |
+| `unknown` | its type's icon | grey `#768390` |
+| a path | `file-directory` | grey `#768390` |
+
+`approved` is left plain green rather than given a tick overlay: at 14 px a
+second mark inside the glyph turns into grit, and a row's job is "which thing,
+roughly how is it doing" — the exact review state is one click away.
+
+The icons are the 16×16 [Octicons](https://github.com/primer/octicons) (MIT),
+verbatim path data, rasterized in the binary: the path is parsed, its curves and
+arcs are flattened to polygons, and a nonzero-winding scanline fill with four
+subsample rows per pixel and exact horizontal coverage turns it into an alpha
+mask. No font to ship and no bitmap to blur — which is what keeps the hole in
+`issue-opened` a hole at 1×, 1.5× and 2×.
+
+The card shares the caption toast's *material* — one rounded-rect distance field
+giving the silhouette, its hairline and its shadow, and the same rasterized
+fonts — but not its palette. The toast is a light notification that appears for a
+sentence; this is a dark panel that lives on a dark terminal for hours, so it
+takes GitHub's dark surface: `#212830` card, `#3d444d` lines, `#d1d7e0` primary
+and `#9198a1` secondary text, and a hover band one step lighter at `#2a313c`.
+It ignores `--caption-variant` entirely — a coloured card would claim the meaning
+that belongs to the icons.
 
 ### Collapse
 
 The header is the summary line, with a `−` at the right. Click either and the
-card becomes a one-line pill: how many items, and the **worst** badge among them.
+card becomes a one-line pill: how many items, and the **worst** item's icon and
+colour among them.
 That is enough to know whether the window wants attention, while giving the
 terminal underneath its corner back.
 
@@ -621,8 +644,9 @@ speak.exe --panel-demo --title "reviewer worker"    rem a real panel for 20 s
 ```
 
 `--panel-preview <prefix>` writes `<prefix>-expanded.png`, `-hover.png` and
-`-collapsed.png` from sample data covering every badge, a path row, a title long
-enough to be cut and one item too many so the `+N more` row appears. Layered
+`-collapsed.png` at the screen's own scale, from sample data covering every icon
+and colour, a path row, a title long enough to be cut and two items too many so
+the `+N more` row appears. Layered
 windows are invisible to GDI screen capture, so rendering them is the only way to
 review the look — same reason `--orb-preview` exists. (PNG rather than the
 previews' BMP, and with no zlib linked: a deflate stream of *stored* blocks is
