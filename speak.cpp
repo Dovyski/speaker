@@ -2072,12 +2072,22 @@ struct PointRequest {
     POINT       at{};
     HWND        hwnd    = nullptr;
     std::string title;
+    // A Claude session id. The daemon's panel registrations are the session →
+    // window table, so this is the one target that survives a terminal being
+    // retitled mid-turn — and the only one an agent can name without guessing.
+    std::string session;
+    int         point_port = 0;   // where to ask, when we are not the daemon
     int         pulses  = 3;
     int         size    = 0;      // 0 = g_point_size
     float       duration = 0.f;   // 0 = the built-in pacing
     bool        have_colour = false;
     Rgb         colour{};         // only read when have_colour
 };
+
+// Defined with the panel registrations, which are what a session id resolves
+// against. `point_port` is 0 inside the daemon, where the table is local — asking
+// ourselves over our own single-threaded listener would deadlock.
+HWND ResolveSessionHwnd(const std::string& session, int point_port);
 
 // Applies a request's look — pacing and colour — and hands back the ring count.
 // Both the live overlay and --point-preview go through here, so a previewed frame
@@ -2094,18 +2104,30 @@ int ApplyPointStyle(const PointRequest& req) {
 // the caller can act on, and `candidates` with the JSON list to choose from.
 bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
                   std::string* candidates) {
-    if (req.have_at) { *out = req.at; return true; }
-
     const auto centre = [](const WindowTarget& t) {
         return POINT{(t.rect.left + t.rect.right) / 2, (t.rect.top + t.rect.bottom) / 2};
     };
-
-    if (req.hwnd) {
-        if (!IsWindow(req.hwnd)) { *err = "no such window"; return false; }
+    const auto centre_of = [&](HWND h) {
         RECT r{};
-        if (!GetWindowRect(req.hwnd, &r)) { *err = "window has no rectangle"; return false; }
+        if (!GetWindowRect(h, &r)) return false;
         *out = POINT{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
         return true;
+    };
+
+    // A session id first: it is the only target that does not have to be
+    // guessed. A session the daemon has never seen a panel for is *not* an error
+    // on its own — fall through to the title, which is what the skill tells an
+    // agent to pass alongside it.
+    if (!req.session.empty()) {
+        if (HWND h = ResolveSessionHwnd(req.session, req.point_port)) {
+            if (IsWindow(h) && centre_of(h)) return true;
+        }
+        if (req.title.empty() && !req.hwnd && !req.have_at) {
+            *err = "session '" + req.session +
+                   "' is not bound to a window — pass --title as well";
+            if (candidates) *candidates = TargetsJson(EnumTargets());
+            return false;
+        }
     }
 
     if (!req.title.empty()) {
@@ -2123,6 +2145,14 @@ bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
         *out = centre(hits[0]);
         return true;
     }
+
+    if (req.hwnd) {
+        if (!IsWindow(req.hwnd)) { *err = "no such window"; return false; }
+        if (!centre_of(req.hwnd)) { *err = "window has no rectangle"; return false; }
+        return true;
+    }
+
+    if (req.have_at) { *out = req.at; return true; }
 
     // A classic console (conhost) has a real window of its own, and a process
     // attached to one can just ask. Under a ConPTY terminal — Windows Terminal,
@@ -2163,6 +2193,11 @@ bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
 // contains-match, case-insensitive — and the same refusal to guess: an ambiguous
 // title gives nothing rather than an arbitrary sibling.
 HWND ResolveTargetHwnd(const PointRequest& req) {
+    if (!req.session.empty()) {
+        if (HWND h = ResolveSessionHwnd(req.session, req.point_port)) {
+            if (IsWindow(h)) return h;
+        }
+    }
     if (req.hwnd) return IsWindow(req.hwnd) ? req.hwnd : nullptr;
     if (req.title.empty()) return nullptr;
     const std::string needle = LowerAscii(req.title);
@@ -4702,6 +4737,68 @@ void RunEnricherLoop() {
     }
 }
 
+// ── session → window ───────────────────────────────────────────────────────
+// The table is the panel registrations: nothing extra is maintained for
+// pointing, and a session that has never posted a panel is simply unknown. What
+// this reads is the snapshot the resolver publishes for GET /panels, so the
+// answer is at most half a second old — which is a window that has not moved in
+// half a second.
+
+// True inside `--serve`. A client has no registrations of its own and has to
+// ask; the daemon must *not* ask, since it would be asking itself through a
+// listener that is busy handling this very request.
+std::atomic<bool> g_in_daemon{false};
+
+HWND PanelSessionFromJson(const std::string& json, const std::string& session) {
+    JsonVal root;
+    if (!JsonParse(json, &root) || root.t != JsonVal::T::Arr) return nullptr;
+    for (const JsonVal& v : root.arr) {
+        if (v.t != JsonVal::T::Obj || v.GetStr("session") != session) continue;
+        const JsonVal* h = v.Find("hwnd");
+        if (!h || h->t != JsonVal::T::Num) return nullptr;   // registered, unbound
+        return reinterpret_cast<HWND>(static_cast<uintptr_t>(h->num));
+    }
+    return nullptr;
+}
+
+// One short GET, for a client that wants to point at its own session's window.
+bool HttpGetLocal(int port, const std::string& path, std::string* body, int timeout_ms) {
+    SOCKET fd = ConnectLocal(port, timeout_ms);
+    if (fd == INVALID_SOCKET) return false;
+    const DWORD tv = static_cast<DWORD>(timeout_ms);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    const std::string head = "Host: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if (!SendAll(fd, "GET " + path + " HTTP/1.1\r\n" + head)) {
+        closesocket(fd);
+        return false;
+    }
+    std::string all;
+    char        buf[4096];
+    for (;;) {
+        const int n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        all.append(buf, n);
+        if (all.size() > (1u << 20)) break;
+    }
+    closesocket(fd);
+    const size_t split = all.find("\r\n\r\n");
+    if (split == std::string::npos) return false;
+    *body = all.substr(split + 4);
+    return true;
+}
+
+HWND ResolveSessionHwnd(const std::string& session, int point_port) {
+    if (session.empty()) return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+        if (HWND h = PanelSessionFromJson(g_pan_snapshot, session)) return h;
+    }
+    if (g_in_daemon.load() || point_port <= 0) return nullptr;
+    std::string body;
+    if (!HttpGetLocal(point_port, "/panels", &body, 400)) return nullptr;
+    return PanelSessionFromJson(body, session);
+}
+
 // ── the endpoint ────────────────────────────────────────────────────────────
 
 std::string PanelUrlDecode(const std::string& s) {
@@ -5106,7 +5203,8 @@ void HandlePointRequest(SOCKET fd) {
     }
 
     PointRequest pr;
-    pr.title = pocket_tts::json_get_string(req.body, "title");
+    pr.title   = pocket_tts::json_get_string(req.body, "title");
+    pr.session = pocket_tts::json_get_string(req.body, "session");
     double v = 0;
     if (JsonGetNumber(req.body, "hwnd", &v))
         pr.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(v));
@@ -5131,9 +5229,10 @@ void HandlePointRequest(SOCKET fd) {
         pr.have_colour = true;
     }
 
-    if (!pr.have_at && !pr.hwnd && pr.title.empty()) {
+    if (!pr.have_at && !pr.hwnd && pr.title.empty() && pr.session.empty()) {
         PointHttpRespond(fd, 400,
-            "{\"ok\":false,\"error\":\"name a target: title, hwnd, or x and y\"}");
+            "{\"ok\":false,\"error\":\"name a target: session, title, hwnd, "
+            "or x and y\"}");
         return;
     }
     // One overlay at a time: two animations on top of each other read as noise.
@@ -5446,6 +5545,9 @@ void Usage() {
         "                        With no target given, the window of the calling\n"
         "                        session is used, and it is an error (exit 3) if\n"
         "                        that cannot be told apart from its siblings.\n"
+        "  --session <id>        point at the window this Claude session's panel\n"
+        "                        is bound to; preferred over --title and falls\n"
+        "                        back to it (implies --point)\n"
         "  --title <substr>      point at the window whose title contains this\n"
         "  --hwnd <n>            point at this window handle\n"
         "  --at <x,y>            point at a screen position\n"
@@ -5535,6 +5637,10 @@ int main() {
         else if (a == "--point")       opt.point = true;
         else if (a == "--list-targets") opt.list_targets = true;
         else if (a == "--title")       { opt.point_req.title = next("--title"); opt.point = true; }
+        else if (a == "--session") {
+            opt.point_req.session = next("--session");
+            opt.point = true;
+        }
         else if (a == "--hwnd") {
             opt.point_req.hwnd = reinterpret_cast<HWND>(
                 static_cast<uintptr_t>(std::strtoull(next("--hwnd").c_str(), nullptr, 0)));
@@ -5638,6 +5744,10 @@ int main() {
 
     // Rasterized once here, before anything can render a frame: --orb-size is
     // settled by now and the text never changes after this point.
+    // Where to ask about a session id. Harmless with no daemon running: the
+    // connect fails fast and the request falls back to --title.
+    opt.point_req.point_port = opt.point_port ? opt.point_port : opt.port + 1;
+
     BuildCaptionCard();
     BuildSubtitle();
 
@@ -5690,7 +5800,10 @@ int main() {
     }
     if (stop)   return StopDaemon(opt);
     if (status) return DaemonStatus(opt);
-    if (serve)  return RunDaemon(opt);
+    if (serve) {
+        g_in_daemon.store(true);
+        return RunDaemon(opt);
+    }
 
     // Pointing on its own: no model, no audio device, nothing to wait for.
     if (opt.point && opt.text.empty()) {
