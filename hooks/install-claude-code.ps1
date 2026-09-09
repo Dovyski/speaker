@@ -5,7 +5,8 @@ What it does, idempotently:
   1. copies hooks\*.ps1 into <ClaudeDir>\hooks\ (overwrites; creates the dir)
   2. creates <ClaudeDir>\attention\ (the session files, caches and logs)
   3. merges the `Stop` (matcher *) and `PostToolUse` (matcher Bash) hook entries
-     for i47-attention.ps1 into <ClaudeDir>\settings.json and into every
+     for i47-attention.ps1, plus the `SessionStart` (matcher *) entry for
+     i47-session-id.ps1, into <ClaudeDir>\settings.json and into every
      -ExtraClaudeDirs settings.json that exists, without touching any other
      hook and without duplicating an entry it already installed
   4. unregisters the legacy `cto-i47-enrich` scheduled task if it is still
@@ -84,8 +85,9 @@ foreach ($s in $scripts) {
 Note ("copied {0} hook script(s) to {1}" -f $scripts.Count, $HooksDst)
 if ($panelPort -ne 8124) { Note "rewrote the POST endpoint to port $panelPort" }
 
-$Producer = Join-Path $HooksDst 'i47-attention.ps1'
-$Enricher = Join-Path $HooksDst 'i47-enrich.ps1'
+$Producer  = Join-Path $HooksDst 'i47-attention.ps1'
+$Enricher  = Join-Path $HooksDst 'i47-enrich.ps1'
+$SessionId = Join-Path $HooksDst 'i47-session-id.ps1'
 
 # --- 2. state directory -----------------------------------------------------
 
@@ -105,10 +107,14 @@ foreach ($a in $AttentionDirs) {
 
 # --- 3. settings.json -------------------------------------------------------
 
-$HookCommand = 'pwsh -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $Producer
+function Get-HookCommand([string]$script) {
+    'pwsh -NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $script
+}
 $Wanted = @(
-    @{ Event = 'Stop';        Matcher = '*'    },
-    @{ Event = 'PostToolUse'; Matcher = 'Bash' }
+    @{ Event = 'Stop';         Matcher = '*';    Script = $Producer  },
+    @{ Event = 'PostToolUse';  Matcher = 'Bash'; Script = $Producer  },
+    # announces the session id so the model can use `speak.exe --session <id>`
+    @{ Event = 'SessionStart'; Matcher = '*';    Script = $SessionId }
 )
 
 function Get-Prop($obj, [string]$name) {
@@ -121,7 +127,7 @@ function Set-Prop($obj, [string]$name, $value) {
 }
 
 # Returns $true when it changed $settings.
-function Merge-HookEntry($settings, [string]$event, [string]$matcher, [string]$command) {
+function Merge-HookEntry($settings, [string]$event, [string]$matcher, [string]$command, [string]$dupPattern) {
     $hooks = Get-Prop $settings 'hooks'
     if (-not $hooks) { $hooks = [pscustomobject]@{}; Set-Prop $settings 'hooks' $hooks }
 
@@ -145,7 +151,7 @@ function Merge-HookEntry($settings, [string]$event, [string]$matcher, [string]$c
         $inner = @($inner | Where-Object { $_ })
         foreach ($h in $inner) {
             # same script, however it is spelled: that is the duplicate test
-            if ([string](Get-Prop $h 'command') -match '(?i)i47-attention\.ps1') { return $false }
+            if ([string](Get-Prop $h 'command') -match $dupPattern) { return $false }
         }
         Set-Prop $g 'hooks' @($inner + $entry)
         return $true
@@ -178,7 +184,9 @@ foreach ($dir in $targets) {
 
     $changed = $false
     foreach ($w in $Wanted) {
-        if (Merge-HookEntry $settings $w.Event $w.Matcher $HookCommand) {
+        $cmd = Get-HookCommand $w.Script
+        $dup = '(?i)' + [regex]::Escape((Split-Path -Leaf $w.Script))
+        if (Merge-HookEntry $settings $w.Event $w.Matcher $cmd $dup) {
             $changed = $true
             Note ("{0}: added the {1} ({2}) entry" -f $file, $w.Event, $w.Matcher)
         }

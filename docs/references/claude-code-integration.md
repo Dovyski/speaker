@@ -21,6 +21,11 @@ document covers only the producer chain that feeds it.
 ```
 Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>"
   │
+  ├─ SessionStart hook (matcher *)      once, when the session opens
+  │     └─ hooks/i47-session-id.ps1 — prints one line, which Claude Code injects
+  │        into the model's context:
+  │        "Speak session id: <id> — pass it as --session to speak.exe …"
+  │
   ├─ Stop hook (matcher *)              once per assistant turn
   └─ PostToolUse hook (matcher Bash)    every Bash call; ignored unless `gh pr|gh issue`
         │  hook JSON on stdin
@@ -89,6 +94,38 @@ Claude Code sets it to a spinner glyph plus a short description of the turn.
   fastest way to debug a title that will not bind. It is the one script with a
   hardcoded path (`$SpeakExe = 'C:\Dev\www\claude-speak\speak.exe'`) — edit that
   line before using it elsewhere.
+
+## Speaking and pointing by session id
+
+Title→window resolution is also what `speak.exe --title` does when an agent
+wants to point at its own terminal, and it has the same weaknesses: the model
+has to guess a substring of a title it cannot read, and the title changes every
+turn. `--session` removes the guess.
+
+```
+SessionStart hook  ──▶  "Speak session id: <id>"  ──▶  the model's context
+                                                            │
+POST /panel {"session":"<id>","title":…}  ──▶  daemon binds <id> → hwnd
+                                                            │
+                                                            ▼
+speak.exe --session <id>  /  POST /point {"session":"<id>"}  ──▶  rings on that hwnd
+```
+
+- `hooks/i47-session-id.ps1` is the whole producer side. `SessionStart` is the
+  one hook whose **stdout is injected into the model's context**, so a single
+  line is the entire delivery mechanism. It exits 0 in well under 200 ms, prints
+  nothing else, and `exit 0`s immediately when `I47_NESTED` is set.
+- The daemon's session→hwnd table *is* the panel registration table — the same
+  one `GET /panels` reports. A session the producer has never posted for is
+  therefore unknown to the daemon, and `--session` falls back to `--title` when
+  one was given as well. Nothing extra has to be maintained for pointing.
+- `--session` implies `--point`, exactly as `--title` does. The fallback order
+  in the `speak` skill is now `--session`, then `--title`, then
+  `--list-targets`.
+- A session's id is also in its own state file — as the file name *and* as the
+  `session` key of `~/.claude/attention/<session_id>.json`. The hook re-stamps
+  that key when the file already exists; it never creates the file, because the
+  producer owns it.
 
 ## The hook JSON
 
@@ -252,9 +289,15 @@ pwsh -NoProfile -File hooks\install-claude-code.ps1
 ```
 
 It copies `hooks\*.ps1` into `<ClaudeDir>\hooks\`, creates
+<<<<<<< HEAD
 `<ClaudeDir>\attention\`, merges the two hook entries into every settings file it
 was pointed at, removes the legacy scheduled task if it is still registered, and
 prints what it did and what is left to do by hand.
+=======
+`<ClaudeDir>\attention\`, merges the three hook entries (`Stop`, `PostToolUse`,
+`SessionStart`) into every settings file it was pointed at, registers the
+scheduled task, and prints what it did and what is left to do by hand.
+>>>>>>> feat/i47-speak-by-session
 
 | Parameter | Default | |
 |---|---|---|
@@ -283,6 +326,12 @@ already there:
     "hooks": [ { "type": "command",
                  "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\<user>\\.claude\\hooks\\i47-attention.ps1\"",
                  "timeout": 10 } ] }
+],
+"SessionStart": [
+  { "matcher": "*",
+    "hooks": [ { "type": "command",
+                 "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\<user>\\.claude\\hooks\\i47-session-id.ps1\"",
+                 "timeout": 10 } ] }
 ]
 ```
 
@@ -291,9 +340,10 @@ there is one installed copy of the scripts, not one per config dir. The file is
 backed up to `settings.json.bak-i47-<yyyyMMdd-HHmmss>` before the first change
 and rewritten as UTF-8 without BOM at two-space indentation. Re-running changes
 nothing and leaves no new backup: the duplicate test is "does any hook in this
-matcher's list mention `i47-attention.ps1`", so a hand-edited command line is
-recognised too. **`settings.json` is read at session start**, so an already-open
-session will not pick the hooks up.
+matcher's list mention that script's file name", so a hand-edited command line
+is recognised too, and an entry appended to a `SessionStart` group that already
+holds someone else's hook leaves that hook alone. **`settings.json` is read at
+session start**, so an already-open session will not pick the hooks up.
 
 ### The enricher is the daemon's job, not the scheduler's
 
@@ -408,6 +458,8 @@ or a `POST` with empty `items`. Registrations expire 48 h after their last
 | Rows for things the session never worked on | The producer scrapes the whole transcript, including text *about* other sessions and agent briefs, so a coordinating session collects other people's numbers. Bare `#N` is the weakest rule and is born `mentioned`, which is not POSTed; the Haiku layer demotes the rest. Without `claude` on `PATH` there is no pruning at all. |
 | A row for an identifier that does not exist | Fake identifiers in prompts (`does-not-exist#1`) are indistinguishable from real ones to a regex. The enricher gives up after 3 failed lookups; keep invented numbers out of live prompts. |
 | A question row that is already answered | The Haiku worker clears questions when the user has spoken since, unless the model re-lists them as open. Check `q_open` / `q_resolved` in `haiku.log`. |
+| `speak.exe --session <id>` cannot find the window | The daemon holds no panel registration for that session: it was restarted, or the session has not finished a turn yet. Check `GET /panels`; meanwhile pass `--title` too, which is what `--session` falls back to. |
+| No "Speak session id" line in a session's context | The `SessionStart` hook is missing from *that* config dir's `settings.json`, or the session predates its registration — hooks are read at session start. The id is also the name of the session's file in `~/.claude/attention/`. |
 | `haiku.log` says `skip:locked` | A previous worker is still running (`<session>.haiku.lock`, considered stale after 5 minutes). `skip:no-verdict` after `cli: timeout` means the model call exceeded 40 s and both attempts failed — harmless, the next turn tries again. |
 
 ## What is machine-specific
@@ -423,5 +475,10 @@ using the chain outside Fernando's machine.
 | `i47-attention.ps1`, `i47-enrich.ps1`, `i47-haiku.ps1` | `$Endpoint = 'http://127.0.0.1:8124/panel'`; the installer rewrites it for a non-default `-DaemonPort` |
 | `i47-terminal-title.ps1` | `$SpeakExe = 'C:\Dev\www\claude-speak\speak.exe'` |
 | `i47-haiku.ps1` | `$ApiModel = 'claude-haiku-4-5-20251001'` (API fallback only), and prompts that name the user |
+<<<<<<< HEAD
 | `install-claude-code.ps1` | the legacy task name `cto-i47-enrich` it removes, and `.claude-max` as the extra config dir |
+=======
+| `install-claude-code.ps1` | the task name `cto-i47-enrich`, and `.claude-max` as the extra config dir |
+| `i47-session-id.ps1` | nothing — it is the one script with no machine-specific constant |
+>>>>>>> feat/i47-speak-by-session
 | all | `~/.claude/attention` as the state directory, resolved from `$env:USERPROFILE` |
