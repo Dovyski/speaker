@@ -89,6 +89,8 @@ target_link_libraries(speak PRIVATE
     ${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib
     sentencepiece-static
     ws2_32 ole32 gdi32 user32 dwmapi
+    windowscodecs   # WIC, for decoding the avatar PNGs the enricher downloads
+    windowscodecs   # WIC, for decoding the avatar PNGs the enricher downloads
     delayimp
 )
 

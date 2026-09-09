@@ -25,6 +25,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <dwmapi.h>
+#include <wincodec.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -2551,6 +2552,21 @@ const char* PanStatusName(PanStatus s) {
     return kNames[static_cast<int>(s)];
 }
 
+// The status as a human reads it. The row has room for a glyph; the popover has
+// room for the word.
+const char* PanStatusWord(PanStatus s) {
+    switch (s) {
+        case PanStatus::Open:             return "Open";
+        case PanStatus::Approved:         return "Approved";
+        case PanStatus::ChangesRequested: return "Changes requested";
+        case PanStatus::ChecksFailing:    return "Checks failing";
+        case PanStatus::Merged:           return "Merged";
+        case PanStatus::Closed:           return "Closed";
+        case PanStatus::Draft:            return "Draft";
+        default:                          return "";
+    }
+}
+
 PanStatus ParsePanStatus(const std::string& name) {
     for (int i = 0; i <= static_cast<int>(PanStatus::ChecksFailing); ++i) {
         if (name == PanStatusName(static_cast<PanStatus>(i))) {
@@ -2560,6 +2576,31 @@ PanStatus ParsePanStatus(const std::string& name) {
     return PanStatus::Unknown;
 }
 
+// What the enricher can find out about a row beyond its status: who wrote it,
+// who is on it, what it is labelled, how its checks are doing. Every field is
+// optional — a producer that has not run the enricher yet sends none of it, and a
+// popover then shows what the row itself already knows.
+struct PanPerson {
+    std::string login;
+    std::string avatar;   // absolute path to a local PNG
+    std::string state;    // reviews only: APPROVED / CHANGES_REQUESTED / ...
+};
+
+struct PanLabel {
+    std::string name;
+    Rgb         colour{0.5f, 0.5f, 0.5f};
+};
+
+struct PanDetails {
+    bool                   have = false;
+    std::string            title;
+    PanPerson              author;
+    std::vector<PanPerson> assignees, reviews, review_requests;
+    std::vector<PanLabel>  labels;
+    bool                   have_checks = false;
+    long                   total = 0, failing = 0, pending = 0;
+};
+
 struct PanelItem {
     std::string kind;      // "pr", "issue", "path"; anything else is drawn like a path
     std::string repo;      // "owner/name" — only the name is shown
@@ -2567,6 +2608,7 @@ struct PanelItem {
     std::string title;
     long        number = 0;
     PanStatus   status  = PanStatus::Unknown;
+    PanDetails  details;
 
     // "repo#1375", or the last segment of a path: the short handle a human uses
     // for the thing, which is what a row leads with.
@@ -2896,6 +2938,17 @@ constexpr const char* kOctMerge =
     "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z";
 constexpr const char* kOctQuestion =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.92 6.085h.001a.749.749 0 1 1-1.342-.67c.169-.339.436-.701.849-.977C6.845 4.16 7.369 4 8 4a2.756 2.756 0 0 1 1.637.525c.503.377.863.965.863 1.725 0 .448-.115.83-.329 1.15-.205.307-.47.513-.692.662-.109.072-.22.138-.313.195l-.006.004a6.24 6.24 0 0 0-.26.16.952.952 0 0 0-.276.245.75.75 0 0 1-1.248-.832c.184-.264.42-.489.692-.661.103-.067.207-.132.313-.195l.007-.004c.1-.061.182-.11.258-.161a.969.969 0 0 0 .277-.245C8.96 6.514 9 6.427 9 6.25a.612.612 0 0 0-.262-.525A1.27 1.27 0 0 0 8 5.5c-.369 0-.595.09-.74.187a1.01 1.01 0 0 0-.34.398ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z";
+// A review's verdict, and the empty circle for one that has not arrived.
+// Octicons has no `request-changes`, so changes-requested takes the plain `x`:
+// against the green check it reads immediately, which a diff glyph would not.
+constexpr const char* kOctCheck =
+    "M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z";
+constexpr const char* kOctX =
+    "M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z";
+constexpr const char* kOctComment =
+    "M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z";
+constexpr const char* kOctCircle =
+    "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z";
 constexpr const char* kOctFileDirectory =
     "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
     "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
@@ -4083,6 +4136,596 @@ int ResolvePanelTarget(const std::string& title, HWND* out, std::string* err,
     return PanelResolve(PanelPools::Snapshot(), title, out, err, candidates);
 }
 
+// ── the hover popover ───────────────────────────────────────────────────────
+// A row has space for a handle, a glyph and a cut-off title. Everything else the
+// enricher knows about it — the full title, who wrote it, who is assigned, what
+// it is labelled, how the reviews and checks are going — needs somewhere to go,
+// and hovering is the gesture that costs nothing: no click, no navigation, and
+// it is already the gesture that highlights the row.
+//
+// So: a second layered window, to the left of the card, after a third of a
+// second of dwell. Display-only, so unlike the card it *is* WS_EX_TRANSPARENT —
+// which also keeps WindowFromPoint skipping it, so the popover cannot steal the
+// hover that opened it.
+
+constexpr int   kPopWidth   = 380;   // at 96 dpi
+constexpr int   kPopPad     = 14;
+constexpr int   kPopGap     = 10;    // between the card and the popover
+constexpr int   kPopAvatar  = 20;    // avatar diameter
+constexpr int   kPopRowGap  = 8;     // between sections
+constexpr int   kPopLinePx  = 13;
+constexpr int   kPopSmallPx = 11;    // label pills
+constexpr int   kPopTitleLines = 3;
+constexpr int   kPopMaxPeople  = 6;
+constexpr DWORD kPopDwellMs = 350;
+
+// ── avatars ─────────────────────────────────────────────────────────────────
+// The enricher downloads them once into ~/.claude/attention/avatars/<login>.png
+// and this only ever reads. Decoded lazily, on the panel thread, and cached by
+// path *and* mtime *and* diameter — including the failures, so a login whose
+// file never arrived is one stat and one decode attempt, not one per frame.
+
+struct AvatarKey {
+    std::string path;
+    uint64_t    mtime = 0;
+    int         d     = 0;
+    bool operator==(const AvatarKey& o) const {
+        return d == o.d && mtime == o.mtime && path == o.path;
+    }
+};
+
+struct AvatarHash {
+    size_t operator()(const AvatarKey& k) const {
+        return std::hash<std::string>()(k.path) ^ (std::hash<uint64_t>()(k.mtime) << 1) ^
+               (static_cast<size_t>(k.d) << 7);
+    }
+};
+
+struct Avatar {
+    bool                  ok = false;
+    std::vector<uint32_t> px;   // premultiplied BGRA, d x d, already circular
+};
+
+uint64_t FileMtime(const std::string& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(Wide(path).c_str(), GetFileExInfoStandard, &fad)) return 0;
+    return (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+           fad.ftLastWriteTime.dwLowDateTime;
+}
+
+// WIC rather than GDI+: a flat COM API with a scaler and a format converter in
+// it is less to carry than another library's headers, and 32bppPBGRA is exactly
+// the layout the layered window wants.
+bool DecodeAvatar(const std::string& path, int d, std::vector<uint32_t>* out) {
+    // Wherever this runs — the panel thread, or the main thread under
+    // --panel-preview — WIC needs COM on it. Doing it here rather than at each
+    // call site is what keeps the avatar loader self-contained; whatever mode the
+    // thread is already in is fine, only the initialisation has to have happened.
+    static thread_local bool com_ready = false;
+    if (!com_ready) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        com_ready = true;
+    }
+    IWICImagingFactory* factory = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+    IWICBitmapDecoder*     dec    = nullptr;
+    IWICBitmapFrameDecode* frame  = nullptr;
+    IWICBitmapScaler*      scaler = nullptr;
+    IWICFormatConverter*   conv   = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(factory->CreateDecoderFromFilename(Wide(path).c_str(), nullptr,
+                                                     GENERIC_READ,
+                                                     WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->GetFrame(0, &frame)) &&
+        SUCCEEDED(factory->CreateBitmapScaler(&scaler)) &&
+        SUCCEEDED(scaler->Initialize(frame, d, d, WICBitmapInterpolationModeFant)) &&
+        SUCCEEDED(factory->CreateFormatConverter(&conv)) &&
+        SUCCEEDED(conv->Initialize(scaler, GUID_WICPixelFormat32bppPBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom))) {
+        out->assign(static_cast<size_t>(d) * d, 0);
+        ok = SUCCEEDED(conv->CopyPixels(nullptr, d * 4,
+                                        static_cast<UINT>(out->size() * 4),
+                                        reinterpret_cast<BYTE*>(out->data())));
+    }
+    if (conv)    conv->Release();
+    if (scaler)  scaler->Release();
+    if (frame)   frame->Release();
+    if (dec)     dec->Release();
+    factory->Release();
+    return ok;
+}
+
+// Cut to a circle in place: GitHub's avatars are square and everyone draws them
+// round, and the antialiased edge is what stops it looking like a sticker.
+void CircleMask(std::vector<uint32_t>* px, int d) {
+    const float c = d * 0.5f, r = c - 0.5f;
+    for (int y = 0; y < d; ++y) {
+        for (int x = 0; x < d; ++x) {
+            const float dx = x + 0.5f - c, dy = y + 0.5f - c;
+            const float a = 1.f - SmoothStep(-0.7f, 0.7f, std::sqrt(dx * dx + dy * dy) - r);
+            uint32_t& p = (*px)[static_cast<size_t>(y) * d + x];
+            p = a >= 0.999f ? p : (a <= 0.004f ? 0 : ScaleAlpha(p, a));
+        }
+    }
+}
+
+const Avatar& AvatarFor(const std::string& path, int d) {
+    static std::unordered_map<AvatarKey, Avatar, AvatarHash> cache;
+    static const Avatar kNone;
+    if (path.empty() || d <= 0) return kNone;
+
+    const AvatarKey key{path, FileMtime(path), d};
+    const auto      it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    Avatar av;
+    if (key.mtime && DecodeAvatar(path, d, &av.px)) {
+        CircleMask(&av.px, d);
+        av.ok = true;
+    }
+    // Cached either way: a login whose file never arrived costs one stat and one
+    // decode attempt, not one per frame.
+    return cache.emplace(key, std::move(av)).first->second;
+}
+
+// The fallback, and the reason a missing avatar is not a hole: a grey disc with
+// the login's initial, which is what every other product does for the same
+// reason.
+void StampInitial(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int d,
+                  const std::string& login) {
+    for (int y = 0; y < d; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < d; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const float c = d * 0.5f, r = c - 0.5f;
+            const float dx = x + 0.5f - c, dy = y + 0.5f - c;
+            const float a =
+                1.f - SmoothStep(-0.7f, 0.7f, std::sqrt(dx * dx + dy * dy) - r);
+            if (a <= 0.004f) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(Pack(kPanLine, a), dst);
+        }
+    }
+    if (login.empty()) return;
+    const std::wstring initial(1, static_cast<wchar_t>(
+                                     std::toupper(static_cast<unsigned char>(login[0]))));
+    const TextMask m = RenderText(initial, std::max(8, d * 3 / 5), true, d, 1,
+                                  DT_SINGLELINE | DT_CENTER);
+    for (int y = 0; y < m.h; ++y) {
+        const int cy = y0 + (d - m.h) / 2 + y;
+        if (cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < m.w; ++x) {
+            const int cx = x0 + (d - m.w) / 2 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const uint8_t a = m.a[static_cast<size_t>(y) * m.w + x];
+            if (!a) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(Pack(kPanTextB, a / 255.f), dst);
+        }
+    }
+}
+
+void StampAvatar(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int d,
+                 const PanPerson& who) {
+    const Avatar& av = AvatarFor(who.avatar, d);
+    if (!av.ok) {
+        StampInitial(deco, cw, ch, x0, y0, d, who.login);
+        return;
+    }
+    for (int y = 0; y < d; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < d; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const uint32_t p = av.px[static_cast<size_t>(y) * d + x];
+            if (!(p >> 24)) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(p, dst);
+        }
+    }
+}
+
+// ── laying the popover out ─────────────────────────────────────────────────
+
+// GitHub picks black or white label text by the colour's own brightness, and so
+// does this: a pill is unreadable the moment it guesses wrong.
+Rgb PopPillInk(const Rgb& bg) {
+    const float lum = 0.299f * bg.r + 0.587f * bg.g + 0.114f * bg.b;
+    return lum > 0.70f ? Rgb{0.05f, 0.06f, 0.07f} : Rgb{1.f, 1.f, 1.f};
+}
+
+struct PopGlyph {
+    const char* path;
+    Rgb         colour;
+};
+
+PopGlyph PopReviewGlyph(const std::string& state) {
+    if (state == "APPROVED")          return {kOctCheck, kOctGreen};
+    if (state == "CHANGES_REQUESTED") return {kOctX, kOctRed};
+    if (state == "COMMENTED")         return {kOctComment, kOctGrey};
+    return {kOctCircle, kOctGrey};   // PENDING, or anything unrecognised
+}
+
+TextMask PopLine(const std::string& text, bool bold, int max_w, int px = kPopLinePx,
+                 int lines = 1, UINT extra = DT_SINGLELINE | DT_END_ELLIPSIS) {
+    return RenderText(Wide(text), PanScale(px), bold, max_w, lines, extra);
+}
+
+void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale) {
+    *out = PanelCard{};
+    g_pan_scale = scale;
+
+    const PanDetails& d      = item.details;
+    const int         pad    = PanScale(kPopPad);
+    const int         margin = PanScale(kPanShadow);
+    const int         panel_w = PanScale(kPopWidth);
+    const int         inner  = panel_w - 2 * pad;
+    const int         icon   = PanScale(kPanIcon);
+    const int         av     = PanScale(kPopAvatar);
+    const int         gap    = PanScale(kPopRowGap);
+
+    // Two passes over the same layout: measure everything into a list of things
+    // to stamp, then allocate and stamp. Cheaper than guessing the height, and
+    // it keeps every y in one place.
+    struct Piece {
+        enum class T { Text, Icon, Avatar, Pill } t = T::Text;
+        TextMask    mask;
+        int         x = 0, y = 0, w = 0, h = 0;
+        bool        dim = false;
+        const char* glyph = nullptr;
+        Rgb         colour{};
+        PanPerson   who;
+    };
+    std::vector<Piece> pieces;
+    int y = 0;
+
+    const auto text = [&](const TextMask& m, int x, int row_h, bool dim) {
+        if (!m.w) return;
+        Piece p;
+        p.t    = Piece::T::Text;
+        p.mask = m;
+        p.x    = x;
+        p.y    = y + (row_h - m.h) / 2;
+        p.dim  = dim;
+        pieces.push_back(std::move(p));
+    };
+
+    // 1. the handle line: glyph, repo#N, the status in words
+    {
+        const PanGlyph  g     = PanelGlyphFor(item);
+        const TextMask  label = PopLine(item.Label(), true, inner - icon - PanScale(8));
+        const std::string word = PanStatusWord(item.status);
+        const int       used  = icon + PanScale(8) + label.w + PanScale(10);
+        const TextMask  state = word.empty() ? TextMask{}
+                                             : PopLine(word, false, std::max(0, inner - used));
+        const int row_h = std::max({icon, label.h, state.h});
+        Piece p;
+        p.t      = Piece::T::Icon;
+        p.glyph  = g.path;
+        p.colour = g.colour;
+        p.x      = 0;
+        p.y      = y + (row_h - icon) / 2;
+        p.w      = icon;
+        pieces.push_back(std::move(p));
+        text(label, icon + PanScale(8), row_h, false);
+        if (state.w) text(state, inner - state.w, row_h, true);
+        y += row_h + gap;
+    }
+
+    // 2. the full title, which is the whole point of hovering
+    {
+        const std::string t = d.have && !d.title.empty() ? d.title : item.title;
+        if (!t.empty()) {
+            const TextMask m = PopLine(t, false, inner, kPopLinePx, kPopTitleLines,
+                                       DT_WORDBREAK | DT_END_ELLIPSIS);
+            text(m, 0, m.h, false);
+            y += m.h + gap;
+        }
+    }
+
+    if (d.have) {
+        // 3. the author
+        if (!d.author.login.empty()) {
+            const TextMask m = PopLine(d.author.login, false, inner - av - PanScale(8));
+            const int row_h = std::max(av, m.h);
+            Piece p;
+            p.t   = Piece::T::Avatar;
+            p.who = d.author;
+            p.x   = 0;
+            p.y   = y + (row_h - av) / 2;
+            p.w   = av;
+            pieces.push_back(std::move(p));
+            text(m, av + PanScale(8), row_h, true);
+            y += row_h + gap;
+        }
+
+        // 4. labels, as pills that wrap
+        if (!d.labels.empty()) {
+            const int pill_pad = PanScale(7);
+            int       x = 0;
+            int       row_h = 0;
+            for (const PanLabel& lab : d.labels) {
+                const TextMask m = PopLine(lab.name, false, inner - 2 * pill_pad,
+                                           kPopSmallPx);
+                if (!m.w) continue;
+                const int w = m.w + 2 * pill_pad;
+                const int h = m.h + PanScale(5);
+                if (x && x + w > inner) {
+                    y += row_h + PanScale(4);
+                    x = 0;
+                    row_h = 0;
+                }
+                Piece p;
+                p.t      = Piece::T::Pill;
+                p.mask   = m;
+                p.x      = x;
+                p.y      = y;
+                p.w      = w;
+                p.h      = h;
+                p.colour = lab.colour;
+                pieces.push_back(std::move(p));
+                x += w + PanScale(5);
+                row_h = std::max(row_h, h);
+            }
+            if (row_h) y += row_h + gap;
+        }
+
+        // 5. assignees, and 6. reviewers — a caption then a person per line, so a
+        // login is never cut to fit a neighbour on the same row.
+        const auto people = [&](const char* caption,
+                                const std::vector<PanPerson>& list, bool with_state) {
+            if (list.empty()) return;
+            const TextMask cap = PopLine(caption, true, inner, kPopSmallPx);
+            text(cap, 0, cap.h, true);
+            y += cap.h + PanScale(4);
+            const size_t n = std::min<size_t>(list.size(), kPopMaxPeople);
+            for (size_t i = 0; i < n; ++i) {
+                const PanPerson& who = list[i];
+                const int  glyph_w = with_state ? icon + PanScale(6) : 0;
+                const TextMask m =
+                    PopLine(who.login, false, inner - av - PanScale(8) - glyph_w);
+                const int row_h = std::max(av, m.h);
+                Piece p;
+                p.t   = Piece::T::Avatar;
+                p.who = who;
+                p.x   = 0;
+                p.y   = y + (row_h - av) / 2;
+                p.w   = av;
+                pieces.push_back(std::move(p));
+                text(m, av + PanScale(8), row_h, false);
+                if (with_state) {
+                    const PopGlyph g = PopReviewGlyph(who.state);
+                    Piece s;
+                    s.t      = Piece::T::Icon;
+                    s.glyph  = g.path;
+                    s.colour = g.colour;
+                    s.x      = inner - icon;
+                    s.y      = y + (row_h - icon) / 2;
+                    s.w      = icon;
+                    pieces.push_back(std::move(s));
+                }
+                y += row_h + PanScale(3);
+            }
+            if (list.size() > n) {
+                const TextMask more =
+                    PopLine("+" + std::to_string(list.size() - n) + " more", false, inner,
+                            kPopSmallPx);
+                text(more, av + PanScale(8), more.h, true);
+                y += more.h + PanScale(3);
+            }
+            y += gap - PanScale(3);
+        };
+        people("Assignees", d.assignees, false);
+
+        std::vector<PanPerson> reviewers = d.reviews;
+        for (const PanPerson& r : d.review_requests) {
+            bool already = false;
+            for (const PanPerson& e : reviewers) {
+                if (e.login == r.login) { already = true; break; }
+            }
+            if (already) continue;
+            PanPerson pending = r;
+            pending.state = "PENDING";
+            reviewers.push_back(std::move(pending));
+        }
+        if (item.kind == "pr") people("Reviewers", reviewers, true);
+
+        // 7. checks, in one line, because that is all anyone reads of them
+        if (d.have_checks) {
+            const long passing = std::max<long>(0, d.total - d.failing - d.pending);
+            const std::string line =
+                "Checks: " + std::to_string(passing) + " passing · " +
+                std::to_string(d.pending) + " pending · " + std::to_string(d.failing) +
+                " failing";
+            const TextMask m = PopLine(line, false, inner);
+            text(m, 0, m.h, true);
+            y += m.h + gap;
+        }
+    }
+
+    if (pieces.empty()) return;
+    const int panel_h = y - gap + 2 * pad;
+
+    out->margin  = margin;
+    out->panel_w = panel_w;
+    out->panel_h = panel_h;
+    out->radius  = static_cast<float>(PanScale(kPanRadius));
+    out->w = panel_w + 2 * margin;
+    out->h = panel_h + 2 * margin;
+    const size_t n = static_cast<size_t>(out->w) * out->h;
+    out->dist.resize(n);
+    out->ink.assign(n, 0);
+    out->dim.assign(n, 0);
+    out->deco.assign(n, 0);
+
+    const int ox = margin + pad, oy = margin + pad;
+    for (const Piece& p : pieces) {
+        switch (p.t) {
+            case Piece::T::Text:
+                StampMask(p.dim ? &out->dim : &out->ink, out->w, out->h, p.mask,
+                          ox + p.x, oy + p.y);
+                break;
+            case Piece::T::Icon:
+                StampOcticon(&out->deco, out->w, out->h, ox + p.x, oy + p.y, p.w,
+                             p.glyph, p.colour);
+                break;
+            case Piece::T::Avatar:
+                StampAvatar(&out->deco, out->w, out->h, ox + p.x, oy + p.y, p.w, p.who);
+                break;
+            case Piece::T::Pill: {
+                const float r = p.h * 0.5f;
+                for (int py = 0; py < p.h; ++py) {
+                    for (int px = 0; px < p.w; ++px) {
+                        const float bx = std::fabs(px + 0.5f - p.w * 0.5f);
+                        const float by = std::fabs(py + 0.5f - p.h * 0.5f);
+                        const float qx = std::max(bx - (p.w * 0.5f - r), 0.f);
+                        const float qy = std::max(by - (p.h * 0.5f - r), 0.f);
+                        const float a =
+                            1.f - SmoothStep(-0.7f, 0.7f, std::sqrt(qx * qx + qy * qy) - r);
+                        if (a <= 0.004f) continue;
+                        const int cx = ox + p.x + px, cy = oy + p.y + py;
+                        if (cx < 0 || cx >= out->w || cy < 0 || cy >= out->h) continue;
+                        uint32_t& dst = (*&out->deco)[static_cast<size_t>(cy) * out->w + cx];
+                        dst = BlendOver(Pack(p.colour, a), dst);
+                    }
+                }
+                // The pill's text is coloured by its background, so it cannot ride
+                // the shared ink layers.
+                const Rgb ink = PopPillInk(p.colour);
+                for (int my = 0; my < p.mask.h; ++my) {
+                    const int cy = oy + p.y + (p.h - p.mask.h) / 2 + my;
+                    if (cy < 0 || cy >= out->h) continue;
+                    for (int mx = 0; mx < p.mask.w; ++mx) {
+                        const int cx = ox + p.x + (p.w - p.mask.w) / 2 + mx;
+                        if (cx < 0 || cx >= out->w) continue;
+                        const uint8_t a = p.mask.a[static_cast<size_t>(my) * p.mask.w + mx];
+                        if (!a) continue;
+                        uint32_t& dst = out->deco[static_cast<size_t>(cy) * out->w + cx];
+                        dst = BlendOver(Pack(ink, a / 255.f), dst);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    PanelShapeAndBake(out);
+}
+
+// ── the popover window ─────────────────────────────────────────────────────
+
+struct Popover {
+    HWND      hwnd = nullptr;
+    PanelCard card;
+    HDC       dc      = nullptr;
+    HBITMAP   dib     = nullptr;
+    HGDIOBJ   old_bmp = nullptr;
+    void*     bits    = nullptr;
+    int       dib_w = 0, dib_h = 0;
+    bool      shown = false;
+    std::string key;        // what it is currently showing
+    float     scale = 1.f;
+
+    void ReleaseDib() {
+        if (dc && old_bmp) SelectObject(dc, old_bmp);
+        if (dib) DeleteObject(dib);
+        if (dc)  DeleteDC(dc);
+        dc = nullptr; dib = nullptr; old_bmp = nullptr; bits = nullptr;
+        dib_w = dib_h = 0;
+    }
+    ~Popover() { ReleaseDib(); }
+};
+
+void PopoverHide(Popover* pop) {
+    if (!pop->shown) return;
+    ShowWindow(pop->hwnd, SW_HIDE);
+    pop->shown = false;
+    pop->key.clear();
+}
+
+// Anchored to the left of the card and centred on the row that opened it, then
+// pushed back on screen — a row near the bottom of a maximized terminal would
+// otherwise hang the popover off the taskbar.
+void PopoverShow(Popover* pop, const Panel& panel, const RECT& row, const PanelItem& item,
+                 const std::string& key) {
+    if (pop->key == key && pop->shown) return;
+
+    pop->scale = panel.scale;
+    BuildPopoverCard(&pop->card, item, panel.scale);
+    if (!pop->card.w) { PopoverHide(pop); return; }
+
+    if (!pop->hwnd) {
+        pop->hwnd = CreateWindowExW(
+            // Display-only, so click-through: the pointer must keep reaching the
+            // card that opened this, and there is nothing here to press.
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
+                WS_EX_NOACTIVATE,
+            L"ClaudeSpeakPopover", L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (!pop->hwnd) return;
+    }
+    if (pop->card.w != pop->dib_w || pop->card.h != pop->dib_h) {
+        pop->ReleaseDib();
+        HDC screen = GetDC(nullptr);
+        pop->dc = CreateCompatibleDC(screen);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = pop->card.w;
+        bi.bmiHeader.biHeight      = -pop->card.h;
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        pop->dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &pop->bits, nullptr, 0);
+        ReleaseDC(nullptr, screen);
+        if (!pop->dib) { pop->ReleaseDib(); return; }
+        pop->old_bmp = SelectObject(pop->dc, pop->dib);
+        pop->dib_w = pop->card.w;
+        pop->dib_h = pop->card.h;
+    }
+
+    g_pan_scale = panel.scale;
+    ComposePanel(static_cast<uint32_t*>(pop->bits), pop->card, nullptr, 1.f, 0.f, 0.f);
+
+    const int m = pop->card.margin;
+    POINT pos{panel.pos.x + panel.card.margin - PanScale(kPopGap) - pop->card.panel_w - m,
+              panel.pos.y + (row.top + row.bottom) / 2 - pop->card.panel_h / 2 - m};
+
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (HMONITOR mon = MonitorFromWindow(panel.target, MONITOR_DEFAULTTONEAREST)) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) work = mi.rcWork;
+    }
+    // No room to the left (a card against the left edge of a narrow monitor):
+    // put it on the other side rather than over the rows it describes.
+    if (pos.x + m < work.left) {
+        pos.x = panel.pos.x + panel.card.margin + panel.card.panel_w + PanScale(kPopGap) - m;
+    }
+    pos.x = std::min<LONG>(pos.x, work.right - pop->card.panel_w - m);
+    pos.x = std::max<LONG>(pos.x, work.left - m);
+    pos.y = std::min<LONG>(pos.y, work.bottom - pop->card.panel_h - m);
+    pos.y = std::max<LONG>(pos.y, work.top - m);
+
+    SIZE  size{pop->card.w, pop->card.h};
+    POINT src{0, 0};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(pop->hwnd, nullptr, &pos, &size, pop->dc, &src, 0, &blend,
+                        ULW_ALPHA);
+    if (!pop->shown) {
+        ShowWindow(pop->hwnd, SW_SHOWNOACTIVATE);
+        pop->shown = true;
+    }
+    SetWindowPos(pop->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    pop->key = key;
+}
+
 // ── the receiving end of the beacon ─────────────────────────────────────────
 // Keyed by target window, not by session or by title: the card *shown* on that
 // hwnd is the context for that window, whichever registration happens to own it,
@@ -4285,7 +4928,12 @@ bool PanelEnsureWindow(Panel* p) {
     return true;
 }
 
+// Set while a popover is up, so hiding a card can take it away without the
+// hide path having to know what a popover is.
+std::function<void()> g_pop_close;
+
 void PanelHide(Panel* p, const char* why) {
+    if (p->shown && g_pop_close) g_pop_close();
     if (!p->shown) return;
     ShowWindow(p->hwnd, SW_HIDE);
     p->shown = false;
@@ -4401,12 +5049,26 @@ void PanelThread(float seconds) {
     wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));   // IDC_ARROW
     wc.lpszClassName = L"ClaudeSpeakPanel";
     RegisterClassExW(&wc);   // harmless if it is already there
+    wc.lpfnWndProc   = DefWindowProcW;   // the popover has nothing to handle
+    wc.lpszClassName = L"ClaudeSpeakPopover";
+    RegisterClassExW(&wc);
+
+    // WIC needs COM on this thread to decode an avatar. Whatever mode it is
+    // already in is fine; only the initialisation has to have happened.
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     HWINEVENTHOOK hook = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, PanelWinEvent, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     std::vector<std::unique_ptr<Panel>> panels;
+    Popover     pop;
+    std::string dwell_key;     // what the pointer has been resting on
+    DWORD       dwell_since = 0;
+    g_pop_close = [&pop, &dwell_key] {
+        PopoverHide(&pop);
+        dwell_key.clear();
+    };
     // Only ever installed while the pointer is over a scrollable card, and only
     // when Windows will not route the wheel to us by itself.
     const bool wheel_arrives = PanelWheelReachesUs();
@@ -4565,6 +5227,32 @@ void PanelThread(float seconds) {
                 PanelCompose(p);
                 redrawn = true;
             }
+
+            // The popover's key is everything that would make it wrong: which
+            // row, in which session, at which scroll offset, on which tab. Any
+            // of them changing restarts the dwell and takes the popover away —
+            // which is also how "closes on scroll" and "closes on tab change"
+            // are implemented, without either being a special case.
+            std::string key;
+            const PanelItem* over = nullptr;
+            if (hover.kind == PanHit::Kind::Row && !p->collapsed &&
+                hover.index < static_cast<int>(p->card.rows.size())) {
+                const int idx = p->card.rows[hover.index].item;
+                if (idx >= 0 && idx < static_cast<int>(p->items.size()) &&
+                    (p->items[idx].kind == "pr" || p->items[idx].kind == "issue")) {
+                    over = &p->items[idx];
+                    key  = p->session + "|" + p->tab + "|" + std::to_string(p->scroll) +
+                           "|" + over->kind + "|" + over->repo + "|" +
+                           std::to_string(over->number);
+                }
+            }
+            if (key != dwell_key) {
+                dwell_key   = key;
+                dwell_since = GetTickCount();
+                if (pop.key != key) PopoverHide(&pop);
+            } else if (over && GetTickCount() - dwell_since >= kPopDwellMs) {
+                PopoverShow(&pop, *p, p->card.rows[hover.index].hit, *over, key);
+            }
             // The glow moves every frame, which is a recompose and never a
             // rebuild: no text is re-measured to make a card breathe. The
             // `glow_drawn` half matters as much — without one last frame after it
@@ -4623,6 +5311,11 @@ void PanelThread(float seconds) {
     }
 
     if (mouse) UnhookWindowsHookEx(mouse);
+    g_pop_close = nullptr;
+    if (pop.hwnd) {
+        DestroyWindow(pop.hwnd);
+        pop.hwnd = nullptr;
+    }
     g_pan_wheel_to.store(nullptr);
     for (size_t i = panels.size(); i-- > 0;) PanelDestroy(&panels[i]);
     panels.clear();
@@ -4850,6 +5543,72 @@ std::string PanelGuessUrl(const PanelItem& item) {
            std::to_string(item.number);
 }
 
+// "d73a4a" as GitHub writes it, with or without a leading #.
+Rgb ParseHexColour(const std::string& hex, const Rgb& fallback) {
+    const std::string h = hex.size() && hex[0] == '#' ? hex.substr(1) : hex;
+    if (h.size() != 6) return fallback;
+    unsigned v = 0;
+    for (char c : h) {
+        int d = -1;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return fallback;
+        v = (v << 4) | static_cast<unsigned>(d);
+    }
+    return Rgb{((v >> 16) & 0xFF) / 255.f, ((v >> 8) & 0xFF) / 255.f, (v & 0xFF) / 255.f};
+}
+
+PanPerson ParsePerson(const JsonVal& v) {
+    PanPerson who;
+    if (v.t != JsonVal::T::Obj) return who;
+    who.login  = v.GetStr("login");
+    who.avatar = v.GetStr("avatar");
+    who.state  = v.GetStr("state");
+    return who;
+}
+
+void ParsePeople(const JsonVal* arr, std::vector<PanPerson>* out) {
+    if (!arr || arr->t != JsonVal::T::Arr) return;
+    for (const JsonVal& v : arr->arr) {
+        PanPerson who = ParsePerson(v);
+        if (!who.login.empty()) out->push_back(std::move(who));
+    }
+}
+
+// Every field optional, on purpose: the enricher fills this in over several
+// passes, and a half-filled `details` should show what it has rather than
+// nothing.
+void ParseDetails(const JsonVal* v, PanDetails* out) {
+    if (!v || v->t != JsonVal::T::Obj) return;
+    out->have  = true;
+    out->title = PanTrim(v->GetStr("title"));
+    if (const JsonVal* a = v->Find("author")) out->author = ParsePerson(*a);
+    ParsePeople(v->Find("assignees"), &out->assignees);
+    ParsePeople(v->Find("reviews"), &out->reviews);
+    ParsePeople(v->Find("review_requests"), &out->review_requests);
+    if (const JsonVal* labels = v->Find("labels")) {
+        if (labels->t == JsonVal::T::Arr) {
+            for (const JsonVal& l : labels->arr) {
+                if (l.t != JsonVal::T::Obj) continue;
+                PanLabel lab;
+                lab.name = PanTrim(l.GetStr("name"));
+                if (lab.name.empty()) continue;
+                lab.colour = ParseHexColour(l.GetStr("color"), kOctGrey);
+                out->labels.push_back(std::move(lab));
+            }
+        }
+    }
+    if (const JsonVal* c = v->Find("checks")) {
+        if (c->t == JsonVal::T::Obj) {
+            out->have_checks = true;
+            out->total   = c->GetNum("total", 0);
+            out->failing = c->GetNum("failing", 0);
+            out->pending = c->GetNum("pending", 0);
+        }
+    }
+}
+
 bool ParsePanelItems(const JsonVal& arr, std::vector<PanelItem>* out, std::string* err) {
     if (arr.t != JsonVal::T::Arr) {
         *err = "items must be an array";
@@ -4867,6 +5626,7 @@ bool ParsePanelItems(const JsonVal& arr, std::vector<PanelItem>* out, std::strin
         item.title  = PanTrim(v.GetStr("title"));
         item.number = v.GetNum("number", 0);
         item.status = ParsePanStatus(v.GetStr("status"));
+        ParseDetails(v.Find("details"), &item.details);
         if (item.url.empty()) item.url = PanelGuessUrl(item);
         if (item.Label().empty() && item.title.empty()) continue;   // nothing to draw
         out->push_back(std::move(item));
@@ -5026,6 +5786,91 @@ std::vector<PanelItem> SamplePanelItems() {
     };
 }
 
+// Two PNGs an avatar loader can actually load, so the popover previews show a
+// real decoded, scaled, circular avatar rather than the fallback disc. Written
+// beside the previews themselves, which is where a reviewer already is.
+std::string WriteFakeAvatar(const std::string& path, const Rgb& a, const Rgb& b) {
+    constexpr int kSide = 64;
+    std::vector<uint32_t> px(static_cast<size_t>(kSide) * kSide);
+    for (int y = 0; y < kSide; ++y) {
+        for (int x = 0; x < kSide; ++x) {
+            const float t = (x + y) / (2.f * kSide);
+            Rgb c = Mix(a, b, Clamp01(t));
+            // A lighter blob, so a scaled avatar has something to scale.
+            const float dx = (x - kSide * 0.36f) / (kSide * 0.30f);
+            const float dy = (y - kSide * 0.34f) / (kSide * 0.30f);
+            c = Mix(c, Rgb{1.f, 1.f, 1.f},
+                    0.45f * (1.f - Clamp01(std::sqrt(dx * dx + dy * dy))));
+            px[static_cast<size_t>(y) * kSide + x] = Pack(c, 1.f);
+        }
+    }
+    WritePng(path, px, kSide, kSide);
+    return path;
+}
+
+// The sample row a popover is previewed against: everything the contract allows,
+// so every branch of the layout is on the page.
+PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string& av_b) {
+    PanelItem it;
+    it.kind   = pr ? "pr" : "issue";
+    it.repo   = pr ? "optidatacloud/laravel-opticloud" : "optidatacloud/optiwork-ai";
+    it.number = pr ? 1375 : 377;
+    it.status = pr ? PanStatus::ChangesRequested : PanStatus::Open;
+    it.title  = pr ? "feat: calendar event reminder as a bottom-right toast"
+                   : "MCP P14: tool surface parity with the chat tools";
+    it.url    = PanelGuessUrl(it);
+
+    PanDetails& d = it.details;
+    d.have  = true;
+    d.title = pr ? "feat: calendar event reminder as a bottom-right toast, with the "
+                   "one-shot highlight and the quiet-hours rule behind it"
+                 : "MCP P14: bring the MCP tool surface to parity with the chat tools, "
+                   "including the papers and calendar handlers";
+    d.author = PanPerson{"dovyski", av_a, ""};
+    d.labels = {
+        PanLabel{"enhancement", ParseHexColour("a2eeef", kOctGrey)},
+        PanLabel{"needs design", ParseHexColour("d876e3", kOctGrey)},
+        PanLabel{"bug", ParseHexColour("d73a4a", kOctGrey)},
+    };
+    d.assignees = {PanPerson{"dovyski", av_a, ""}, PanPerson{"liandro", av_b, ""}};
+    if (pr) {
+        d.reviews = {
+            PanPerson{"gustavo", av_b, "APPROVED"},
+            PanPerson{"renata", "", "CHANGES_REQUESTED"},
+            PanPerson{"joao", av_a, "COMMENTED"},
+        };
+        d.review_requests = {PanPerson{"ezequiel", "", ""}};
+        d.have_checks = true;
+        d.total   = 6;
+        d.failing = 1;
+        d.pending = 1;
+    }
+    return it;
+}
+
+void PanelPopoverPreview(const std::string& prefix, float scale) {
+    const std::string a = WriteFakeAvatar(prefix + "-avatar-a.png",
+                                          Rgb{0.16f, 0.38f, 0.72f}, Rgb{0.42f, 0.20f, 0.62f});
+    const std::string b = WriteFakeAvatar(prefix + "-avatar-b.png",
+                                          Rgb{0.10f, 0.47f, 0.33f}, Rgb{0.70f, 0.62f, 0.14f});
+    for (int i = 0; i < 2; ++i) {
+        const PanelItem item = SamplePopoverItem(i == 0, a, b);
+        PanelCard card;
+        BuildPopoverCard(&card, item, scale);
+        if (!card.w) continue;
+        std::vector<uint32_t> px(static_cast<size_t>(card.w) * card.h);
+        LARGE_INTEGER f{}, t0{}, t1{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        ComposePanel(px.data(), card, nullptr, 1.f, 0.f, 0.f);
+        QueryPerformanceCounter(&t1);
+        const std::string path = prefix + (i == 0 ? "-popover-pr.png" : "-popover-issue.png");
+        WritePng(path, px, card.w, card.h);
+        std::printf("%s (%dx%d)  compose %.2f ms\n", path.c_str(), card.w, card.h,
+                    1000.0 * (t1.QuadPart - t0.QuadPart) / f.QuadPart);
+    }
+}
+
 void PanelPreview(const std::string& prefix) {
     // Per-monitor aware first, so the preview is drawn at the scale the screen
     // actually uses rather than at a virtualized 96 dpi — the point is to review
@@ -5091,6 +5936,7 @@ void PanelPreview(const std::string& prefix) {
                     1000.0 * (b.QuadPart - a.QuadPart) / f.QuadPart,
                     1000.0 * (c.QuadPart - b.QuadPart) / f.QuadPart);
     }
+    PanelPopoverPreview(prefix, scale);
 }
 
 // A throwaway panel against a real window, with no daemon and no producer: the
