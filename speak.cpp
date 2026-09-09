@@ -34,7 +34,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -196,6 +198,9 @@ struct OrbGeometry {
 OrbGeometry g_geom;
 
 int CaptionStripWidth();
+// Defined with the socket helpers, called from the overlay loop below: one
+// datagram per frame telling a daemon's panel how loud this utterance is.
+void BeaconSend(float level, bool active);
 bool InsideCaptionClose(HWND hwnd, POINT screen_pt);
 
 // True for points inside the ring, which is the only part that reacts to a click.
@@ -1111,8 +1116,15 @@ void OrbThread() {
 
         ComposeFrame(pixels, level, voice, fade, anim, pause);
         PushOrb(hwnd, mem_dc);
+        // The panel in the target window glows off the same envelope the ring
+        // does, so the two move together rather than merely coinciding.
+        if ((frame & 1) == 0) BeaconSend(voice, !closing);
         Sleep(16);
     }
+
+    // Say so, rather than leaving the daemon to notice the datagrams stopped:
+    // the gap is the fallback for a client that died, not the normal ending.
+    for (int i = 0; i < 3; ++i) BeaconSend(0.f, false);
 
     SelectObject(mem_dc, old);
     DeleteObject(dib);
@@ -1402,6 +1414,74 @@ bool DaemonAlive(int port, int timeout_ms) {
 // Renders mono 24 kHz float audio pulled from `src` to the default device,
 // recording an amplitude envelope and the live playback position as it goes.
 // Returns false on a fatal audio error.
+// ── the speaking beacon ─────────────────────────────────────────────────────
+// When speech is aimed at a window (`--title`, `--hwnd`), the panel parked in
+// that window's corner should say so — glowing with the voice, and showing the
+// caption the utterance carries. The awkward part is *where the two live*: the
+// panel belongs to the resident daemon, while the audio, the amplitude envelope
+// and the caption all belong to the one-shot client process that is playing.
+//
+// So the client broadcasts. One fixed-size datagram per frame to loopback, each
+// carrying the whole state — target, level, caption — so the protocol has no
+// setup, no teardown and no session: a gap in the datagrams *is* the end of the
+// utterance, which also means a client killed mid-sentence cannot leave a panel
+// glowing forever. Upstream's TTSServer has its routes hardcoded in a file CMake
+// downloads at a pinned SHA, so a field on POST /tts was never an option; and a
+// 60 Hz stream of tiny HTTP requests through the pointing listener would have
+// blocked /panel behind it.
+
+constexpr uint32_t kBeaconMagic   = 0x424B5053;   // "SPKB"
+constexpr uint32_t kBeaconVersion = 1;
+
+#pragma pack(push, 1)
+struct SpeakBeacon {
+    uint32_t magic   = kBeaconMagic;
+    uint32_t version = kBeaconVersion;
+    uint64_t hwnd    = 0;      // the window the speech is aimed at
+    float    level   = 0.f;    // live amplitude, 0..1 — the orb's own value
+    uint32_t active  = 0;      // 0 while fading out, so the end is explicit too
+    char     caption_title[128]{};
+    char     caption[192]{};
+};
+#pragma pack(pop)
+
+// Set by the client once its target is resolved; 0 means "say nothing".
+std::atomic<uint64_t> g_beacon_hwnd{0};
+int                   g_beacon_port = 0;
+
+void BeaconCopy(char* dst, size_t n, const std::string& src) {
+    const size_t len = std::min(n - 1, src.size());
+    std::memcpy(dst, src.data(), len);
+    dst[len] = 0;
+}
+
+// One unconnected UDP socket for the life of the process. Nothing listening is
+// not an error: the panel is optional scenery.
+void BeaconSend(float level, bool active) {
+    const uint64_t target = g_beacon_hwnd.load();
+    if (!target || g_beacon_port <= 0) return;
+
+    static SOCKET fd = INVALID_SOCKET;
+    if (fd == INVALID_SOCKET) {
+        if (!WinsockInit()) return;
+        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd == INVALID_SOCKET) return;
+    }
+    SpeakBeacon msg;
+    msg.hwnd   = target;
+    msg.level  = level;
+    msg.active = active ? 1u : 0u;
+    BeaconCopy(msg.caption_title, sizeof(msg.caption_title), g_cap_title);
+    BeaconCopy(msg.caption, sizeof(msg.caption), g_cap_text);
+
+    sockaddr_in to{};
+    to.sin_family      = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port        = htons(static_cast<unsigned short>(g_beacon_port));
+    sendto(fd, reinterpret_cast<const char*>(&msg), sizeof(msg), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
 bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audio_ms) {
     IMMDeviceEnumerator* enumerator = nullptr;
     IMMDevice*           device     = nullptr;
@@ -1861,6 +1941,40 @@ std::unordered_map<DWORD, std::pair<DWORD, std::string>> ProcessTable() {
     return table;
 }
 
+// The image name for one pid, cached. Enumerating windows is cheap; taking a
+// TH32CS_SNAPPROCESS snapshot of the entire machine to find out who owns them is
+// not, and the panel's resolver does this twice a second for as long as the
+// daemon lives. A pid's image name cannot change, so the only reason to expire
+// the entry at all is pid reuse after a process dies — thirty seconds is plenty
+// of margin for a mapping whose worst failure is mislabelling a window.
+std::string ProcessNameFor(DWORD pid) {
+    struct Entry { std::string name; DWORD at; };
+    static std::mutex                          mtx;
+    static std::unordered_map<DWORD, Entry>    cache;
+    const DWORD now = GetTickCount();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto it = cache.find(pid);
+        if (it != cache.end() && now - it->second.at < 30000) return it->second.name;
+    }
+    std::string name;
+    if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t buf[MAX_PATH]{};
+        DWORD   n = MAX_PATH;
+        if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
+            std::string full = Utf8(buf);
+            const size_t slash = full.find_last_of("\\/");
+            name = LowerAscii(slash == std::string::npos ? full : full.substr(slash + 1));
+        }
+        CloseHandle(h);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        cache[pid] = Entry{name, now};
+    }
+    return name;
+}
+
 // Every top-level window a human could point at: visible, titled, real size, not
 // a DWM-cloaked ghost (background store apps leave those behind), and not one of
 // ours. Optionally narrowed to one process.
@@ -1901,11 +2015,7 @@ std::vector<WindowTarget> EnumTargets(DWORD only_pid = 0) {
         return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
 
-    const auto table = ProcessTable();
-    for (auto& t : ctx.out) {
-        const auto it = table.find(t.pid);
-        if (it != table.end()) t.process = it->second.second;
-    }
+    for (auto& t : ctx.out) t.process = ProcessNameFor(t.pid);
     return ctx.out;
 }
 
@@ -2048,6 +2158,23 @@ bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
 }
 
 // Runs a pointing request to completion. Must be called on a DPI-aware thread.
+// The *window* a pointing request names, for the caller that wants the handle
+// rather than the centre of it. Same rule pointing uses — a unique
+// contains-match, case-insensitive — and the same refusal to guess: an ambiguous
+// title gives nothing rather than an arbitrary sibling.
+HWND ResolveTargetHwnd(const PointRequest& req) {
+    if (req.hwnd) return IsWindow(req.hwnd) ? req.hwnd : nullptr;
+    if (req.title.empty()) return nullptr;
+    const std::string needle = LowerAscii(req.title);
+    HWND              found  = nullptr;
+    for (const WindowTarget& t : EnumTargets()) {
+        if (LowerAscii(t.title).find(needle) == std::string::npos) continue;
+        if (found) return nullptr;
+        found = t.hwnd;
+    }
+    return found;
+}
+
 bool Point(const PointRequest& req, std::string* err, std::string* candidates) {
     POINT centre{};
     if (!ResolvePoint(req, &centre, err, candidates)) return false;
@@ -2055,6 +2182,2629 @@ bool Point(const PointRequest& req, std::string* err, std::string* candidates) {
     PointerOverlay(centre, req.size > 0 ? req.size : g_point_size, pulses);
     return true;
 }
+
+// ── The attention panel ─────────────────────────────────────────────────────
+// A small card parked inside the bottom-right corner of *one* terminal window,
+// listing what the session running in it is working on: pull requests, issues,
+// working directories. Where the orb says "something spoke" and the pointer says
+// "over there", this says "and here is what it is about" — and it stays, because
+// the answer to "what was I doing in this window" is wanted long after the voice
+// has finished.
+//
+// It is the caption toast's material — the same rounded card, fonts, light fill
+// and dark ink — so the two read as one product. Three things make it a
+// different object all the same: it is bound to a window rather than to the
+// screen, it lives until told otherwise rather than for one utterance, and it is
+// *interactive*: rows highlight under the pointer and open in the browser or in
+// Explorer when clicked. So, unlike the pointer, it does not set
+// WS_EX_TRANSPARENT — and unlike the orb, several can be alive at once, one per
+// terminal.
+
+// ── a JSON value, for the one endpoint that takes nested data ───────────────
+// Upstream's json_get_string only reaches top-level strings, and /panel takes an
+// array of objects. A small recursive-descent parser rather than more regex.
+
+struct JsonVal {
+    enum class T { Null, Bool, Num, Str, Arr, Obj } t = T::Null;
+    bool                                         b   = false;
+    double                                       num = 0;
+    std::string                                  str;
+    std::vector<JsonVal>                         arr;
+    std::vector<std::pair<std::string, JsonVal>> obj;
+
+    const JsonVal* Find(const std::string& key) const {
+        if (t != T::Obj) return nullptr;
+        for (const auto& kv : obj) {
+            if (kv.first == key) return &kv.second;
+        }
+        return nullptr;
+    }
+    std::string GetStr(const std::string& key) const {
+        const JsonVal* v = Find(key);
+        return (v && v->t == T::Str) ? v->str : std::string();
+    }
+    // Numbers arrive as numbers from a sane producer and as strings from a shell
+    // one-liner, so take either.
+    long GetNum(const std::string& key, long fallback = 0) const {
+        const JsonVal* v = Find(key);
+        if (!v) return fallback;
+        if (v->t == T::Num) return static_cast<long>(v->num);
+        if (v->t == T::Str) return std::atol(v->str.c_str());
+        return fallback;
+    }
+};
+
+void Utf8Append(std::string* out, unsigned cp) {
+    if (cp < 0x80) {
+        *out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        *out += static_cast<char>(0xC0 | (cp >> 6));
+        *out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        *out += static_cast<char>(0xE0 | (cp >> 12));
+        *out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        *out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        *out += static_cast<char>(0xF0 | (cp >> 18));
+        *out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        *out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        *out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+struct JsonParser {
+    const std::string& s;
+    size_t             i = 0;
+
+    explicit JsonParser(const std::string& text) : s(text) {}
+
+    void Space() {
+        while (i < s.size() &&
+               (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+            ++i;
+        }
+    }
+    bool Lit(const char* word) {
+        const size_t n = std::strlen(word);
+        if (s.compare(i, n, word) != 0) return false;
+        i += n;
+        return true;
+    }
+    bool Hex4(unsigned* out) {
+        if (i + 4 > s.size()) return false;
+        unsigned cp = 0;
+        for (int k = 0; k < 4; ++k) {
+            const char h = s[i + k];
+            cp <<= 4;
+            if (h >= '0' && h <= '9')      cp |= static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+            else return false;
+        }
+        i += 4;
+        *out = cp;
+        return true;
+    }
+    bool String(std::string* out) {
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        for (;;) {
+            if (i >= s.size()) return false;
+            const char c = s[i++];
+            if (c == '"') return true;
+            if (c != '\\') { *out += c; continue; }
+            if (i >= s.size()) return false;
+            const char e = s[i++];
+            switch (e) {
+                case '"':  *out += '"';  break;
+                case '\\': *out += '\\'; break;
+                case '/':  *out += '/';  break;
+                case 'b':  *out += '\b'; break;
+                case 'f':  *out += '\f'; break;
+                case 'n':  *out += '\n'; break;
+                case 'r':  *out += '\r'; break;
+                case 't':  *out += '\t'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    if (!Hex4(&cp)) return false;
+                    // Surrogate pair: the producer writes JSON from a UTF-16 world.
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.size() &&
+                        s[i] == '\\' && s[i + 1] == 'u') {
+                        const size_t save = i;
+                        i += 2;
+                        unsigned lo = 0;
+                        if (Hex4(&lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        } else {
+                            i = save;
+                        }
+                    }
+                    Utf8Append(out, cp);
+                    break;
+                }
+                default: return false;
+            }
+        }
+    }
+    bool Value(JsonVal* out, int depth = 0) {
+        if (depth > 32) return false;   // a malformed body must not eat the stack
+        Space();
+        if (i >= s.size()) return false;
+        const char c = s[i];
+        if (c == '"') {
+            out->t = JsonVal::T::Str;
+            return String(&out->str);
+        }
+        if (c == '{') {
+            ++i;
+            out->t = JsonVal::T::Obj;
+            Space();
+            if (i < s.size() && s[i] == '}') { ++i; return true; }
+            for (;;) {
+                Space();
+                std::string key;
+                if (!String(&key)) return false;
+                Space();
+                if (i >= s.size() || s[i] != ':') return false;
+                ++i;
+                JsonVal v;
+                if (!Value(&v, depth + 1)) return false;
+                out->obj.emplace_back(std::move(key), std::move(v));
+                Space();
+                if (i < s.size() && s[i] == ',') { ++i; continue; }
+                if (i < s.size() && s[i] == '}') { ++i; return true; }
+                return false;
+            }
+        }
+        if (c == '[') {
+            ++i;
+            out->t = JsonVal::T::Arr;
+            Space();
+            if (i < s.size() && s[i] == ']') { ++i; return true; }
+            for (;;) {
+                JsonVal v;
+                if (!Value(&v, depth + 1)) return false;
+                out->arr.push_back(std::move(v));
+                Space();
+                if (i < s.size() && s[i] == ',') { ++i; continue; }
+                if (i < s.size() && s[i] == ']') { ++i; return true; }
+                return false;
+            }
+        }
+        if (c == 't' || c == 'f') {
+            out->t = JsonVal::T::Bool;
+            if (Lit("true"))  { out->b = true;  return true; }
+            if (Lit("false")) { out->b = false; return true; }
+            return false;
+        }
+        if (c == 'n') {
+            out->t = JsonVal::T::Null;
+            return Lit("null");
+        }
+        char* end = nullptr;
+        const double v = std::strtod(s.c_str() + i, &end);
+        if (!end || end == s.c_str() + i) return false;
+        i = static_cast<size_t>(end - s.c_str());
+        out->t   = JsonVal::T::Num;
+        out->num = v;
+        return true;
+    }
+};
+
+bool JsonParse(const std::string& text, JsonVal* out) {
+    JsonParser p(text);
+    if (!p.Value(out)) return false;
+    p.Space();
+    return true;
+}
+
+// ── PNG out, for --panel-preview ────────────────────────────────────────────
+// The BMPs the orb and pointer previews write are fine for a strip of frames
+// committed to a repo, but a panel preview is a single image a human or an agent
+// opens to look at, so: PNG. No zlib here and no wish to link one — a zlib
+// stream made entirely of *stored* deflate blocks is legal, so the whole encoder
+// is a CRC, an Adler and some framing. The files are a few hundred KB, which for
+// a preview nobody ships is a fair trade for zero dependencies.
+
+uint32_t Crc32(const uint8_t* data, size_t n, uint32_t crc = 0) {
+    static uint32_t table[256];
+    static bool     ready = false;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        ready = true;
+    }
+    crc = ~crc;
+    for (size_t i = 0; i < n; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+void PngBe32(std::string* out, uint32_t v) {
+    out->push_back(static_cast<char>((v >> 24) & 0xFF));
+    out->push_back(static_cast<char>((v >> 16) & 0xFF));
+    out->push_back(static_cast<char>((v >> 8) & 0xFF));
+    out->push_back(static_cast<char>(v & 0xFF));
+}
+
+void PngChunk(std::string* out, const char* tag, const std::string& body) {
+    PngBe32(out, static_cast<uint32_t>(body.size()));
+    std::string payload(tag, 4);
+    payload += body;
+    *out += payload;
+    PngBe32(out, Crc32(reinterpret_cast<const uint8_t*>(payload.data()), payload.size()));
+}
+
+// Premultiplied BGRA in, 24-bit PNG out, flattened over the same #22272E the BMP
+// dumps use — the panel lives on a dark terminal, so that is roughly what it
+// looks like in place.
+void WritePng(const std::string& path, const std::vector<uint32_t>& px, int w, int h) {
+    std::string raw;
+    raw.reserve(static_cast<size_t>(h) * (1 + static_cast<size_t>(w) * 3));
+    for (int y = 0; y < h; ++y) {
+        raw.push_back(0);   // filter: none
+        for (int x = 0; x < w; ++x) {
+            const uint32_t p = px[static_cast<size_t>(y) * w + x];
+            const float    a = ((p >> 24) & 0xFF) / 255.f;
+            const auto     ch = [&](int shift, int bg) {
+                return static_cast<uint8_t>(std::min(255.f,
+                           ((p >> shift) & 0xFF) + (1.f - a) * bg));
+            };
+            raw.push_back(static_cast<char>(ch(16, 0x22)));   // R
+            raw.push_back(static_cast<char>(ch(8, 0x27)));    // G
+            raw.push_back(static_cast<char>(ch(0, 0x2E)));    // B
+        }
+    }
+
+    std::string z;
+    z.push_back(0x78);   // zlib: deflate, 32K window
+    z.push_back(0x01);   // no preset dictionary
+    uint32_t a = 1, b = 0;
+    for (unsigned char c : raw) {
+        a = (a + c) % 65521;
+        b = (b + a) % 65521;
+    }
+    for (size_t off = 0;;) {
+        const uint16_t n    = static_cast<uint16_t>(std::min<size_t>(65535, raw.size() - off));
+        const bool     last = static_cast<size_t>(off) + n >= raw.size();
+        z.push_back(static_cast<char>(last ? 1 : 0));   // stored block, final or not
+        z.push_back(static_cast<char>(n & 0xFF));
+        z.push_back(static_cast<char>((n >> 8) & 0xFF));
+        z.push_back(static_cast<char>(~n & 0xFF));
+        z.push_back(static_cast<char>((~n >> 8) & 0xFF));
+        z.append(raw, off, n);
+        off += n;
+        if (last) break;
+    }
+    PngBe32(&z, (b << 16) | a);
+
+    std::string ihdr;
+    PngBe32(&ihdr, static_cast<uint32_t>(w));
+    PngBe32(&ihdr, static_cast<uint32_t>(h));
+    ihdr.push_back(8);   // bit depth
+    ihdr.push_back(2);   // colour type: truecolour
+    ihdr.push_back(0);   // deflate
+    ihdr.push_back(0);   // adaptive filtering
+    ihdr.push_back(0);   // no interlace
+
+    std::string out("\x89PNG\r\n\x1a\n", 8);
+    PngChunk(&out, "IHDR", ihdr);
+    PngChunk(&out, "IDAT", z);
+    PngChunk(&out, "IEND", std::string());
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "speak: cannot write %s\n", path.c_str()); return; }
+    std::fwrite(out.data(), 1, out.size(), f);
+    std::fclose(f);
+}
+
+// ── what a panel is made of ─────────────────────────────────────────────────
+
+// The state a row reports, in the order that decides which one a collapsed pill
+// shows: the pill carries the *worst* of them, so a red mark on a one-line pill
+// is enough to know that window wants attention.
+enum class PanStatus {
+    Unknown = 0, Closed, Merged, Draft, Open, Approved, ChangesRequested, ChecksFailing
+};
+
+const char* PanStatusName(PanStatus s) {
+    static const char* kNames[] = {"unknown", "closed",   "merged",
+                                   "draft",   "open",     "approved",
+                                   "changes_requested",   "checks_failing"};
+    return kNames[static_cast<int>(s)];
+}
+
+PanStatus ParsePanStatus(const std::string& name) {
+    for (int i = 0; i <= static_cast<int>(PanStatus::ChecksFailing); ++i) {
+        if (name == PanStatusName(static_cast<PanStatus>(i))) {
+            return static_cast<PanStatus>(i);
+        }
+    }
+    return PanStatus::Unknown;
+}
+
+struct PanelItem {
+    std::string kind;      // "pr", "issue", "path"; anything else is drawn like a path
+    std::string repo;      // "owner/name" — only the name is shown
+    std::string url;       // the thing a click opens
+    std::string title;
+    long        number = 0;
+    PanStatus   status  = PanStatus::Unknown;
+
+    // "repo#1375", or the last segment of a path: the short handle a human uses
+    // for the thing, which is what a row leads with.
+    std::string Label() const {
+        if (number > 0) {
+            std::string name = repo;
+            const size_t slash = name.rfind('/');
+            if (slash != std::string::npos) name = name.substr(slash + 1);
+            return (name.empty() ? "" : name) + "#" + std::to_string(number);
+        }
+        std::string tail = url;
+        while (!tail.empty() && (tail.back() == '\\' || tail.back() == '/')) tail.pop_back();
+        const size_t sep = tail.find_last_of("\\/");
+        if (sep != std::string::npos) tail = tail.substr(sep + 1);
+        return tail.empty() ? title : tail;
+    }
+};
+
+// ── Octicons ────────────────────────────────────────────────────────────────
+// A coloured dot said "this needs attention" but not *what the thing is*, and a
+// row that leads with `repo#1375` is otherwise indistinguishable from a
+// directory. So each row is marked with GitHub's own icon for its type — the
+// same glyph the row's page shows — tinted with GitHub's own status colour. Two
+// pieces of information in the space one dot took.
+//
+// The icons are the 16×16 Octicons (github.com/primer/octicons, MIT), verbatim
+// path data, rasterized here. No font and no image: the path is parsed, its
+// curves and arcs are flattened to polygons, and a nonzero-winding scanline fill
+// with four subsample rows per pixel and analytic horizontal coverage turns it
+// into an alpha mask. That is what keeps the hole in `issue-opened` a hole at
+// every DPI, where a bitmap would smear at 1.5× and a font would need shipping.
+
+struct PanPt { float x, y; };
+using PanPolys = std::vector<std::vector<PanPt>>;
+
+// SVG path number/flag reader. Path data omits separators before a sign or a
+// decimal point ("0-3", ".5.5"), which strtof happens to handle exactly right.
+struct SvgReader {
+    const char* p;
+
+    void Space() {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    }
+    bool Num(float* out) {
+        Space();
+        char*       end = nullptr;
+        const float v   = std::strtof(p, &end);
+        if (!end || end == p) return false;
+        p    = end;
+        *out = v;
+        return true;
+    }
+    // Arc flags may be written without a separator ("1 1", "11"), and only ever
+    // appear where a single 0 or 1 is the whole value.
+    bool Flag(bool* out) {
+        Space();
+        if (*p == '0' || *p == '1') {
+            *out = (*p == '1');
+            ++p;
+            return true;
+        }
+        float v = 0;
+        if (!Num(&v)) return false;
+        *out = v != 0.f;
+        return true;
+    }
+};
+
+void PanCubic(std::vector<PanPt>* sub, PanPt p0, PanPt p1, PanPt p2, PanPt p3, int steps) {
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / steps, u = 1.f - t;
+        const float a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+        sub->push_back(PanPt{a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+                             a * p0.y + b * p1.y + c * p2.y + d * p3.y});
+    }
+}
+
+// Endpoint parameterization to centre parameterization, straight out of the SVG
+// spec's appendix, then sampled. Octicons draw every dot and every ring as an
+// arc — including the degenerate `a.75.75 0 1 0 0 .005` trick for a full circle,
+// which this handles because the large-arc flag makes the sweep ~360°.
+void PanArc(std::vector<PanPt>* sub, PanPt from, float rx, float ry, float phi_deg,
+            bool large, bool sweep, PanPt to) {
+    if (rx == 0.f || ry == 0.f) {
+        sub->push_back(to);
+        return;
+    }
+    rx = std::fabs(rx);
+    ry = std::fabs(ry);
+    const float phi = phi_deg * 3.14159265f / 180.f;
+    const float cp = std::cos(phi), sp = std::sin(phi);
+    const float dx = (from.x - to.x) * 0.5f, dy = (from.y - to.y) * 0.5f;
+    const float x1 = cp * dx + sp * dy, y1 = -sp * dx + cp * dy;
+
+    const float lambda = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
+    if (lambda > 1.f) {
+        const float s = std::sqrt(lambda);
+        rx *= s;
+        ry *= s;
+    }
+    const float num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+    const float den = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+    const float co  = (den > 0.f ? std::sqrt(std::max(0.f, num / den)) : 0.f) *
+                     ((large != sweep) ? 1.f : -1.f);
+    const float cxp = co * rx * y1 / ry, cyp = -co * ry * x1 / rx;
+    const float cx = cp * cxp - sp * cyp + (from.x + to.x) * 0.5f;
+    const float cy = sp * cxp + cp * cyp + (from.y + to.y) * 0.5f;
+
+    const float t1 = std::atan2((y1 - cyp) / ry, (x1 - cxp) / rx);
+    const float t2 = std::atan2((-y1 - cyp) / ry, (-x1 - cxp) / rx);
+    float       dt = t2 - t1;
+    if (!sweep && dt > 0.f)  dt -= 2.f * 3.14159265f;
+    if (sweep && dt < 0.f)   dt += 2.f * 3.14159265f;
+
+    const int steps = std::max(4, static_cast<int>(std::ceil(std::fabs(dt) / 0.18f)));
+    for (int i = 1; i <= steps; ++i) {
+        const float t = t1 + dt * i / steps;
+        sub->push_back(PanPt{cx + rx * std::cos(t) * cp - ry * std::sin(t) * sp,
+                             cy + rx * std::cos(t) * sp + ry * std::sin(t) * cp});
+    }
+}
+
+// The subset of the path grammar Octicons actually use: M L H V C A Z, absolute
+// and relative. Anything else is a data error rather than a silent gap.
+bool PanSvgPath(const char* d, float scale, PanPolys* out) {
+    SvgReader r{d};
+    PanPt     cur{0, 0}, start{0, 0};
+    char      cmd = 0;
+    r.Space();
+    while (*r.p) {
+        if (std::isalpha(static_cast<unsigned char>(*r.p))) {
+            cmd = *r.p++;
+        } else if (!cmd) {
+            return false;
+        }
+        const bool rel = std::islower(static_cast<unsigned char>(cmd)) != 0;
+        const char op  = static_cast<char>(std::toupper(static_cast<unsigned char>(cmd)));
+        const auto abs2 = [&](float x, float y) {
+            return rel ? PanPt{cur.x + x, cur.y + y} : PanPt{x, y};
+        };
+        if (op == 'Z') {
+            cur = start;
+            r.Space();
+            continue;
+        }
+        if (out->empty() && op != 'M') return false;
+
+        float a = 0, b = 0, c = 0, e = 0, f = 0, g = 0;
+        switch (op) {
+            case 'M': {
+                if (!r.Num(&a) || !r.Num(&b)) return false;
+                cur = abs2(a, b);
+                start = cur;
+                out->push_back({cur});
+                // A repeated M coordinate pair means an implicit L.
+                cmd = rel ? 'l' : 'L';
+                break;
+            }
+            case 'L':
+                if (!r.Num(&a) || !r.Num(&b)) return false;
+                cur = abs2(a, b);
+                out->back().push_back(cur);
+                break;
+            case 'H':
+                if (!r.Num(&a)) return false;
+                cur = PanPt{rel ? cur.x + a : a, cur.y};
+                out->back().push_back(cur);
+                break;
+            case 'V':
+                if (!r.Num(&a)) return false;
+                cur = PanPt{cur.x, rel ? cur.y + a : a};
+                out->back().push_back(cur);
+                break;
+            case 'C': {
+                if (!r.Num(&a) || !r.Num(&b) || !r.Num(&c) || !r.Num(&e) ||
+                    !r.Num(&f) || !r.Num(&g)) {
+                    return false;
+                }
+                const PanPt c1 = abs2(a, b), c2 = abs2(c, e), p3 = abs2(f, g);
+                PanCubic(&out->back(), cur, c1, c2, p3, 12);
+                cur = p3;
+                break;
+            }
+            case 'A': {
+                bool large = false, sweep = false;
+                if (!r.Num(&a) || !r.Num(&b) || !r.Num(&c) || !r.Flag(&large) ||
+                    !r.Flag(&sweep) || !r.Num(&f) || !r.Num(&g)) {
+                    return false;
+                }
+                const PanPt to = abs2(f, g);
+                PanArc(&out->back(), cur, a, b, c, large, sweep, to);
+                cur = to;
+                break;
+            }
+            default:
+                return false;
+        }
+        r.Space();
+    }
+    for (std::vector<PanPt>& sub : *out) {
+        for (PanPt& pt : sub) {
+            pt.x *= scale;
+            pt.y *= scale;
+        }
+    }
+    return true;
+}
+
+void PanAddSpan(std::vector<float>* acc, int w, float x0, float x1, float weight) {
+    x0 = std::max(x0, 0.f);
+    x1 = std::min(x1, static_cast<float>(w));
+    if (x1 <= x0) return;
+    const int first = static_cast<int>(std::floor(x0));
+    const int last  = std::min(w, static_cast<int>(std::ceil(x1)));
+    for (int x = std::max(0, first); x < last; ++x) {
+        const float l = std::max(x0, static_cast<float>(x));
+        const float rr = std::min(x1, static_cast<float>(x) + 1.f);
+        if (rr > l) (*acc)[x] += (rr - l) * weight;
+    }
+}
+
+// Nonzero winding, which is what keeps a counter-wound inner ring a hole.
+// Vertical coverage is sampled (four rows per pixel), horizontal coverage is
+// exact — the cheap half of analytic antialiasing where it matters most, since
+// these glyphs are mostly vertical strokes and circles.
+void PanFillPolys(const PanPolys& polys, std::vector<uint8_t>* mask, int w, int h) {
+    constexpr int kSub = 4;
+    struct Cross { float x; int dir; };
+    std::vector<float> acc(w, 0.f);
+    std::vector<Cross> xs;
+    for (int py = 0; py < h; ++py) {
+        std::fill(acc.begin(), acc.end(), 0.f);
+        for (int s = 0; s < kSub; ++s) {
+            const float y = py + (s + 0.5f) / kSub;
+            xs.clear();
+            for (const std::vector<PanPt>& sub : polys) {
+                const size_t n = sub.size();
+                if (n < 2) continue;
+                for (size_t i = 0; i < n; ++i) {
+                    const PanPt& a = sub[i];
+                    const PanPt& b = sub[(i + 1) % n];
+                    if (a.y == b.y) continue;
+                    if (y < std::min(a.y, b.y) || y >= std::max(a.y, b.y)) continue;
+                    const float t = (y - a.y) / (b.y - a.y);
+                    xs.push_back(Cross{a.x + t * (b.x - a.x), b.y > a.y ? 1 : -1});
+                }
+            }
+            if (xs.empty()) continue;
+            std::sort(xs.begin(), xs.end(),
+                      [](const Cross& l, const Cross& r) { return l.x < r.x; });
+            int   wind = 0;
+            float span = 0.f;
+            for (const Cross& c : xs) {
+                const int prev = wind;
+                wind += c.dir;
+                if (prev == 0 && wind != 0) span = c.x;
+                else if (prev != 0 && wind == 0) PanAddSpan(&acc, w, span, c.x, 1.f / kSub);
+            }
+        }
+        for (int x = 0; x < w; ++x) {
+            (*mask)[static_cast<size_t>(py) * w + x] =
+                static_cast<uint8_t>(std::lround(Clamp01(acc[x]) * 255.f));
+        }
+    }
+}
+
+// Rasterizes one icon into the card's colour layer. Small and few, so it is not
+// worth a cache: a rebuild happens only when the content changes.
+void StampOcticon(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int size,
+                  const char* path, const Rgb& colour, int top = 0,
+                  int bottom = 1 << 24) {
+    if (size <= 0) return;
+    PanPolys polys;
+    if (!PanSvgPath(path, size / 16.f, &polys)) {
+        std::fprintf(stderr, "speak: bad octicon path data\n");
+        return;
+    }
+    std::vector<uint8_t> mask(static_cast<size_t>(size) * size, 0);
+    PanFillPolys(polys, &mask, size, size);
+    for (int y = 0; y < size; ++y) {
+        const int cy = y0 + y;
+        if (cy < top || cy >= bottom || cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < size; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const uint8_t a = mask[static_cast<size_t>(y) * size + x];
+            if (!a) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(Pack(colour, a / 255.f), dst);
+        }
+    }
+}
+
+// ── which icon, and what colour ─────────────────────────────────────────────
+// GitHub's own pairing, so a row means on this card what it means on the page it
+// came from. `approved` is left plain green rather than given a tick overlay:
+// at 14 px a second mark inside the glyph turns into grit, and the row's job is
+// "which thing, roughly how is it doing" — the exact review state is one click
+// away.
+
+constexpr Rgb kOctGreen  {0x34 / 255.f, 0x7d / 255.f, 0x39 / 255.f};   // #347d39
+constexpr Rgb kOctPurple {0x82 / 255.f, 0x56 / 255.f, 0xd0 / 255.f};   // #8256d0
+constexpr Rgb kOctRed    {0xc9 / 255.f, 0x3c / 255.f, 0x37 / 255.f};   // #c93c37
+constexpr Rgb kOctAmber  {0xc6 / 255.f, 0x90 / 255.f, 0x26 / 255.f};   // #c69026
+constexpr Rgb kOctGrey   {0x76 / 255.f, 0x83 / 255.f, 0x90 / 255.f};   // #768390
+
+// Octicons 16px, verbatim (MIT).
+constexpr const char* kOctIssueOpened =
+    "M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"
+    "M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z";
+constexpr const char* kOctIssueClosed =
+    "M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5Z"
+    "M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0Zm-1.5 0a6.5 6.5 0 1 0-13 0 6.5 6.5 0 0 0 13 0Z";
+constexpr const char* kOctPullRequest =
+    "M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Z"
+    "m5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z"
+    "M3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z";
+constexpr const char* kOctPullRequestDraft =
+    "M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Z"
+    "m9.5 14a2.25 2.25 0 1 1 0-4.5 2.25 2.25 0 0 1 0 4.5ZM2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM14 7.5a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Zm0-4.25a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Z";
+constexpr const char* kOctPullRequestClosed =
+    "M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Z"
+    "m9.5 5.5a.75.75 0 0 1 .75.75v3.378a2.251 2.251 0 1 1-1.5 0V7.25a.75.75 0 0 1 .75-.75Z"
+    "m-2.03-5.273a.75.75 0 0 1 1.06 0l.97.97.97-.97a.748.748 0 0 1 1.265.332.75.75 0 0 1-.205.729l-.97.97.97.97a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-.97-.97-.97.97a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734l.97-.97-.97-.97a.75.75 0 0 1 0-1.06Z"
+    "M2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z";
+constexpr const char* kOctMerge =
+    "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z";
+constexpr const char* kOctFileDirectory =
+    "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
+    "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
+
+struct PanGlyph {
+    const char* path;
+    Rgb         colour;
+};
+
+PanGlyph PanelGlyphFor(const PanelItem& item) {
+    const bool pr = item.kind == "pr";
+    // A path, or anything numberless, is a folder. Any *other* kind with a
+    // number — `question` from the agent-questions flow, whatever comes next — is
+    // drawn like an issue rather than refused: a producer running ahead of this
+    // binary should degrade to a plausible row, not to a folder or to nothing.
+    if (!pr && (item.kind == "path" || item.number <= 0)) {
+        return {kOctFileDirectory, kOctGrey};
+    }
+    const bool issue = !pr;
+
+    switch (item.status) {
+        case PanStatus::Merged: return {kOctMerge, kOctPurple};
+        case PanStatus::Draft:  return {kOctPullRequestDraft, kOctGrey};
+        case PanStatus::Closed:
+            // GitHub's split: a closed issue is "completed" (purple), a closed
+            // pull request is abandoned (red).
+            return issue ? PanGlyph{kOctIssueClosed, kOctPurple}
+                         : PanGlyph{kOctPullRequestClosed, kOctRed};
+        default:
+            break;
+    }
+    const char* path = issue ? kOctIssueOpened : kOctPullRequest;
+    switch (item.status) {
+        case PanStatus::Open:
+        case PanStatus::Approved:         return {path, kOctGreen};
+        case PanStatus::ChangesRequested: return {path, kOctAmber};
+        case PanStatus::ChecksFailing:    return {path, kOctRed};
+        default:                          return {path, kOctGrey};
+    }
+}
+
+// ── geometry ────────────────────────────────────────────────────────────────
+// Everything is expressed at 96 dpi and multiplied by the target window's scale,
+// so the card is the same physical size on a 4K laptop panel and on a 1080p
+// monitor. The panel thread is per-monitor aware (like pointing), which is what
+// makes GetClientRect and the overlay agree in the first place.
+
+constexpr int kPanWidth     = 360;  // the card, at 96 dpi
+constexpr int kPanMargin    = 12;   // inset from the target's client corner
+constexpr int kPanShadow    = 20;   // room around the card for its drop shadow
+constexpr int kPanPad       = 12;
+constexpr int kPanRadius    = 10;
+constexpr int kPanRowGap    = 6;    // padding added to each row's tallest mark
+constexpr int kPanIcon      = 14;   // octicon box, at 96 dpi
+constexpr int kPanIconGap   = 9;    // icon to label
+constexpr int kPanLabelGap  = 8;    // label to title
+constexpr int kPanTextPx    = 13;
+constexpr int kPanToggle    = 11;   // the − / + mark, corner to corner
+constexpr int kPanToggleGap = 12;
+constexpr int kPanHeadGap   = 7;    // padding added to the header row
+constexpr int kPanRuleGap   = 5;    // header rule to the first row
+constexpr int kPanStroke    = 2;
+constexpr int kPanMaxRows   = 6;    // past this, the rest collapse into "+N more"
+constexpr int kPanTabPx     = 12;   // the tab strip's type
+constexpr int kPanTabPadX   = 8;    // inside a tab, either side of its label
+constexpr int kPanTabGap    = 4;    // between tabs
+constexpr int kPanTabPadY   = 6;
+constexpr int kPanTabRule   = 2;    // the active tab's accent, GitHub's weight
+constexpr int kPanScrollBar = 3;    // the scroll indicator, at 96 dpi
+constexpr int kPanScrollPx  = 56;   // how far one wheel notch moves the list
+constexpr float kPanMaxFrac = 0.70f;  // ceiling on a full list: this much of the
+                                      // target's client height
+constexpr int kPanTick      = 40;   // ms between follow/hover passes
+constexpr int kPanResolveMs = 500;  // ms between title→window resolver passes
+// A registration is dropped this long after its last POST. Long enough that a
+// session left alone overnight still has its panel in the morning, short enough
+// that a machine left running for a week is not carrying last week's windows.
+constexpr double kPanTtlSeconds = 48.0 * 3600.0;
+
+constexpr float kPanFillAlpha = 0.97f;
+constexpr float kPanShadowA   = 0.40f;   // a dark card needs a darker shadow to read
+
+// GitHub's own dark surface, so the card sits in the same world as the icons and
+// the pages the rows lead to. The caption toast's *material* is still shared —
+// one rounded-rect distance field, its hairline, its shadow, the same fonts — but
+// not its palette: the toast is a light notification that appears for a sentence,
+// this is a dark panel that lives on a dark terminal for hours.
+constexpr Rgb kPanBg    {0x21 / 255.f, 0x28 / 255.f, 0x30 / 255.f};   // #212830
+constexpr Rgb kPanLine  {0x3d / 255.f, 0x44 / 255.f, 0x4d / 255.f};   // #3d444d
+constexpr Rgb kPanTextA {0xd1 / 255.f, 0xd7 / 255.f, 0xe0 / 255.f};   // #d1d7e0
+constexpr Rgb kPanTextB {0x91 / 255.f, 0x98 / 255.f, 0xa1 / 255.f};   // #9198a1
+constexpr Rgb kPanHover {0x2a / 255.f, 0x31 / 255.f, 0x3c / 255.f};   // #2a313c
+constexpr Rgb kPanAccent{0xf7 / 255.f, 0x81 / 255.f, 0x66 / 255.f};   // #f78166
+
+// The scale the card currently being built is drawn at. Panels are only ever
+// built on the panel thread (or on the main thread by --panel-preview), so a
+// plain global is enough and keeps the geometry helpers free of a context
+// parameter — exactly how CapScale reads g_orb_size.
+float g_pan_scale = 1.f;
+
+int PanScale(int v) { return std::max(1, static_cast<int>(std::lround(v * g_pan_scale))); }
+
+// Fixed, rather than following whatever --caption-variant a passing utterance
+// happened to set: the panel is on screen for hours, and a colour on the card
+// would claim the meaning that belongs to the icons.
+Rgb PanFill()   { return kPanBg; }
+Rgb PanInk()    { return kPanTextA; }
+Rgb PanDimInk() { return kPanTextB; }
+Rgb PanBorder() { return kPanLine; }
+
+// ── the tab strip ───────────────────────────────────────────────────────────
+// A table rather than a switch, because the interesting tab is the one that does
+// not exist yet: `Pending (N)` for questions an agent is waiting on Fernando to
+// answer is one row added here and nothing else. A tab with nothing in it is not
+// shown, and if that leaves only `All` there is no strip at all — the panel is
+// six rows in the corner of a terminal, and furniture has to earn its line.
+
+bool PanTabAll(const PanelItem&)  { return true; }
+bool PanTabIssue(const PanelItem& i) { return i.kind == "issue"; }
+bool PanTabPr(const PanelItem& i)    { return i.kind == "pr"; }
+
+struct PanTab {
+    const char* id;
+    const char* label;
+    bool (*match)(const PanelItem&);
+    bool counted;   // "Issues (3)"; `All` is a mode, not a quantity
+};
+
+constexpr PanTab kPanTabs[] = {
+    {"all",    "All",    PanTabAll,   false},
+    {"issues", "Issues", PanTabIssue, true},
+    {"prs",    "PRs",    PanTabPr,    true},
+};
+constexpr int kPanTabCount = static_cast<int>(sizeof(kPanTabs) / sizeof(kPanTabs[0]));
+
+int PanTabIndex(const std::string& id) {
+    for (int i = 0; i < kPanTabCount; ++i) {
+        if (id == kPanTabs[i].id) return i;
+    }
+    return 0;
+}
+
+size_t PanTabTally(const PanTab& tab, const std::vector<PanelItem>& items) {
+    size_t n = 0;
+    for (const PanelItem& it : items) {
+        if (tab.match(it)) ++n;
+    }
+    return n;
+}
+
+std::string PanCountText(size_t n) {
+    return std::to_string(n) + (n == 1 ? " item" : " items");
+}
+
+// The pill shows the worst item on the list — its icon and its colour — which
+// is what makes a collapsed panel still worth glancing at. PanStatus is declared
+// in that order.
+const PanelItem* PanWorstItem(const std::vector<PanelItem>& items) {
+    const PanelItem* worst = nullptr;
+    for (const PanelItem& it : items) {
+        if (!worst || static_cast<int>(it.status) > static_cast<int>(worst->status)) {
+            worst = &it;
+        }
+    }
+    return worst;
+}
+
+// Rasterized once per content change; the hover highlight and the colours are
+// applied per compose, so moving the pointer down the list does not re-measure
+// any text. Same split as the caption card.
+struct PanelCard {
+    int                   w = 0, h = 0;      // including the shadow margin
+    int                   panel_w = 0, panel_h = 0;
+    int                   margin = 0;
+    float                 radius = 0.f;
+    std::vector<float>    dist;              // signed distance to the card edge
+    // Composed once by BakePanelLayers: everything below the interactive bits,
+    // and everything above them. A frame is a copy of the first, two small
+    // overlays, and the second.
+    std::vector<uint32_t> base, marks;
+    // The speaking halo's shape, baked at the same time. Only its *brightness*
+    // follows the voice, so the falloff is geometry like everything else here.
+    std::vector<uint8_t>  halo;
+    std::vector<uint8_t>  ink, dim;          // text coverage, full and muted
+    std::vector<uint32_t> deco;              // premultiplied: the icons carry colour
+    RECT                  header{};          // the collapse toggle's click target
+    int                   rule_y = -1;       // hairline under the header, -1 for none
+    struct Row {
+        RECT hit;
+        int  item;   // index into items, or one of the two controls below
+    };
+    std::vector<Row> rows;
+    struct Tab {
+        RECT hit;
+        int  index;   // into kPanTabs
+    };
+    std::vector<Tab> tabs;
+    int              scroll_max = 0;   // >0 when the list is taller than its viewport
+};
+
+// Every row is clickable, so the two that are controls rather than items get
+// their own indices rather than being "not a row".
+constexpr int kPanRowMore = -1;   // "+N more"  -> show everything
+constexpr int kPanRowLess = -2;   // "show less" -> back to the first six
+
+// The rows live in a viewport that can be shorter than they are, so everything
+// drawn into it is clipped vertically. Cheaper and simpler than compositing a
+// separate rows layer: the header sits outside the same band and must survive.
+void PanStampMask(std::vector<uint8_t>* layer, int layer_w, int layer_h,
+                  const TextMask& m, int x0, int y0, int top, int bottom) {
+    for (int y = 0; y < m.h; ++y) {
+        const int cy = y0 + y;
+        if (cy < top || cy >= bottom || cy < 0 || cy >= layer_h) continue;
+        for (int x = 0; x < m.w; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= layer_w) continue;
+            (*layer)[static_cast<size_t>(cy) * layer_w + cx] =
+                m.a[static_cast<size_t>(y) * m.w + x];
+        }
+    }
+}
+
+void PanFillRect(std::vector<uint32_t>* deco, int w, int h, RECT r, const Rgb& colour,
+                 float alpha) {
+    for (int y = std::max<int>(0, r.top); y < std::min<int>(h, r.bottom); ++y) {
+        for (int x = std::max<int>(0, r.left); x < std::min<int>(w, r.right); ++x) {
+            uint32_t& dst = (*deco)[static_cast<size_t>(y) * w + x];
+            dst = BlendOver(Pack(colour, alpha), dst);
+        }
+    }
+}
+
+// One line, cut with an ellipsis rather than wrapped: a row is a handle, not a
+// paragraph. DT_SINGLELINE turns off the rasterizer's word breaking, and the
+// width clamp it already applies is what gives DrawText the box to ellipsize in.
+TextMask PanLine(const std::string& text, bool bold, int max_w) {
+    return RenderText(Wide(text), PanScale(kPanTextPx), bold, max_w, 1,
+                      DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// `max_h` caps the card (0 = no ceiling) and `scroll` is clamped in place, so a
+// list longer than its viewport can be wheeled through. Both only ever matter
+// once the "+N more" row has been clicked.
+void BakePanelLayers(PanelCard* out);   // defined after this, used at the end
+
+// `cap_title`/`cap` take the header line over while the panel is speaking: what
+// the voice is saying about this terminal is more urgent than what it is working
+// on, and it is the same line either way rather than a row that appears and
+// shoves the list down.
+void BuildPanelCard(PanelCard* out, const std::string& summary,
+                    const std::vector<PanelItem>& items, bool collapsed,
+                    const std::string& tab, bool expanded_all, float scale, int max_h,
+                    int* scroll, const std::string& cap_title = std::string(),
+                    const std::string& cap = std::string()) {
+    *out = PanelCard{};
+    g_pan_scale = scale;
+
+    const int pad    = PanScale(kPanPad);
+    const int margin = PanScale(kPanShadow);
+    const int toggle = PanScale(kPanToggle);
+    const int tgap   = PanScale(kPanToggleGap);
+    const int icon   = PanScale(kPanIcon);
+    const int igap   = PanScale(kPanIconGap);
+
+    // ── the collapsed pill ──
+    // A one-line lozenge: the worst item's icon and how many things are behind it. It
+    // fits its text rather than keeping the expanded width, so a collapsed panel
+    // gives the terminal underneath almost all of its corner back.
+    if (collapsed) {
+        const TextMask count = PanLine(PanCountText(items.size()), false,
+                                       PanScale(kPanWidth) - 2 * pad);
+        const int panel_w = pad + icon + igap + count.w + tgap + toggle + pad;
+        const int panel_h = std::max({count.h, toggle, icon}) + 2 * PanScale(7);
+        out->margin  = margin;
+        out->panel_w = panel_w;
+        out->panel_h = panel_h;
+        out->radius  = panel_h * 0.5f;   // a real pill, not a small card
+        out->w = panel_w + 2 * margin;
+        out->h = panel_h + 2 * margin;
+        const size_t n = static_cast<size_t>(out->w) * out->h;
+        out->dist.resize(n);
+        out->ink.assign(n, 0);
+        out->dim.assign(n, 0);
+        out->deco.assign(n, 0);
+        out->header = RECT{margin, margin, margin + panel_w, margin + panel_h};
+        StampMask(&out->dim, out->w, out->h, count,
+                  margin + pad + icon + igap, margin + (panel_h - count.h) / 2);
+        if (const PanelItem* worst = PanWorstItem(items)) {
+            const PanGlyph g = PanelGlyphFor(*worst);
+            StampOcticon(&out->deco, out->w, out->h, margin + pad,
+                         margin + (panel_h - icon) / 2, icon, g.path, g.colour);
+        }
+        // A `+`, because from here the gesture is to unfold it.
+        const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
+        const float tc = toggle * 0.5f;
+        StampSdf(&out->ink, out->w, out->h, margin + panel_w - pad - toggle,
+                 margin + (panel_h - toggle) / 2, toggle, toggle,
+                 [=](float px, float py) {
+            return std::min(SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc),
+                            SegDist(px, py, tc, 0.5f, tc, toggle - 0.5f)) - tw;
+        });
+    } else {
+        // ── the expanded card ──
+        const int panel_w = PanScale(kPanWidth);
+        const int inner   = panel_w - 2 * pad;
+
+        // The header doubles as the summary line: one row is enough for "what is
+        // this terminal doing", and giving the toggle its own row would spend a
+        // line of the terminal on furniture.
+        const bool  spoken   = !cap_title.empty() || !cap.empty();
+        const int   head_w   = inner - toggle - tgap;
+        const std::string head_text =
+            spoken ? cap_title
+                   : (summary.empty() ? PanCountText(items.size()) : summary);
+        const TextMask head = PanLine(head_text, spoken, head_w);
+        // Speaking: a bold title and the caption beside it, laid out like a row.
+        TextMask head_rest;
+        if (spoken && !cap.empty()) {
+            const int rest = head_w - head.w - (head.w ? PanScale(kPanLabelGap) : 0);
+            if (rest >= PanScale(56)) head_rest = PanLine(cap, false, rest);
+        }
+        const int head_h =
+            std::max({head.h, head_rest.h, toggle}) + PanScale(kPanHeadGap);
+
+        // Which tabs exist for this list, and which of them is showing. An empty
+        // tab is not offered, and a selection whose tab has emptied falls back to
+        // `All` without being forgotten — the items may well come back.
+        struct TabBuild {
+            int      index;
+            TextMask label;
+            int      w = 0;
+            size_t   count = 0;
+        };
+        std::vector<TabBuild> tabs;
+        int                   active = 0;
+        for (int i = 0; i < kPanTabCount; ++i) {
+            const size_t n = PanTabTally(kPanTabs[i], items);
+            if (i > 0 && n == 0) continue;
+            TabBuild t;
+            t.index = i;
+            t.count = n;
+            std::string label = kPanTabs[i].label;
+            if (kPanTabs[i].counted) label += " (" + std::to_string(n) + ")";
+            t.label = RenderText(Wide(label), PanScale(kPanTabPx), true, inner, 1,
+                                 DT_SINGLELINE | DT_END_ELLIPSIS);
+            t.w     = t.label.w + 2 * PanScale(kPanTabPadX);
+            if (tab == kPanTabs[i].id) active = static_cast<int>(tabs.size());
+            tabs.push_back(std::move(t));
+        }
+        if (tabs.size() < 2) tabs.clear();   // only `All`: no strip worth the line
+        int tab_h = 0;
+        for (const TabBuild& t : tabs) {
+            tab_h = std::max(tab_h, t.label.h + 2 * PanScale(kPanTabPadY));
+        }
+        const PanTab& filter = kPanTabs[tabs.empty() ? 0 : tabs[active].index];
+
+        std::vector<int> view;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (filter.match(items[i])) view.push_back(static_cast<int>(i));
+        }
+
+        // Switching tabs must not move the strip out from under the cursor, so
+        // the card keeps the height of the *tallest* tab's list and a shorter one
+        // simply leaves card underneath. No text has to be measured to know that:
+        // every row is one line, so a list's height is arithmetic once the line
+        // height is known.
+        const int line_h = std::max(PanLine("Ag", true, inner).h,
+                                    PanLine("Ag", false, inner).h);
+        const int item_row_h = std::max(line_h, icon) + PanScale(kPanRowGap);
+        const int ctrl_row_h = line_h + PanScale(kPanRowGap);
+        const auto list_h = [&](size_t n) {
+            const size_t vis =
+                expanded_all ? n : std::min<size_t>(n, kPanMaxRows);
+            const bool ctrl = n > vis || (expanded_all && n > kPanMaxRows);
+            return static_cast<int>(vis) * item_row_h + (ctrl ? ctrl_row_h : 0);
+        };
+        int tallest = list_h(tabs.empty() ? items.size() : 0);
+        for (const TabBuild& t : tabs) tallest = std::max(tallest, list_h(t.count));
+
+        struct RowBuild {
+            TextMask label, title;
+            int      h = 0, item = 0;
+        };
+        std::vector<RowBuild> built;
+        const int text_w = inner - icon - igap;
+        const size_t shown =
+            expanded_all ? view.size() : std::min<size_t>(view.size(), kPanMaxRows);
+        for (size_t k = 0; k < shown; ++k) {
+            const PanelItem& item = items[view[k]];
+            RowBuild r;
+            r.item  = view[k];
+            r.label = PanLine(item.Label(), true, text_w);
+            // Whatever the label leaves. Below a usable remainder the title is
+            // dropped entirely rather than shown as three characters and a dot.
+            const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
+            std::string title = item.title;
+            if (title == item.Label()) title.clear();
+            if (!title.empty() && rest >= PanScale(56)) r.title = PanLine(title, false, rest);
+            r.h = std::max({r.label.h, r.title.h, icon}) + PanScale(kPanRowGap);
+            built.push_back(std::move(r));
+        }
+        // The last row is a control either way: what is hidden, or the way back.
+        if (view.size() > shown || (expanded_all && view.size() > kPanMaxRows)) {
+            RowBuild r;
+            const bool more = view.size() > shown;
+            r.item  = more ? kPanRowMore : kPanRowLess;
+            r.label = PanLine(more ? "+" + std::to_string(view.size() - shown) + " more"
+                                   : std::string("show less"),
+                              false, inner);
+            r.h     = r.label.h + PanScale(kPanRowGap);
+            built.push_back(std::move(r));
+        }
+
+        int rows_h = 0;
+        for (const RowBuild& r : built) rows_h += r.h;
+
+        // A full list must not swallow the terminal it is sitting in, so it is
+        // capped and the overflow is wheeled through instead.
+        const int chrome  = pad + head_h + tab_h + PanScale(kPanRuleGap) + pad;
+        int       view_h  = std::max(rows_h, tallest);
+        if (max_h > 0 && chrome + view_h > max_h) {
+            view_h = std::max(PanScale(48), max_h - chrome);
+        }
+        out->scroll_max = std::max(0, rows_h - view_h);
+        int at = scroll ? std::max(0, std::min(*scroll, out->scroll_max)) : 0;
+        if (scroll) *scroll = at;
+        const int panel_h = chrome + view_h;
+
+        out->margin  = margin;
+        out->panel_w = panel_w;
+        out->panel_h = panel_h;
+        out->radius  = static_cast<float>(PanScale(kPanRadius));
+        out->w = panel_w + 2 * margin;
+        out->h = panel_h + 2 * margin;
+        const size_t n = static_cast<size_t>(out->w) * out->h;
+        out->dist.resize(n);
+        out->ink.assign(n, 0);
+        out->dim.assign(n, 0);
+        out->deco.assign(n, 0);
+
+        int y = margin + pad;
+        // The whole top band, padding included: the header is meant to be an easy
+        // thing to hit, since it is the one control on the card.
+        out->header = RECT{margin, margin, margin + panel_w, y + head_h};
+        StampMask(spoken ? &out->ink : &out->dim, out->w, out->h, head, margin + pad,
+                  y + (head_h - head.h) / 2);
+        if (head_rest.w) {
+            StampMask(&out->dim, out->w, out->h, head_rest,
+                      margin + pad + head.w + PanScale(kPanLabelGap),
+                      y + (head_h - head_rest.h) / 2);
+        }
+        const int tx = margin + panel_w - pad - toggle;
+        const int ty = y + (head_h - toggle) / 2;
+        const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
+        const float tc = toggle * 0.5f;
+        StampSdf(&out->ink, out->w, out->h, tx, ty, toggle, toggle,
+                 [=](float px, float py) {
+            return SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc) - tw;
+        });
+        y += head_h;
+
+        // The strip sits on the hairline, GitHub's underlined nav: the active
+        // tab's accent replaces that line under itself, which is what makes the
+        // pair read as one control rather than as a label above a border.
+        if (!tabs.empty()) {
+            int tx_at = margin + pad - PanScale(kPanTabPadX);
+            for (size_t i = 0; i < tabs.size(); ++i) {
+                const TabBuild& t = tabs[i];
+                const RECT hit{tx_at, y, tx_at + t.w, y + tab_h};
+                out->tabs.push_back(PanelCard::Tab{hit, t.index});
+                const bool on = (static_cast<int>(i) == active);
+                StampMask(on ? &out->ink : &out->dim, out->w, out->h, t.label,
+                          tx_at + PanScale(kPanTabPadX), y + (tab_h - t.label.h) / 2);
+                if (on) {
+                    PanFillRect(&out->deco, out->w, out->h,
+                                RECT{tx_at, y + tab_h - PanScale(kPanTabRule),
+                                     tx_at + t.w, y + tab_h},
+                                kPanAccent, 1.f);
+                }
+                tx_at += t.w + PanScale(kPanTabGap);
+            }
+            y += tab_h;
+        }
+        out->rule_y = y + (tabs.empty() ? PanScale(2) : -1);
+        y += PanScale(kPanRuleGap);
+
+        const int view_top = y, view_bottom = y + view_h;
+        y -= at;   // the whole list slides under the viewport
+
+        for (const RowBuild& r : built) {
+            // Rows claim the full width bar a hair each side, so the highlight
+            // reads as a band across the card rather than as a button in it.
+            const int slop = PanScale(4);
+            const int top = std::max(y, view_top), bot = std::min(y + r.h, view_bottom);
+            if (bot > top) {
+                out->rows.push_back(PanelCard::Row{
+                    RECT{margin + slop, top, margin + panel_w - slop, bot}, r.item});
+            }
+            if (r.item < 0) {
+                PanStampMask(&out->dim, out->w, out->h, r.label, margin + pad,
+                             y + (r.h - r.label.h) / 2, view_top, view_bottom);
+            } else {
+                const PanGlyph g = PanelGlyphFor(items[r.item]);
+                StampOcticon(&out->deco, out->w, out->h, margin + pad,
+                             y + (r.h - icon) / 2, icon, g.path, g.colour,
+                             view_top, view_bottom);
+                const int lx = margin + pad + icon + igap;
+                PanStampMask(&out->ink, out->w, out->h, r.label, lx,
+                             y + (r.h - r.label.h) / 2, view_top, view_bottom);
+                if (r.title.w) {
+                    PanStampMask(&out->dim, out->w, out->h, r.title,
+                                 lx + r.label.w + PanScale(kPanLabelGap),
+                                 y + (r.h - r.title.h) / 2, view_top, view_bottom);
+                }
+            }
+            y += r.h;
+        }
+
+        // No scrollbar chrome, just enough of a mark to say there is more and
+        // roughly where you are in it.
+        if (out->scroll_max > 0) {
+            const int bw = PanScale(kPanScrollBar);
+            const int bx = margin + panel_w - PanScale(5) - bw;
+            const int bh = std::max(PanScale(18), view_h * view_h / std::max(1, rows_h));
+            const int by = view_top + (view_h - bh) * at / out->scroll_max;
+            PanFillRect(&out->deco, out->w, out->h,
+                        RECT{bx, by, bx + bw, by + bh}, kPanLine, 0.95f);
+        }
+    }
+
+    // The silhouette, its hairline and its shadow, all out of one rounded-rect
+    // distance field — the caption card's trick, and the reason the two objects
+    // have the same edge.
+    const float hw = out->panel_w * 0.5f, hh = out->panel_h * 0.5f;
+    const float ccx = out->w * 0.5f, ccy = out->h * 0.5f;
+    const float radius = std::min(out->radius, std::min(hw, hh));
+    for (int y = 0; y < out->h; ++y) {
+        for (int x = 0; x < out->w; ++x) {
+            const float dx = x + 0.5f - ccx, dy = y + 0.5f - ccy;
+            const float qx = std::max(std::fabs(dx) - (hw - radius), 0.f);
+            const float qy = std::max(std::fabs(dy) - (hh - radius), 0.f);
+            out->dist[static_cast<size_t>(y) * out->w + x] =
+                std::sqrt(qx * qx + qy * qy) - radius;
+        }
+    }
+
+    BakePanelLayers(out);
+}
+
+// Almost none of a card changes between frames: the shadow, the fill, the
+// hairline, the header rule, the icons and every glyph of text are all fixed
+// until the content is. So they are composed *once*, at build time, into two
+// premultiplied layers — everything under the interactive bits, and everything
+// over them — and a frame is a copy plus the two things that do move.
+//
+// This is the difference between 5.5 ms and half a millisecond per frame, which
+// matters because a glowing card redraws twenty-five times a second while the
+// voice is going, on the same thread that answers every panel POST.
+void BakePanelLayers(PanelCard* out) {
+    const Rgb fill   = PanFill();
+    const Rgb border = PanBorder();
+    const Rgb ink    = PanInk();
+    const Rgb dim    = PanDimInk();
+    constexpr Rgb kShadowInk{0.01f, 0.02f, 0.04f};
+    // Tighter than the caption toast's: that one appears for a sentence over
+    // whatever the desktop is, where a wide shadow lifts it off. This one sits on
+    // a terminal all day, and on a light theme a broad halo read as dirt around
+    // the card — most obviously around the collapsed pill, which is small enough
+    // that the shadow was most of it.
+    const float sigma = std::max(1.f, PanScale(kPanShadow) * 0.31f);
+    const int   drop  = PanScale(4);
+
+    const size_t n = static_cast<size_t>(out->w) * out->h;
+    out->base.assign(n, 0);
+    out->marks.assign(n, 0);
+    for (int y = 0; y < out->h; ++y) {
+        for (int x = 0; x < out->w; ++x) {
+            const size_t ci = static_cast<size_t>(y) * out->w + x;
+            const float  d  = out->dist[ci];
+            const float  inside = 1.f - SmoothStep(-0.7f, 0.7f, d);
+
+            uint32_t p = 0;
+            // The same distance field sampled a few rows up is the shape of the
+            // shadow — and only outside the card, since the fill would cover it.
+            if (y >= drop && d > -1.f) {
+                const float sd =
+                    std::max(out->dist[static_cast<size_t>(y - drop) * out->w + x], 0.f);
+                const float a = kPanShadowA * std::exp(-(sd / sigma) * (sd / sigma));
+                if (a > 0.004f) p = Pack(kShadowInk, Clamp01(a));
+            }
+            if (inside > 0.004f) {
+                p = BlendOver(Pack(fill, inside * kPanFillAlpha), p);
+                // A band a pixel or two wide just *inside* the edge. Note the
+                // direction: `dist` is negative inside, so the ramp has to rise
+                // towards the boundary. Getting that backwards paints the whole
+                // card in the border colour, which is invisible when the border
+                // is 13% off the fill (as the caption toast's is) and very much
+                // not when it is #3d444d on #212830.
+                const float edge = inside * SmoothStep(-1.8f, -0.3f, d);
+                if (edge > 0.004f) p = BlendOver(Pack(border, edge * kPanFillAlpha), p);
+                if (out->rule_y >= 0 && y == out->rule_y &&
+                    x > out->margin && x < out->margin + out->panel_w) {
+                    p = BlendOver(Pack(kPanLine, 1.f), p);
+                }
+            }
+            out->base[ci] = p;
+
+            uint32_t m = 0;
+            if (const uint32_t b = out->deco[ci]) m = ScaleAlpha(b, inside);
+            if (const uint8_t a = out->ink[ci])   m = BlendOver(Pack(ink, a / 255.f), m);
+            if (const uint8_t a = out->dim[ci])   m = BlendOver(Pack(dim, a / 255.f), m);
+            out->marks[ci] = m;
+        }
+    }
+
+    // The halo: a Gaussian band on the card's own outline, reaching a little way
+    // inside so the hairline is lit too and the edge reads as glowing rather
+    // than as a card with something behind it.
+    out->halo.assign(n, 0);
+    const float gsig  = std::max(1.f, static_cast<float>(PanScale(7)));
+    const float reach = 3.f * gsig;
+    for (size_t ci = 0; ci < n; ++ci) {
+        const float d = out->dist[ci];
+        if (d < -2.5f || d > reach) continue;
+        const float t = std::max(d, 0.f) / gsig;
+        const float a = std::exp(-t * t) * 0.62f;
+        if (a > 0.004f) out->halo[ci] = static_cast<uint8_t>(a * 255.f + 0.5f);
+    }
+}
+
+// A frame: the baked card, the hovered band under the text, the speaking halo
+// around the outline, the baked marks on top. `hover` is the row rectangle to
+// light up (the header and the tabs count as rows), or null.
+void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, float fade,
+                  float glow, float voice) {
+    const size_t n = static_cast<size_t>(card.w) * card.h;
+    if (card.base.size() != n) return;
+    std::memcpy(frame, card.base.data(), n * 4);
+
+    if (hover) {
+        const float hr = static_cast<float>(PanScale(6));   // the band's corners
+        const float bw = (hover->right - hover->left) * 0.5f;
+        const float bh = (hover->bottom - hover->top) * 0.5f;
+        const float r  = std::min(hr, std::min(bw, bh));
+        const int   y0 = std::max(0, static_cast<int>(hover->top) - 2);
+        const int   y1 = std::min(card.h, static_cast<int>(hover->bottom) + 2);
+        const int   x0 = std::max(0, static_cast<int>(hover->left) - 2);
+        const int   x1 = std::min(card.w, static_cast<int>(hover->right) + 2);
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                const size_t ci = static_cast<size_t>(y) * card.w + x;
+                const float bx = std::fabs(x + 0.5f - (hover->left + bw));
+                const float by = std::fabs(y + 0.5f - (hover->top + bh));
+                const float qx = std::max(bx - (bw - r), 0.f);
+                const float qy = std::max(by - (bh - r), 0.f);
+                const float hd = std::sqrt(qx * qx + qy * qy) - r;
+                const float inside = 1.f - SmoothStep(-0.7f, 0.7f, card.dist[ci]);
+                const float ha = (1.f - SmoothStep(-0.7f, 0.7f, hd)) * inside;
+                if (ha > 0.004f) frame[ci] = BlendOver(Pack(kPanHover, ha), frame[ci]);
+            }
+        }
+    }
+
+    // Brightness follows the voice; the shape is baked. A table for the colour
+    // as well, because this runs over every pixel of the ring twenty-five times
+    // a second for as long as the utterance lasts, and Pack's float work is most
+    // of what that used to cost.
+    const float gi = glow * (0.30f + 0.55f * Clamp01(voice));
+    if (gi > 0.004f && card.halo.size() == n) {
+        static uint32_t ember[256];
+        static bool     ready = false;
+        if (!ready) {
+            for (int i = 0; i < 256; ++i) ember[i] = Pack(kEmber, i / 255.f);
+            ready = true;
+        }
+        for (size_t ci = 0; ci < n; ++ci) {
+            const uint8_t hm = card.halo[ci];
+            if (!hm) continue;
+            const int q = static_cast<int>(gi * hm);
+            if (q > 3) frame[ci] = BlendOver(ember[q > 255 ? 255 : q], frame[ci]);
+        }
+    }
+
+    for (size_t ci = 0; ci < n; ++ci) {
+        if (const uint32_t m = card.marks[ci]) frame[ci] = BlendOver(m, frame[ci]);
+    }
+    if (fade < 0.999f) {
+        for (size_t ci = 0; ci < n; ++ci) frame[ci] = ScaleAlpha(frame[ci], fade);
+    }
+}
+
+// ── a live panel ────────────────────────────────────────────────────────────
+
+// What is under the pointer. Three kinds of thing are clickable now — the
+// header, a tab, a row — so this is a pair rather than an index with sentinels.
+struct PanHit {
+    enum class Kind { None, Header, Tab, Row } kind = Kind::None;
+    int index = -1;
+
+    bool operator==(const PanHit& o) const { return kind == o.kind && index == o.index; }
+    bool operator!=(const PanHit& o) const { return !(*this == o); }
+};
+
+// A *registration*, not a window: a session says what it is working on and which
+// window title to look for, and that outlives any particular window. Windows
+// Terminal windows have tabs and the window title is the active tab's, so the
+// window a session belongs to comes and goes as Fernando switches tabs — the
+// card follows, the registration does not.
+struct Panel {
+    std::string            session;
+    std::string            title;    // what to look for, re-matched every ~500 ms
+    HWND                   target = nullptr;   // the window it matches *now*, or none
+    HWND                   hwnd   = nullptr;   // our card, created on the first bind
+    std::string            summary;
+    std::vector<PanelItem> items;
+    time_t    updated_at = 0;        // last POST; registrations expire 48 h after it
+    bool      collapsed = false;
+    // These three survive a POST and a collapse: what the card is showing is the
+    // reader's business, not the producer's.
+    std::string tab = "all";         // which tab is selected, by id
+    bool      expanded_all = false;  // the "+N more" row has been clicked
+    int       scroll   = 0;          // px the full list is wheeled down by
+    int       max_h    = 0;          // ceiling from the target's client height
+    bool      dirty     = true;      // content changed: the card needs rebuilding
+    PanHit    hover{};
+    // The speaking glow: `glow` eases in and out so the card arrives and leaves
+    // with the voice rather than snapping, `voice` is the live envelope, and the
+    // captions replace the summary line while it lasts.
+    float       glow = 0.f, voice = 0.f;
+    bool        speaking = false;
+    bool        glow_drawn = false;   // the last frame pushed had a halo on it
+    std::string cap_title, cap;
+    float     scale     = 1.f;
+    PanelCard card;
+
+    // The layered window's backing store, resized whenever the card is.
+    HDC     dc      = nullptr;
+    HBITMAP dib     = nullptr;
+    HGDIOBJ old_bmp = nullptr;
+    void*   bits    = nullptr;
+    int     dib_w = 0, dib_h = 0;
+    POINT   pos{-32000, -32000};
+    bool    shown = false;
+
+    void ReleaseDib() {
+        if (dc && old_bmp) SelectObject(dc, old_bmp);
+        if (dib) DeleteObject(dib);
+        if (dc)  DeleteDC(dc);
+        dc = nullptr; dib = nullptr; old_bmp = nullptr; bits = nullptr;
+        dib_w = dib_h = 0;
+    }
+    ~Panel() { ReleaseDib(); }
+};
+
+Panel* PanelOf(HWND hwnd) {
+    return reinterpret_cast<Panel*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+}
+
+// The card itself, without the shadow margin: everything else about this window
+// is transparent and must stay click-through.
+bool PanelInside(const Panel* p, POINT screen) {
+    if (!p->card.w) return false;
+    const long x = screen.x - p->pos.x, y = screen.y - p->pos.y;
+    return x >= p->card.margin && x < p->card.margin + p->card.panel_w &&
+           y >= p->card.margin && y < p->card.margin + p->card.panel_h;
+}
+
+PanHit PanelHitAt(const Panel* p, POINT screen) {
+    if (!PanelInside(p, screen)) return {};
+    POINT q{screen.x - p->pos.x, screen.y - p->pos.y};
+    if (PtInRect(&p->card.header, q)) return {PanHit::Kind::Header, 0};
+    for (size_t i = 0; i < p->card.tabs.size(); ++i) {
+        if (PtInRect(&p->card.tabs[i].hit, q)) {
+            return {PanHit::Kind::Tab, static_cast<int>(i)};
+        }
+    }
+    for (size_t i = 0; i < p->card.rows.size(); ++i) {
+        if (PtInRect(&p->card.rows[i].hit, q)) {
+            return {PanHit::Kind::Row, static_cast<int>(i)};
+        }
+    }
+    return {};
+}
+
+// A row's target is handed to ShellExecute, so it is worth being narrow about
+// what may be one: an http(s) URL, or an absolute Windows path. The producer is
+// on loopback, but "open whatever string arrived over a socket" is not a thing
+// to build even so.
+bool PanelOpenable(const std::string& u) {
+    const std::string lower = LowerAscii(u);
+    if (lower.rfind("http://", 0) == 0 || lower.rfind("https://", 0) == 0) return true;
+    if (u.size() >= 3 && std::isalpha(static_cast<unsigned char>(u[0])) && u[1] == ':' &&
+        (u[2] == '\\' || u[2] == '/')) {
+        return true;
+    }
+    return u.size() >= 2 && u[0] == '\\' && u[1] == '\\';
+}
+
+// URLs go to the browser, directories to Explorer — one call does both, which is
+// the whole reason a path row can sit in the same list as a pull request.
+void PanelOpen(const PanelItem& item) {
+    if (!PanelOpenable(item.url)) {
+        std::fprintf(stderr, "speak: panel row '%s' has nothing openable\n",
+                     item.Label().c_str());
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", Wide(item.url).c_str(), nullptr, nullptr,
+                  SW_SHOWNORMAL);
+}
+
+void PanelCompose(Panel* p);   // defined with the render pass below
+
+void PanelScrollBy(Panel* p, int delta) {
+    if (p->card.scroll_max <= 0 || delta == 0) return;
+    g_pan_scale = p->scale;
+    const int step = PanScale(kPanScrollPx) * (delta > 0 ? -1 : 1);
+    const int want = std::max(0, std::min(p->scroll + step, p->card.scroll_max));
+    if (want == p->scroll) return;
+    p->scroll = want;
+    p->dirty  = true;
+}
+
+void PanelToggle(Panel* p) {
+    p->collapsed = !p->collapsed;
+    p->dirty     = true;
+    p->hover     = PanHit{};
+}
+
+LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Panel* p = PanelOf(hwnd);
+    switch (msg) {
+        case WM_NCHITTEST: {
+            // The shadow margin is empty pixels; it must not swallow a click meant
+            // for the terminal behind it. Same trick as the orb's square.
+            if (!p) break;
+            const POINT s{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            return PanelInside(p, s) ? HTCLIENT : HTTRANSPARENT;
+        }
+        case WM_LBUTTONDOWN: {
+            if (!p) break;
+            POINT cur{};
+            GetCursorPos(&cur);
+            const PanHit hit = PanelHitAt(p, cur);
+            if (hit.kind == PanHit::Kind::Header) {
+                PanelToggle(p);
+            } else if (hit.kind == PanHit::Kind::Tab) {
+                p->tab    = kPanTabs[p->card.tabs[hit.index].index].id;
+                p->scroll = 0;
+                p->dirty  = true;
+                p->hover  = PanHit{};
+            } else if (hit.kind == PanHit::Kind::Row) {
+                const int idx = p->card.rows[hit.index].item;
+                if (idx >= 0 && idx < static_cast<int>(p->items.size())) {
+                    PanelOpen(p->items[idx]);
+                } else if (idx == kPanRowMore || idx == kPanRowLess) {
+                    p->expanded_all = (idx == kPanRowMore);
+                    p->scroll       = 0;
+                    p->dirty        = true;
+                    p->hover        = PanHit{};
+                }
+            }
+            return 0;
+        }
+        case WM_MOUSEWHEEL:
+            // Windows routes the wheel to the window under the pointer for
+            // inactive windows ("scroll inactive windows when I hover over
+            // them", on by default since Windows 10), which is the whole reason
+            // this arrives at a window that never takes focus. When that setting
+            // is off, the hook below posts the same message here.
+            if (p) PanelScrollBy(p, GET_WHEEL_DELTA_WPARAM(wp));
+            return 0;
+        case WM_RBUTTONDOWN:
+            // Anywhere on the card: the collapse toggle is the only gesture, so it
+            // should not require finding the header.
+            if (p && PanelInside(p, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) {
+                PanelToggle(p);
+            }
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Reblits the existing card with the current hover state — no text is measured
+// here, so running down the list is cheap.
+void PanelCompose(Panel* p) {
+    if (!p->bits) return;
+    g_pan_scale = p->scale;
+    const RECT* hover = nullptr;
+    const int   i     = p->hover.index;
+    switch (p->hover.kind) {
+        case PanHit::Kind::Header:
+            hover = &p->card.header;
+            break;
+        case PanHit::Kind::Tab:
+            if (i >= 0 && i < static_cast<int>(p->card.tabs.size())) {
+                hover = &p->card.tabs[i].hit;
+            }
+            break;
+        case PanHit::Kind::Row:
+            if (i >= 0 && i < static_cast<int>(p->card.rows.size())) {
+                hover = &p->card.rows[i].hit;
+            }
+            break;
+        default:
+            break;
+    }
+    ComposePanel(static_cast<uint32_t*>(p->bits), p->card, hover, 1.f, p->glow,
+                 p->voice);
+}
+
+void PanelRender(Panel* p) {
+    BuildPanelCard(&p->card, p->summary, p->items, p->collapsed, p->tab,
+                   p->expanded_all, p->scale, p->max_h, &p->scroll, p->cap_title,
+                   p->cap);
+    if (p->card.w != p->dib_w || p->card.h != p->dib_h) {
+        p->ReleaseDib();
+        HDC screen = GetDC(nullptr);
+        p->dc = CreateCompatibleDC(screen);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = p->card.w;
+        bi.bmiHeader.biHeight      = -p->card.h;   // top-down
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        p->dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &p->bits, nullptr, 0);
+        ReleaseDC(nullptr, screen);
+        if (!p->dib) { p->ReleaseDib(); return; }
+        p->old_bmp = SelectObject(p->dc, p->dib);
+        p->dib_w = p->card.w;
+        p->dib_h = p->card.h;
+    }
+    PanelCompose(p);
+    p->dirty = false;
+}
+
+void PanelPush(Panel* p) {
+    if (!p->dc || !p->card.w) return;
+    POINT pos = p->pos;
+    SIZE  size{p->card.w, p->card.h};
+    POINT src{0, 0};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(p->hwnd, nullptr, &pos, &size, p->dc, &src, 0, &blend, ULW_ALPHA);
+}
+
+// The scale the target is being drawn at. Per *window*, not per process: dragging
+// a terminal between a scaled laptop panel and an external monitor changes it,
+// and the card is rebuilt when it does.
+float PanelScaleFor(HWND target) {
+    using Fn = UINT(WINAPI*)(HWND);
+    static Fn get_dpi = [] {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? reinterpret_cast<Fn>(GetProcAddress(user32, "GetDpiForWindow"))
+                      : nullptr;
+    }();
+    UINT dpi = (get_dpi && target) ? get_dpi(target) : 0;
+    if (!dpi) {
+        HDC screen = GetDC(nullptr);
+        dpi = screen ? static_cast<UINT>(GetDeviceCaps(screen, LOGPIXELSX)) : 96;
+        if (screen) ReleaseDC(nullptr, screen);
+    }
+    return (dpi ? dpi : 96) / 96.f;
+}
+
+// ── which window does this panel belong to? ─────────────────────────────────
+// Same problem `--title` solves for pointing, and the same answer: Windows
+// Terminal serves every session from one process, so the title Claude Code sets
+// is the only discriminator there is. Three differences here.
+//
+// The title carries a spinner glyph that changes while the session works
+// (`◐ …`, `✳ …`, `⠐ …`), so a leading glyph is stripped from *both* sides before
+// comparing — the registered title was captured at one instant and the window is
+// read at another, and the two will disagree about the glyph.
+//
+// An exact match wins over a containing one, so a session whose title is a
+// prefix of another's still binds to its own window.
+//
+// And the answer changes over time. A Windows Terminal window shows the *active
+// tab's* title, so a session in a background tab does not match any window at
+// all until its tab comes forward. That is not a failure — it is the normal
+// state of a terminal with tabs — so this is re-run on a timer rather than once,
+// per registration, and a no-match hides the card instead of dropping anything.
+
+std::string PanTrim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && static_cast<unsigned char>(s[a]) <= ' ') ++a;
+    while (b > a && static_cast<unsigned char>(s[b - 1]) <= ' ') --b;
+    return s.substr(a, b - a);
+}
+
+// Drops a leading non-ASCII glyph *and the space behind it*. The space is the
+// test: a title that starts with a non-ASCII word ("Ótima ideia") has no space
+// there, and is left alone rather than losing its first letter.
+std::string PanStripGlyph(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size() && static_cast<unsigned char>(s[i]) >= 0x80) ++i;
+    if (i == 0 || i >= s.size()) return s;
+    if (s[i] != ' ' && s[i] != '\t') return s;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+    return s.substr(i);
+}
+
+// Comparable form: trimmed, lowercased, leading glyph gone.
+std::string PanKey(const std::string& title) {
+    return PanStripGlyph(LowerAscii(PanTrim(title)));
+}
+
+// 2 = a unique exact match, 1 = a unique containing one, 0 = none or several (in
+// which case `hits` holds the candidates). The quality is what breaks a tie when
+// two registrations land on the same window.
+int PanPickWindow(const std::vector<WindowTarget>& pool, const std::string& title,
+                  HWND* out, std::vector<WindowTarget>* hits) {
+    const std::string want = PanKey(title);
+    if (want.empty()) return 0;
+    int quality = 2;
+    for (const WindowTarget& t : pool) {
+        if (PanKey(t.title) == want) hits->push_back(t);
+    }
+    if (hits->empty()) {
+        quality = 1;
+        for (const WindowTarget& t : pool) {
+            if (PanKey(t.title).find(want) != std::string::npos) hits->push_back(t);
+        }
+    }
+    if (hits->size() != 1) return 0;
+    *out = (*hits)[0].hwnd;
+    return quality;
+}
+
+// One pass over the desktop, reused for every registration in a resolver tick:
+// enumerating windows per session would be the same work several times over.
+struct PanelPools {
+    std::vector<WindowTarget> terminals;
+    std::vector<WindowTarget> all;
+
+    static PanelPools Snapshot() {
+        PanelPools pools;
+        pools.all = EnumTargets();
+        for (const WindowTarget& t : pools.all) {
+            if (t.process == "windowsterminal.exe") pools.terminals.push_back(t);
+        }
+        return pools;
+    }
+};
+
+// Terminals first, everything else second. The producer is a terminal hook, so a
+// Windows Terminal window is what a panel is *for*; falling back to any window
+// afterwards is what makes --panel-demo usable against, say, a browser while
+// developing.
+int PanelResolve(const PanelPools& pools, const std::string& title, HWND* out,
+                 std::string* err, std::string* candidates) {
+    if (PanTrim(title).empty()) {
+        if (err) *err = "name the window the panel belongs to: title";
+        return 0;
+    }
+    const std::vector<WindowTarget>* order[2] = {&pools.terminals, &pools.all};
+    for (const std::vector<WindowTarget>* pool : order) {
+        if (pool->empty()) continue;
+        std::vector<WindowTarget> hits;
+        const int quality = PanPickWindow(*pool, title, out, &hits);
+        if (quality) return quality;
+        if (hits.size() > 1) {
+            if (err) {
+                *err = "'" + title + "' matches " + std::to_string(hits.size()) +
+                       " windows";
+            }
+            if (candidates) *candidates = TargetsJson(hits);
+            return 0;
+        }
+    }
+    if (err) *err = "no window title matches '" + title + "' right now";
+    if (candidates) {
+        *candidates = TargetsJson(pools.terminals.empty() ? pools.all : pools.terminals);
+    }
+    return 0;
+}
+
+// For the endpoint, which answers one request and takes its own snapshot.
+int ResolvePanelTarget(const std::string& title, HWND* out, std::string* err,
+                       std::string* candidates) {
+    return PanelResolve(PanelPools::Snapshot(), title, out, err, candidates);
+}
+
+// ── the receiving end of the beacon ─────────────────────────────────────────
+// Keyed by target window, not by session or by title: the card *shown* on that
+// hwnd is the context for that window, whichever registration happens to own it,
+// which is the same rule the resolver uses to decide what is shown there at all.
+
+struct SpeakingAt {
+    float       level = 0.f;
+    std::string cap_title, cap;
+    bool        active = false;
+    DWORD       heard  = 0;      // GetTickCount of the last datagram
+};
+
+std::mutex                              g_speaking_mtx;
+std::unordered_map<HWND, SpeakingAt>    g_speaking;
+
+// Its own thread, and a blocking recvfrom: an utterance's worth of datagrams
+// must not wait behind a panel POST, nor hold one up.
+void RunBeaconServer(int port) {
+    if (!WinsockInit()) return;
+    SOCKET fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == INVALID_SOCKET) return;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // never off this machine
+    addr.sin_port        = htons(static_cast<unsigned short>(port));
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        std::fprintf(stderr, "speak: speaking beacon could not take port %d\n", port);
+        closesocket(fd);
+        return;
+    }
+    for (;;) {
+        SpeakBeacon msg;
+        const int n = recv(fd, reinterpret_cast<char*>(&msg), sizeof(msg), 0);
+        if (n == SOCKET_ERROR) break;
+        if (n != static_cast<int>(sizeof(msg)) || msg.magic != kBeaconMagic ||
+            msg.version != kBeaconVersion || !msg.hwnd) {
+            continue;
+        }
+        msg.caption_title[sizeof(msg.caption_title) - 1] = 0;
+        msg.caption[sizeof(msg.caption) - 1] = 0;
+
+        SpeakingAt at;
+        at.level     = Clamp01(msg.level);
+        at.cap_title = msg.caption_title;
+        at.cap       = msg.caption;
+        at.active    = msg.active != 0;
+        at.heard     = GetTickCount();
+        std::lock_guard<std::mutex> lock(g_speaking_mtx);
+        g_speaking[reinterpret_cast<HWND>(static_cast<uintptr_t>(msg.hwnd))] = at;
+    }
+    closesocket(fd);
+}
+
+// ── the panel thread ────────────────────────────────────────────────────────
+// One thread owns every panel window: they are created there, drawn there, bound
+// to a target there and their clicks are handled there, so nothing about a panel
+// needs a lock. The endpoint registers a session and leaves a command behind; it
+// resolves the title too, but only to be able to say what it resolved to *now*.
+
+struct PanelCmd {
+    bool                   remove = false;
+    std::string            session;
+    std::string            title;
+    std::string            summary;
+    std::vector<PanelItem> items;
+};
+
+std::mutex            g_pan_queue_mtx;
+std::vector<PanelCmd> g_pan_queue;
+std::atomic<bool>     g_pan_reassert{false};
+std::atomic<bool>     g_pan_trace{false};   // --panel-demo: report what it is doing
+
+// What GET /panels answers with, rebuilt on each resolver tick. Publishing a
+// snapshot rather than locking the live registrations keeps the panel thread the
+// only thing that ever touches them.
+std::mutex  g_pan_snapshot_mtx;
+std::string g_pan_snapshot = "[]";
+
+void PanelEnqueue(PanelCmd cmd) {
+    std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
+    g_pan_queue.push_back(std::move(cmd));
+}
+
+// The wheel, and why this is fussier than it looks. A layered
+// WS_EX_NOACTIVATE window never has focus, and historically WM_MOUSEWHEEL went
+// to the focused window rather than the one under the pointer. Windows 10 added
+// "scroll inactive windows when I hover over them" and turned it on by default,
+// which delivers the notch to the window under the pointer — so the wndproc
+// above is the whole mechanism for almost everyone.
+//
+// When that setting is *off* there is no substitute for a low-level mouse hook,
+// but a WH_MOUSE_LL hook is a global one: every mouse event on the machine
+// round-trips through the installing thread's message queue, and a thread that
+// is busy drawing makes the whole system's pointer feel late. (It did.) So the
+// hook is installed only while the pointer is actually over a scrollable card,
+// removed the moment it is not, and its callback does nothing but post — no
+// panel state, no locks, no drawing.
+
+#ifndef SPI_GETMOUSEWHEELROUTING
+#define SPI_GETMOUSEWHEELROUTING 0x201C
+#endif
+#ifndef MOUSEWHEEL_ROUTING_FOCUS
+#define MOUSEWHEEL_ROUTING_FOCUS 0
+#endif
+
+bool PanelWheelReachesUs() {
+    UINT routing = MOUSEWHEEL_ROUTING_FOCUS + 1;   // assume the modern default
+    if (!SystemParametersInfoW(SPI_GETMOUSEWHEELROUTING, 0, &routing, 0)) return true;
+    return routing != MOUSEWHEEL_ROUTING_FOCUS;
+}
+
+std::atomic<HWND> g_pan_wheel_to{nullptr};
+
+LRESULT CALLBACK PanelMouseHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && wp == WM_MOUSEWHEEL) {
+        if (HWND to = g_pan_wheel_to.load()) {
+            const auto* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+            PostMessageW(to, WM_MOUSEWHEEL,
+                         MAKEWPARAM(0, GET_WHEEL_DELTA_WPARAM(m->mouseData)),
+                         MAKELPARAM(m->pt.x, m->pt.y));
+            return 1;   // and the terminal underneath does not scroll too
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// Z-order only. Following the target's *geometry* is done by polling below: a
+// LOCATIONCHANGE hook fires for every child of the terminal as it lays out and
+// says nothing about minimize, cloaking or death, all of which the same poll has
+// to check anyway. Foreground changes are different — they are rare, and they
+// are exactly when a topmost window can end up behind something.
+void CALLBACK PanelWinEvent(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    g_pan_reassert.store(true);
+}
+
+void PanelDestroy(std::unique_ptr<Panel>* slot) {
+    Panel* p = slot->get();
+    if (p->hwnd) {
+        SetWindowLongPtrW(p->hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(p->hwnd);
+        p->hwnd = nullptr;
+    }
+    slot->reset();
+}
+
+// Registering is keyed by session and never touches the binding: which window a
+// session is showing in is the resolver's business, and a POST that arrives while
+// the session's tab is in the background must still be remembered.
+//
+// The collapse state is *not* taken from the payload either. New items on a
+// collapsed panel bump the pill and nothing else: being interrupted by a card
+// unfolding itself is the thing collapsing it was meant to stop.
+void PanelApply(std::vector<std::unique_ptr<Panel>>* panels, PanelCmd&& cmd) {
+    for (size_t i = panels->size(); i-- > 0;) {
+        Panel* p = (*panels)[i].get();
+        if (p->session != cmd.session) continue;
+        if (cmd.remove) {
+            PanelDestroy(&(*panels)[i]);
+            panels->erase(panels->begin() + i);
+            return;
+        }
+        p->title      = std::move(cmd.title);
+        p->summary    = std::move(cmd.summary);
+        p->items      = std::move(cmd.items);
+        p->updated_at = std::time(nullptr);
+        p->dirty      = true;
+        return;
+    }
+    if (cmd.remove) return;
+
+    auto up = std::make_unique<Panel>();
+    up->session    = std::move(cmd.session);
+    up->title      = std::move(cmd.title);
+    up->summary    = std::move(cmd.summary);
+    up->items      = std::move(cmd.items);
+    up->updated_at = std::time(nullptr);
+    panels->push_back(std::move(up));
+}
+
+// The card window, created on the first bind rather than on registration: a
+// session whose tab never comes forward should cost nothing on screen.
+bool PanelEnsureWindow(Panel* p) {
+    if (p->hwnd) return true;
+    p->hwnd = CreateWindowExW(
+        // No WS_EX_TRANSPARENT: unlike the pointer, this one is clicked on.
+        // WS_EX_NOACTIVATE keeps that click from stealing focus from the terminal
+        // the panel is sitting in.
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        L"ClaudeSpeakPanel", L"", WS_POPUP, 0, 0, 16, 16, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!p->hwnd) {
+        std::fprintf(stderr, "speak: could not create a panel window\n");
+        return false;
+    }
+    SetWindowLongPtrW(p->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(p));
+    return true;
+}
+
+void PanelHide(Panel* p, const char* why) {
+    if (!p->shown) return;
+    ShowWindow(p->hwnd, SW_HIDE);
+    p->shown = false;
+    if (g_pan_trace.load()) std::fprintf(stderr, "speak: panel hidden (%s)\n", why);
+}
+
+std::string PanelIso8601(time_t t) {
+    char buf[32]{};
+    tm   utc{};
+    if (gmtime_s(&utc, &t) == 0) std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    return buf;
+}
+
+// Re-match every registration against the desktop as it is now, then decide who
+// gets which window. Two registrations can name the same window over time — that
+// is what a tab switch looks like — so at most one card is shown per hwnd and the
+// better match takes it.
+void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
+    const PanelPools pools = PanelPools::Snapshot();
+    const time_t     now   = std::time(nullptr);
+
+    // Expire first: a session that stopped posting two days ago is not a session.
+    for (size_t i = panels->size(); i-- > 0;) {
+        const Panel& p = *(*panels)[i];
+        if (p.updated_at && std::difftime(now, p.updated_at) > kPanTtlSeconds) {
+            if (g_pan_trace.load()) {
+                std::fprintf(stderr, "speak: registration '%s' expired\n",
+                             p.session.c_str());
+            }
+            PanelDestroy(&(*panels)[i]);
+            panels->erase(panels->begin() + i);
+        }
+    }
+
+    struct Claim {
+        HWND hwnd    = nullptr;
+        int  quality = 0;
+    };
+    std::vector<Claim> claims(panels->size());
+    for (size_t i = 0; i < panels->size(); ++i) {
+        Claim& c = claims[i];
+        c.quality = PanelResolve(pools, (*panels)[i]->title, &c.hwnd, nullptr, nullptr);
+        if (!c.quality) c.hwnd = nullptr;
+    }
+
+    std::unordered_map<HWND, size_t> best;
+    for (size_t i = 0; i < claims.size(); ++i) {
+        if (!claims[i].hwnd) continue;
+        const auto it = best.find(claims[i].hwnd);
+        if (it == best.end()) {
+            best.emplace(claims[i].hwnd, i);
+            continue;
+        }
+        const size_t k = it->second;
+        const bool   i_wins =
+            claims[i].quality > claims[k].quality ||
+            (claims[i].quality == claims[k].quality &&
+             (*panels)[i]->updated_at > (*panels)[k]->updated_at);
+        if (i_wins) {
+            claims[k].hwnd = nullptr;
+            it->second     = i;
+        } else {
+            claims[i].hwnd = nullptr;
+        }
+    }
+
+    std::string json = "[";
+    for (size_t i = 0; i < panels->size(); ++i) {
+        Panel* p = (*panels)[i].get();
+        if (p->target != claims[i].hwnd) {
+            p->target = claims[i].hwnd;
+            p->pos    = POINT{-32000, -32000};   // force a push at the new place
+            if (!p->target) {
+                PanelHide(p, "no window matches its title now");
+            } else if (g_pan_trace.load()) {
+                std::fprintf(stderr, "speak: '%s' bound to hwnd %llu\n",
+                             p->session.c_str(),
+                             static_cast<unsigned long long>(
+                                 reinterpret_cast<uintptr_t>(p->target)));
+            }
+        }
+        if (i) json += ",";
+        json += "{\"session\":\"" + JsonEscape(p->session) + "\"" +
+                ",\"title\":\"" + JsonEscape(p->title) + "\"" +
+                ",\"hwnd\":" +
+                (p->target ? std::to_string(reinterpret_cast<uintptr_t>(p->target))
+                           : "null") +
+                ",\"resolved\":" + (p->target ? "true" : "false") +
+                ",\"items\":" + std::to_string(p->items.size()) +
+                ",\"collapsed\":" + (p->collapsed ? "true" : "false") +
+                ",\"tab\":\"" + JsonEscape(p->tab) + "\"" +
+                ",\"expanded_all\":" + (p->expanded_all ? "true" : "false") +
+                ",\"speaking\":" + (p->speaking ? "true" : "false") +
+                ",\"updated_at\":\"" + PanelIso8601(p->updated_at) + "\"}";
+    }
+    json += "]";
+    {
+        std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+        g_pan_snapshot = std::move(json);
+    }
+}
+
+// Runs until the process ends, or for `seconds` when --panel-demo drives it.
+void PanelThread(float seconds) {
+    MakeThreadDpiAware();
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = PanelWndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));   // IDC_ARROW
+    wc.lpszClassName = L"ClaudeSpeakPanel";
+    RegisterClassExW(&wc);   // harmless if it is already there
+
+    HWINEVENTHOOK hook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, PanelWinEvent, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    std::vector<std::unique_ptr<Panel>> panels;
+    // Only ever installed while the pointer is over a scrollable card, and only
+    // when Windows will not route the wheel to us by itself.
+    const bool wheel_arrives = PanelWheelReachesUs();
+    HHOOK      mouse = nullptr;
+    const DWORD started = GetTickCount();
+    int         until_resolve = 0;   // ticks left before the next resolver pass
+
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        bool registered = false;
+        {
+            std::vector<PanelCmd> batch;
+            {
+                std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
+                batch.swap(g_pan_queue);
+            }
+            registered = !batch.empty();
+            for (PanelCmd& cmd : batch) PanelApply(&panels, std::move(cmd));
+        }
+
+        // Twice a second, and immediately after a POST so a card appears as soon
+        // as it is registered rather than up to half a second later. Skipped
+        // entirely with nothing registered, so an idle daemon does not enumerate
+        // the desktop for a living.
+        if (registered || (!panels.empty() && --until_resolve <= 0)) {
+            PanelResolveAll(&panels);
+            until_resolve = std::max(1, kPanResolveMs / kPanTick);
+        }
+
+        const bool reassert = g_pan_reassert.exchange(false);
+        POINT cursor{};
+        GetCursorPos(&cursor);
+
+        std::unordered_map<HWND, SpeakingAt> speaking;
+        {
+            std::lock_guard<std::mutex> lock(g_speaking_mtx);
+            const DWORD now = GetTickCount();
+            for (auto it = g_speaking.begin(); it != g_speaking.end();) {
+                // Two seconds of silence and the entry goes: the fade below is
+                // over long before that, and a client killed mid-sentence must
+                // not leave a card lit.
+                if (now - it->second.heard > 2000) it = g_speaking.erase(it);
+                else ++it;
+            }
+            speaking = g_speaking;
+        }
+
+        for (size_t i = panels.size(); i-- > 0;) {
+            Panel* p = panels[i].get();
+
+            // Unbound: the session's tab is in the background, or its window is
+            // gone. The registration stays either way — the card is what comes
+            // and goes.
+            if (!p->target || !IsWindow(p->target)) {
+                PanelHide(p, "target gone or unbound");
+                continue;
+            }
+
+            RECT client{};
+            bool visible = IsWindowVisible(p->target) && !IsIconic(p->target) &&
+                           !WindowIsCloaked(p->target) &&
+                           GetClientRect(p->target, &client) &&
+                           client.right - client.left > 40 && client.bottom - client.top > 40;
+            if (!visible) {
+                // Minimized, cloaked to another virtual desktop, or hidden: the
+                // panel goes with it and comes back on restore.
+                PanelHide(p, "target not showing");
+                continue;
+            }
+            if (!PanelEnsureWindow(p)) continue;
+
+            const float scale = PanelScaleFor(p->target);
+            if (std::fabs(scale - p->scale) > 0.001f) {
+                p->scale = scale;
+                p->dirty = true;
+            }
+            // A full list is capped at a fraction of the window it sits in, so it
+            // can never bury the terminal it is meant to annotate.
+            const int max_h =
+                static_cast<int>((client.bottom - client.top) * kPanMaxFrac);
+            if (max_h != p->max_h) {
+                p->max_h = max_h;
+                p->dirty = true;
+            }
+            // A datagram inside the last quarter second means the voice is
+            // still going; anything older is the tail.
+            bool  live  = false;
+            float voice = 0.f;
+            const auto found = speaking.find(p->target);
+            if (found != speaking.end()) {
+                live  = found->second.active &&
+                        GetTickCount() - found->second.heard < 250;
+                voice = found->second.level;
+                if (live && (p->cap_title != found->second.cap_title ||
+                             p->cap != found->second.cap)) {
+                    p->cap_title = found->second.cap_title;
+                    p->cap       = found->second.cap;
+                    p->dirty     = true;
+                }
+            }
+            // A few frames to rise, and a *linear* 1.5 s to fall — an
+            // exponential ease never reaches zero, which is how a card was left
+            // faintly lit for the better part of ten seconds after the voice had
+            // stopped.
+            if (live) p->glow += (1.f - p->glow) * 0.25f;
+            else      p->glow = std::max(0.f, p->glow - kPanTick / 1500.f);
+            p->voice += (voice * (live ? 1.f : 0.f) - p->voice) * 0.35f;
+            if (p->speaking != live) {
+                p->speaking = live;
+                // Coming back: the summary returns to the header line.
+                if (!live) {
+                    p->cap_title.clear();
+                    p->cap.clear();
+                    p->dirty = true;
+                }
+            }
+
+            bool redrawn = false;
+            if (p->dirty || !p->bits) {
+                PanelRender(p);
+                redrawn = true;
+            }
+            if (!p->card.w) continue;
+
+            // Inside the client area, so the card never sits on the tab bar or
+            // hangs off a maximized window onto the taskbar.
+            POINT bottom_right{client.right, client.bottom};
+            POINT top_left{client.left, client.top};
+            ClientToScreen(p->target, &bottom_right);
+            ClientToScreen(p->target, &top_left);
+            g_pan_scale = p->scale;
+            const int inset = PanScale(kPanMargin);
+            POINT pos{bottom_right.x - inset - p->card.margin - p->card.panel_w,
+                      bottom_right.y - inset - p->card.margin - p->card.panel_h};
+            pos.x = std::max(pos.x, top_left.x - p->card.margin);
+            pos.y = std::max(pos.y, top_left.y - p->card.margin);
+            const bool moved = pos.x != p->pos.x || pos.y != p->pos.y;
+            if (moved && g_pan_trace.load()) {
+                std::fprintf(stderr, "speak: panel follows target to %ld,%ld\n",
+                             pos.x, pos.y);
+            }
+            p->pos = pos;
+
+            // Hover from the cursor rather than from WM_MOUSEMOVE: it needs no
+            // WM_MOUSELEAVE tracking, and WindowFromPoint is also the occlusion
+            // test — a row does not light up through whatever is covering it.
+            PanHit hover{};
+            if (WindowFromPoint(cursor) == p->hwnd) hover = PanelHitAt(p, cursor);
+            if (hover != p->hover) {
+                p->hover = hover;
+                PanelCompose(p);
+                redrawn = true;
+            }
+            // The glow moves every frame, which is a recompose and never a
+            // rebuild: no text is re-measured to make a card breathe. The
+            // `glow_drawn` half matters as much — without one last frame after it
+            // reaches zero, the card keeps whatever halo was on the last one
+            // pushed, forever.
+            const bool lit = p->glow > 0.f;
+            if ((lit || p->glow_drawn) && !redrawn) {
+                PanelCompose(p);
+                redrawn = true;
+            }
+            p->glow_drawn = lit;
+
+            const bool first = !p->shown;
+            if (moved || redrawn || first) PanelPush(p);
+            if (first) {
+                ShowWindow(p->hwnd, SW_SHOWNOACTIVATE);
+                p->shown = true;
+                if (g_pan_trace.load()) {
+                    std::fprintf(stderr, "speak: panel shown at %ld,%ld (%dx%d)\n",
+                                 pos.x, pos.y, p->card.panel_w, p->card.panel_h);
+                }
+            }
+            if (reassert || first || moved) {
+                SetWindowPos(p->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+
+        // The hover pass above already knows whether the pointer is on a card
+        // that can scroll; that is exactly the window in which a global hook is
+        // worth having, and no wider.
+        HWND wheel_to = nullptr;
+        if (!wheel_arrives) {
+            for (std::unique_ptr<Panel>& up : panels) {
+                if (up->shown && up->card.scroll_max > 0 &&
+                    up->hover.kind != PanHit::Kind::None) {
+                    wheel_to = up->hwnd;
+                    break;
+                }
+            }
+        }
+        g_pan_wheel_to.store(wheel_to);
+        if (wheel_to && !mouse) {
+            mouse = SetWindowsHookExW(WH_MOUSE_LL, PanelMouseHook,
+                                      GetModuleHandleW(nullptr), 0);
+        } else if (!wheel_to && mouse) {
+            UnhookWindowsHookEx(mouse);
+            mouse = nullptr;
+        }
+
+        if (seconds > 0.f &&
+            GetTickCount() - started >= static_cast<DWORD>(seconds * 1000.f)) {
+            break;
+        }
+        Sleep(kPanTick);
+    }
+
+    if (mouse) UnhookWindowsHookEx(mouse);
+    g_pan_wheel_to.store(nullptr);
+    for (size_t i = panels.size(); i-- > 0;) PanelDestroy(&panels[i]);
+    panels.clear();
+    if (hook) UnhookWinEvent(hook);
+}
+
+std::once_flag g_pan_thread_once;
+
+// Started by the first panel that needs it, so a daemon nobody posts a panel to
+// never creates the thread, the class or the hook.
+void EnsurePanelThread() {
+    std::call_once(g_pan_thread_once, [] {
+        std::thread(PanelThread, 0.f).detach();
+    });
+}
+
+// ── the endpoint ────────────────────────────────────────────────────────────
+
+std::string PanelUrlDecode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '+') { out += ' '; continue; }
+        if (s[i] == '%' && i + 2 < s.size() &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            out += static_cast<char>(std::strtol(s.substr(i + 1, 2).c_str(), nullptr, 16));
+            i += 2;
+            continue;
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+std::string PanelQueryParam(const std::string& path, const std::string& key) {
+    const size_t q = path.find('?');
+    if (q == std::string::npos) return {};
+    std::string query = path.substr(q + 1);
+    size_t      pos   = 0;
+    while (pos <= query.size()) {
+        const size_t amp  = query.find('&', pos);
+        const std::string pair = query.substr(pos, amp == std::string::npos
+                                                       ? std::string::npos : amp - pos);
+        const size_t eq = pair.find('=');
+        if (eq != std::string::npos && pair.substr(0, eq) == key) {
+            return PanelUrlDecode(pair.substr(eq + 1));
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return {};
+}
+
+std::string PanelPathOnly(const std::string& path) {
+    const size_t q = path.find('?');
+    return q == std::string::npos ? path : path.substr(0, q);
+}
+
+// The producer already knows the URL in every case it matters, but a hook that
+// only scraped `owner/repo#N` out of a transcript should not have to build one.
+std::string PanelGuessUrl(const PanelItem& item) {
+    if (item.repo.find('/') == std::string::npos || item.number <= 0) return {};
+    const std::string kind = item.kind == "pr" ? "pull" : "issues";
+    return "https://github.com/" + item.repo + "/" + kind + "/" +
+           std::to_string(item.number);
+}
+
+bool ParsePanelItems(const JsonVal& arr, std::vector<PanelItem>* out, std::string* err) {
+    if (arr.t != JsonVal::T::Arr) {
+        *err = "items must be an array";
+        return false;
+    }
+    for (const JsonVal& v : arr.arr) {
+        if (v.t != JsonVal::T::Obj) {
+            *err = "every item must be an object";
+            return false;
+        }
+        PanelItem item;
+        item.kind   = v.GetStr("kind");
+        item.repo   = v.GetStr("repo");
+        item.url    = v.GetStr("url");
+        item.title  = PanTrim(v.GetStr("title"));
+        item.number = v.GetNum("number", 0);
+        item.status = ParsePanStatus(v.GetStr("status"));
+        if (item.url.empty()) item.url = PanelGuessUrl(item);
+        if (item.Label().empty() && item.title.empty()) continue;   // nothing to draw
+        out->push_back(std::move(item));
+        if (out->size() >= 200) break;   // a list this long is a bug at the producer
+    }
+    return true;
+}
+
+void HandlePanelPost(SOCKET fd, const std::string& body,
+                     void (*respond)(SOCKET, int, const std::string&)) {
+    JsonVal root;
+    if (!JsonParse(body, &root) || root.t != JsonVal::T::Obj) {
+        respond(fd, 400, "{\"ok\":false,\"error\":\"body must be a JSON object\"}");
+        return;
+    }
+    const std::string session = PanTrim(root.GetStr("session"));
+    if (session.empty()) {
+        respond(fd, 400, "{\"ok\":false,\"error\":\"name the session: session\"}");
+        return;
+    }
+
+    std::vector<PanelItem> items;
+    if (const JsonVal* arr = root.Find("items")) {
+        std::string err;
+        if (!ParsePanelItems(*arr, &items, &err)) {
+            respond(fd, 400, "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}");
+            return;
+        }
+    }
+    // Nothing to show is how a session says goodbye — no need to make a hook
+    // remember to DELETE when its last pull request merges.
+    if (items.empty()) {
+        PanelCmd cmd;
+        cmd.remove  = true;
+        cmd.session = session;
+        PanelEnqueue(std::move(cmd));
+        EnsurePanelThread();
+        respond(fd, 200, "{\"ok\":true,\"removed\":true}");
+        return;
+    }
+
+    const std::string title = PanTrim(root.GetStr("title"));
+    if (title.empty()) {
+        respond(fd, 400,
+                "{\"ok\":false,\"error\":\"name the window the panel belongs to: title\"}");
+        return;
+    }
+
+    // Registering always succeeds. Whether the title matches a window *right now*
+    // is a separate question, and one whose answer changes: a Windows Terminal
+    // window shows its active tab's title, so a session sitting in a background
+    // tab matches nothing until its tab comes forward. Failing the POST for that
+    // would throw the payload away over a transient — so this reports it and the
+    // resolver keeps trying.
+    HWND        target = nullptr;
+    std::string err, candidates;
+    ResolvePanelTarget(title, &target, &err, &candidates);
+
+    PanelCmd cmd;
+    cmd.session = session;
+    cmd.title   = title;
+    cmd.summary = PanTrim(root.GetStr("summary"));
+    cmd.items   = std::move(items);
+    PanelEnqueue(std::move(cmd));
+    EnsurePanelThread();
+
+    std::string out = "{\"ok\":true,\"hwnd\":";
+    if (target) {
+        out += std::to_string(reinterpret_cast<uintptr_t>(target)) + ",\"resolved\":true}";
+    } else {
+        out += "null,\"resolved\":false,\"error\":\"" + JsonEscape(err) + "\"";
+        if (!candidates.empty()) out += ",\"candidates\":" + candidates;
+        out += "}";
+    }
+    respond(fd, 200, out);
+}
+
+void HandlePanelList(SOCKET fd, void (*respond)(SOCKET, int, const std::string&)) {
+    std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+    respond(fd, 200, g_pan_snapshot);
+}
+
+void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& body,
+                       void (*respond)(SOCKET, int, const std::string&)) {
+    std::string session = PanelQueryParam(path, "session");
+    if (session.empty() && !body.empty()) {
+        JsonVal root;
+        if (JsonParse(body, &root)) session = root.GetStr("session");
+    }
+    session = PanTrim(session);
+    if (session.empty()) {
+        respond(fd, 400, "{\"ok\":false,\"error\":\"which panel? DELETE /panel?session=<id>\"}");
+        return;
+    }
+    PanelCmd cmd;
+    cmd.remove  = true;
+    cmd.session = session;
+    PanelEnqueue(std::move(cmd));
+    EnsurePanelThread();
+    respond(fd, 200, "{\"ok\":true,\"removed\":true}");
+}
+
+// ── previewing and demoing it ───────────────────────────────────────────────
+// The overlays are invisible to GDI screen capture, so the only way to review
+// how one looks is to render it. Sample data on purpose covers every badge, a
+// path row, a title long enough to be cut, and one item too many so the "+N
+// more" row appears.
+
+const char* kPanSampleSummary = "i47 - wiring the attention panel into the daemon";
+constexpr size_t kPanSampleRows = 8;   // the sample list, so a preview can point
+                                       // at its last row
+
+std::vector<PanelItem> SamplePanelItems() {
+    const auto make = [](const char* kind, const char* repo, long number,
+                         const char* title, PanStatus status, const char* url = "") {
+        PanelItem it;
+        it.kind   = kind;
+        it.repo   = repo;
+        it.number = number;
+        it.title  = title;
+        it.status = status;
+        it.url    = *url ? std::string(url) : PanelGuessUrl(it);
+        return it;
+    };
+    return {
+        make("pr", "optidatacloud/laravel-opticloud", 1375,
+             "feat: calendar event reminder as a bottom-right toast",
+             PanStatus::ChecksFailing),
+        make("pr", "optidatacloud/optiwork-api-gateway", 1758,
+             "fix: quantity step on the price table", PanStatus::Approved),
+        make("issue", "optidatacloud/optiwork-ai", 377,
+             "MCP P14: tool surface parity with the chat tools",
+             PanStatus::ChangesRequested),
+        make("issue", "optidatacloud/laravel-opticloud", 1372,
+             "Feature highlights popover regressions", PanStatus::Open),
+        make("pr", "optidatacloud/o-cli", 101, "feat: fmt laravel v2",
+             PanStatus::Merged),
+        make("path", "", 0, "1372-toast", PanStatus::Unknown,
+             "C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast"),
+        // Past the sixth: these two are what the "+N more" row stands for.
+        make("pr", "dovyski/claude-speak", 12, "feat: the attention panel",
+             PanStatus::Draft),
+        make("issue", "optidatacloud/optiwork-infra", 27,
+             "bastion runbook", PanStatus::Closed),
+    };
+}
+
+void PanelPreview(const std::string& prefix) {
+    // Per-monitor aware first, so the preview is drawn at the scale the screen
+    // actually uses rather than at a virtualized 96 dpi — the point is to review
+    // what will be on the glass.
+    MakeThreadDpiAware();
+    const float scale = PanelScaleFor(nullptr);
+    const std::vector<PanelItem> items = SamplePanelItems();
+    struct Shot {
+        const char* suffix;
+        const char* tab;
+        bool        collapsed;
+        bool        all;
+        int         hover;    // row to light up, -3 for none
+        float       glow;     // the speaking halo, 0..1
+        float       voice;    // the amplitude driving it
+        const char* cap_title;
+        const char* cap;
+    };
+    const Shot shots[] = {
+        {"-expanded.png",  "all", false, false, -3, 0.f, 0.f, "", ""},
+        {"-hover.png",     "all", false, false, 1,  0.f, 0.f, "", ""},
+        {"-collapsed.png", "all", true,  false, -3, 0.f, 0.f, "", ""},
+        // Everything, with the way back on the last row — and that row hovered,
+        // since being clickable is the whole point of it.
+        {"-all.png",       "all", false, true,  static_cast<int>(kPanSampleRows),
+         0.f, 0.f, "", ""},
+        {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", ""},
+        // Mid-utterance: lit, and the header carrying what is being said.
+        {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
+         "laravel-opticloud #1375", "checks are green, ready to merge"},
+    };
+    for (const Shot& shot : shots) {
+        PanelCard card;
+        int       scroll = 0;
+        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, shot.tab,
+                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
+        std::vector<uint32_t> px(static_cast<size_t>(card.w) * card.h);
+        const RECT* hover = nullptr;
+        if (shot.hover >= 0 && shot.hover < static_cast<int>(card.rows.size())) {
+            hover = &card.rows[shot.hover].hit;
+        }
+        ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
+        // Timed with the geometry warm: the first number is what a content change
+        // costs, the second what a hover or a glow frame costs.
+        LARGE_INTEGER f{}, a{}, b{}, c{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&a);
+        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, shot.tab,
+                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
+        QueryPerformanceCounter(&b);
+        ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
+        QueryPerformanceCounter(&c);
+        const std::string path = prefix + shot.suffix;
+        WritePng(path, px, card.w, card.h);
+        std::printf("%s (%dx%d)  build %.2f ms, compose %.2f ms\n",
+                    path.c_str(), card.w, card.h,
+                    1000.0 * (b.QuadPart - a.QuadPart) / f.QuadPart,
+                    1000.0 * (c.QuadPart - b.QuadPart) / f.QuadPart);
+    }
+}
+
+// A throwaway panel against a real window, with no daemon and no producer: the
+// only way to check that it follows a move, hides on minimize and opens a row.
+int PanelDemo(const std::string& title, float seconds) {
+    MakeThreadDpiAware();
+    if (PanTrim(title).empty()) {
+        std::fprintf(stderr, "speak: --panel-demo needs --title\n");
+        return 2;
+    }
+    // Resolved here only so the run says what it started on; the demo goes
+    // through the same resolver as a real panel, so a title that matches nothing
+    // yet is not an error — retitle the window and the card turns up.
+    HWND        target = nullptr;
+    std::string err, candidates;
+    if (ResolvePanelTarget(title, &target, &err, &candidates)) {
+        wchar_t got[512]{};
+        GetWindowTextW(target, got, 512);
+        std::printf("panel demo on hwnd %llu (\"%s\") for %.0f s\n",
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target)),
+                    Utf8(got).c_str(), seconds);
+    } else {
+        std::printf("panel demo waiting for a window matching \"%s\" (%s), %.0f s\n",
+                    title.c_str(), err.c_str(), seconds);
+    }
+
+    PanelCmd cmd;
+    cmd.session = "panel-demo";
+    cmd.title   = title;
+    cmd.summary = kPanSampleSummary;
+    cmd.items   = SamplePanelItems();
+    PanelEnqueue(std::move(cmd));
+    g_pan_trace.store(true);
+    PanelThread(seconds);   // inline: this call *is* the demo
+    return 0;
+}
+
 
 // ── the pointing endpoint ───────────────────────────────────────────────────
 // Upstream's TTSServer has its routes hardcoded and lives in a file CMake
@@ -2106,9 +4856,26 @@ void HandlePointRequest(SOCKET fd) {
         PointHttpRespond(fd, 200, TargetsJson(EnumTargets()));
         return;
     }
+    // The attention panel. Unlike /point this returns as soon as the panel is
+    // queued: it is a thing that stays on screen, not a gesture to wait out.
+    if (req.method == "GET" && PanelPathOnly(req.path) == "/panels") {
+        HandlePanelList(fd, PointHttpRespond);
+        return;
+    }
+    if (PanelPathOnly(req.path) == "/panel") {
+        if (req.method == "POST") {
+            HandlePanelPost(fd, req.body, PointHttpRespond);
+        } else if (req.method == "DELETE") {
+            HandlePanelDelete(fd, req.path, req.body, PointHttpRespond);
+        } else {
+            PointHttpRespond(fd, 404, "{\"ok\":false,\"error\":\"try POST /panel or "
+                                      "DELETE /panel?session=<id>\"}");
+        }
+        return;
+    }
     if (req.method != "POST" || req.path != "/point") {
-        PointHttpRespond(fd, 404,
-                         "{\"ok\":false,\"error\":\"try GET /targets or POST /point\"}");
+        PointHttpRespond(fd, 404, "{\"ok\":false,\"error\":\"try GET /targets, "
+                                  "GET /panels, POST /point or POST /panel\"}");
         return;
     }
 
@@ -2209,6 +4976,9 @@ struct Options {
     std::string dump_orb;       // render one orb frame to this BMP and exit
     std::string orb_preview;    // render a strip of orb frames to <prefix>N.bmp
     std::string point_preview;  // render a strip of pointer frames and exit
+    std::string panel_preview;  // render the attention panel to <prefix>-*.png
+    bool   panel_demo  = false;   // a throwaway panel on --title, for review
+    float  panel_secs  = 20.f;    // how long --panel-demo lasts
     bool   point        = false;   // point at a window (before or instead of speaking)
     bool   list_targets = false;
     bool   point_server = true;    // daemon: serve the pointing endpoint
@@ -2304,6 +5074,9 @@ int RunDaemon(const Options& opt) {
         if (opt.point_server) {
             const int point_port = opt.point_port ? opt.point_port : opt.port + 1;
             std::thread(RunPointServer, point_port).detach();
+            // And the speaking beacon on the one after that: UDP, so a 60 Hz
+            // stream of level updates cannot queue behind a /panel POST.
+            std::thread(RunBeaconServer, point_port + 1).detach();
         }
 
         // Keepalive: an idle daemon gets slow again (CPU clocks down, its working
@@ -2397,7 +5170,8 @@ void Usage() {
         "  speak --serve [--port N]      run the resident daemon (fast speech)\n"
         "  speak --status | --stop       inspect or stop the daemon\n"
         "  speak --point [--title T]     ring out a window so a human can find it\n"
-        "  speak --list-targets          the windows --title can match, as JSON\n\n"
+        "  speak --list-targets          the windows --title can match, as JSON\n"
+        "  speak --panel-demo --title T  park a sample attention panel in it\n\n"
         "  Click the orb to pause while speaking, click again to resume.\n"
         "  Click the caption's × to dismiss it.\n\n"
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
@@ -2434,6 +5208,11 @@ void Usage() {
         "  --size <px>           pointer square size (default 320)\n"
         "                        (--point-* also works for these four)\n"
         "  --point-preview <pfx> render a strip of pointer frames and exit\n"
+        "  --panel-preview <pfx> render the attention panel to <pfx>-expanded.png,\n"
+        "                        -hover.png and -collapsed.png, and exit\n"
+        "  --panel-demo          park a sample panel in the bottom-right of the\n"
+        "                        --title window, with no daemon and no producer\n"
+        "  --panel-seconds <s>   how long --panel-demo lasts (default 20)\n"
         "  --list-targets        list pointable windows as JSON and exit\n"
         "  --point-port <n>      daemon: pointing endpoint port (default port+1)\n"
         "  --no-point-server     daemon: do not serve the pointing endpoint\n"
@@ -2534,6 +5313,11 @@ int main() {
         else if (a == "--size" || a == "--point-size")
             g_point_size = std::max(80, std::atoi(next(a.c_str()).c_str()));
         else if (a == "--point-preview") opt.point_preview = next("--point-preview");
+        else if (a == "--panel-preview") opt.panel_preview = next("--panel-preview");
+        else if (a == "--panel-demo")    opt.panel_demo = true;
+        else if (a == "--panel-seconds")
+            opt.panel_secs = std::max(1.f,
+                std::strtof(next("--panel-seconds").c_str(), nullptr));
         else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
         else if (a == "--no-point-server") opt.point_server = false;
         else if (a == "--caption")       g_cap_text  = next("--caption");
@@ -2634,6 +5418,11 @@ int main() {
                     opt.point_preview.c_str(), kFrames - 1);
         return 0;
     }
+    if (!opt.panel_preview.empty()) {
+        PanelPreview(opt.panel_preview);
+        return 0;
+    }
+    if (opt.panel_demo) return PanelDemo(opt.point_req.title, opt.panel_secs);
     if (opt.list_targets) {
         MakeThreadDpiAware();
         std::printf("%s\n", TargetsJson(EnumTargets()).c_str());
@@ -2682,6 +5471,16 @@ int main() {
             return 1;
         }
         source = std::make_unique<EngineSource>(engine.get(), opt.text, opt.voice);
+    }
+
+    // Aimed at a window? Then a panel parked in that window's corner should
+    // glow with this utterance. The handle has to be known before the first
+    // sample, so it is resolved here rather than at the pointing call afterwards
+    // — and only the handle is needed, so no DPI-aware thread is involved.
+    if (opt.point || opt.point_req.hwnd || !opt.point_req.title.empty()) {
+        g_beacon_port = (opt.point_port ? opt.point_port : opt.port + 1) + 1;
+        g_beacon_hwnd.store(
+            reinterpret_cast<uintptr_t>(ResolveTargetHwnd(opt.point_req)));
     }
 
     std::thread orb;
