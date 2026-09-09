@@ -14,6 +14,12 @@ This skill lives in that repo under `skill/speak/`; every path below assumes
 the checkout is at `C:\Dev\www\claude-speak` — adjust them if it is cloned
 elsewhere.
 
+The repo's own docs go deeper than this skill needs to: `docs/references/speech.md`
+(engine, voices, daemon), `docs/references/overlay.md` (orb and captions),
+`docs/references/pointing.md` (rings and targets) and
+`docs/references/attention-panel.md` (the per-terminal card `--session` resolves
+against).
+
 ## Speaking
 
 ```bash
@@ -252,9 +258,9 @@ daemon cannot tell where the call came from. It replies when the animation ends
 
 ## Rules
 
-- **Subagents do not speak.** Only the top-level session the user is talking to
-  calls `speak.exe`; a subagent reports its result as text and lets its
-  orchestrator say it. Holding a session id changes nothing here.
+- **Subagents do not speak or point.** Only the top-level session the user is
+  talking to calls `speak.exe` at all; a subagent reports its result as text and
+  lets its orchestrator say it. Holding a session id changes nothing here.
 - **One call per utterance.** Gather everything you want to say into a single
   string and make one call. On a cold call especially, splitting a summary into
   several calls pays the model load several times.
