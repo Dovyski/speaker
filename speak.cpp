@@ -2936,6 +2936,7 @@ constexpr int kPanMaxRows   = 6;    // past this, the rest collapse into "+N mor
 constexpr int kPanTabPx     = 12;   // the tab strip's type
 constexpr int kPanTabPadX   = 8;    // inside a tab, either side of its label
 constexpr int kPanTabGap    = 4;    // between tabs
+constexpr int kPanTabTally  = 5;    // between a tab's label and its count
 constexpr int kPanTabPadY   = 6;
 constexpr int kPanTabRule   = 2;    // the active tab's accent, GitHub's weight
 constexpr int kPanScrollBar = 3;    // the scroll indicator, at 96 dpi
@@ -3220,9 +3221,13 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // Which tabs exist for this list, and which of them is showing. An empty
         // tab is not offered, and a selection whose tab has emptied falls back to
         // `All` without being forgotten — the items may well come back.
+        // The label and its count are two runs, not one string: the count is a
+        // quantity rather than part of the name, and setting it in the secondary
+        // ink at regular weight lets the eye read the strip as three names with
+        // numbers beside them instead of six words.
         struct TabBuild {
             int      index;
-            TextMask label;
+            TextMask label, tally;
             int      w = 0;
             size_t   count = 0;
         };
@@ -3234,18 +3239,23 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             TabBuild t;
             t.index = i;
             t.count = n;
-            std::string label = kPanTabs[i].label;
-            if (kPanTabs[i].counted) label += " (" + std::to_string(n) + ")";
-            t.label = RenderText(Wide(label), PanScale(kPanTabPx), true, inner, 1,
-                                 DT_SINGLELINE | DT_END_ELLIPSIS);
-            t.w     = t.label.w + 2 * PanScale(kPanTabPadX);
+            t.label = RenderText(Wide(kPanTabs[i].label), PanScale(kPanTabPx), true,
+                                 inner, 1, DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (kPanTabs[i].counted) {
+                t.tally = RenderText(Wide("(" + std::to_string(n) + ")"),
+                                     PanScale(kPanTabPx), false, inner, 1,
+                                     DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+            t.w = t.label.w + (t.tally.w ? PanScale(kPanTabTally) + t.tally.w : 0) +
+                  2 * PanScale(kPanTabPadX);
             if (tab == kPanTabs[i].id) active = static_cast<int>(tabs.size());
             tabs.push_back(std::move(t));
         }
         if (tabs.size() < 2) tabs.clear();   // only `All`: no strip worth the line
         int tab_h = 0;
         for (const TabBuild& t : tabs) {
-            tab_h = std::max(tab_h, t.label.h + 2 * PanScale(kPanTabPadY));
+            tab_h = std::max(tab_h, std::max(t.label.h, t.tally.h) +
+                                        2 * PanScale(kPanTabPadY));
         }
         const PanTab& filter = kPanTabs[tabs.empty() ? 0 : tabs[active].index];
 
@@ -3376,8 +3386,16 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
                 const RECT hit{tx_at, y, tx_at + t.w, y + tab_h};
                 out->tabs.push_back(PanelCard::Tab{hit, t.index});
                 const bool on = (static_cast<int>(i) == active);
-                StampMask(on ? &out->ink : &out->dim, out->w, out->h, t.label,
-                          tx_at + PanScale(kPanTabPadX), y + (tab_h - t.label.h) / 2);
+                const int  lx = tx_at + PanScale(kPanTabPadX);
+                StampMask(on ? &out->ink : &out->dim, out->w, out->h, t.label, lx,
+                          y + (tab_h - t.label.h) / 2);
+                // Always secondary, always regular — the count reads the same on
+                // the tab you are on as on the ones you are not.
+                if (t.tally.w) {
+                    StampMask(&out->dim, out->w, out->h, t.tally,
+                              lx + t.label.w + PanScale(kPanTabTally),
+                              y + (tab_h - t.tally.h) / 2);
+                }
                 if (on) {
                     PanFillRect(&out->deco, out->w, out->h,
                                 RECT{tx_at, y + tab_h - PanScale(kPanTabRule),
