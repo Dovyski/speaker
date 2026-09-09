@@ -777,6 +777,25 @@ a UNC path, and nothing else.
 - Everything answers immediately. Unlike `/point`, this is a thing that stays on
   screen rather than a gesture to wait out.
 
+### Where the statuses come from
+
+A row's state — approved, checks failing, merged — is `gh`'s to answer, and
+polling GitHub is a script's job rather than a C++ one, so it lives in
+[`hooks/i47-enrich.ps1`](hooks/i47-enrich.ps1). The **daemon runs it**: every 60 s
+(`--enricher-interval`), only while at least one panel is registered, started
+with `CREATE_NO_WINDOW` and stdio on `NUL`, one run at a time, killed if it
+outlives two minutes, each start and exit code in the daemon's log.
+
+It was a Windows scheduled task before, and that is worth naming as a trap: a
+task runs `pwsh` in the interactive session, where `-WindowStyle Hidden` hides a
+console *after* it has appeared. Once a minute, all day, a window flashed on
+screen. `CREATE_NO_WINDOW` never creates the console in the first place.
+
+`--enricher <path>` points somewhere else (the default is
+`hooks\i47-enrich.ps1` beside the executable) and `--no-enricher` turns it off.
+Running the script by hand still works and is still the way to debug it —
+`-Once`, `-Session <id>`, `-Verbose`.
+
 ### Seeing it without a daemon
 
 ```bat

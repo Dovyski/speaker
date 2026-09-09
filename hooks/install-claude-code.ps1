@@ -8,14 +8,18 @@ What it does, idempotently:
      for i47-attention.ps1 into <ClaudeDir>\settings.json and into every
      -ExtraClaudeDirs settings.json that exists, without touching any other
      hook and without duplicating an entry it already installed
-  4. registers the `cto-i47-enrich` scheduled task (every minute) unless -SkipTask
+  4. unregisters the legacy `cto-i47-enrich` scheduled task if it is still
+     there: the enricher is run by the speak.exe daemon now (CREATE_NO_WINDOW,
+     once a minute, only while a panel is registered). The task ran pwsh in the
+     interactive session, where -WindowStyle Hidden hides the console only after
+     it has appeared - so it flashed a window on screen every minute.
 
 Nothing here starts the daemon or restarts a Claude session; see the checklist
 it prints, and docs\references\claude-code-integration.md.
 
 Usage:
   pwsh -NoProfile -File hooks\install-claude-code.ps1
-  pwsh -NoProfile -File hooks\install-claude-code.ps1 -SkipTask -WhatIf
+  pwsh -NoProfile -File hooks\install-claude-code.ps1 -RemoveLegacyTask -WhatIf
   pwsh -NoProfile -File hooks\install-claude-code.ps1 -ClaudeDir D:\tmp\.claude -ExtraClaudeDirs @()
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -31,6 +35,11 @@ param(
     # The speak.exe daemon's speech port. The panel listener is DaemonPort + 1.
     [int]$DaemonPort = 8123,
 
+    # Unregister the old scheduled task. This happens anyway when the task
+    # exists; the switch is for saying so explicitly, or for a -WhatIf run.
+    [switch]$RemoveLegacyTask,
+
+    # Accepted and ignored: there is no task to skip any more.
     [switch]$SkipTask
 )
 
@@ -189,36 +198,36 @@ foreach ($dir in $targets) {
     [System.IO.File]::WriteAllText($file, $json, $Utf8NoBom)
 }
 
-# --- 4. scheduled task ------------------------------------------------------
+# --- 4. the legacy scheduled task -------------------------------------------
 
-if ($SkipTask) {
-    Note "skipped the scheduled task (-SkipTask)"
-    Todo "register the enricher yourself, or re-run without -SkipTask"
-} else {
-    $pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) { throw 'pwsh is not on PATH; PowerShell 7 is required' }
-    $action  = New-ScheduledTaskAction -Execute $pwshExe `
-                 -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $Enricher)
-    # -Once + -RepetitionInterval with no duration = repeat forever
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
-                 -RepetitionInterval (New-TimeSpan -Minutes 1)
-    $set     = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
-                 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                 -MultipleInstances IgnoreNew `
-                 -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
-    $prin    = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-                 -LogonType Interactive -RunLevel Limited
-    if ($PSCmdlet.ShouldProcess($TaskName, 'register scheduled task')) {
-        # -Force rewrites an existing definition, so re-running is safe
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $set -Principal $prin -Force | Out-Null
+# The daemon runs the enricher itself now. Nothing is registered here; what is
+# left to do is take away what used to be.
+if ($SkipTask) { Note '-SkipTask accepted and ignored: no task is registered any more' }
+
+$existing = $null
+try { $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch {}
+if ($existing) {
+    if ($PSCmdlet.ShouldProcess($TaskName, 'unregister the legacy scheduled task')) {
+        try {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            Note "unregistered the legacy scheduled task $TaskName (the daemon runs the enricher now)"
+        } catch {
+            Note "could not unregister $TaskName : $($_.Exception.Message)"
+            Todo "remove the scheduled task $TaskName by hand (it flashes a console every minute)"
+        }
+    } else {
+        Note "would unregister the legacy scheduled task $TaskName"
     }
-    Note "registered the scheduled task $TaskName (every minute, hidden, 2 min limit)"
+} elseif ($RemoveLegacyTask) {
+    Note "no legacy scheduled task $TaskName to remove"
+} else {
+    Note "no legacy scheduled task $TaskName (the daemon runs the enricher)"
 }
 
 # --- 5. checklist -----------------------------------------------------------
 
 Todo "start the daemon detached, e.g. Start-Process -FilePath <repo>\speak.exe -ArgumentList '--serve','--port',$DaemonPort -WindowStyle Hidden"
+Todo "the daemon runs $Enricher itself every 60 s while a panel is registered; it looks for hooks\i47-enrich.ps1 beside speak.exe (--enricher to point elsewhere)"
 Todo "open (or restart) a Claude Code session: hooks are read at session start"
 Todo "verify: curl http://127.0.0.1:$panelPort/panels, and tail $RealAttention\producer.log"
 

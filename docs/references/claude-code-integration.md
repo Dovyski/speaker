@@ -40,7 +40,7 @@ Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>
         ├─ rewrites the session json (adds `summary`, `question` rows)
         └─ re-POSTs
 
-   hooks/i47-enrich.ps1  — scheduled task `cto-i47-enrich`, every minute
+   hooks/i47-enrich.ps1  — run by the daemon, every 60 s while a panel exists
         ├─ every session json touched in the last 48 h
         ├─ `gh pr view` / `gh issue view --json …`, cached in status-cache.json
         ├─ writes back `status` and empty `title`s
@@ -253,15 +253,16 @@ pwsh -NoProfile -File hooks\install-claude-code.ps1
 
 It copies `hooks\*.ps1` into `<ClaudeDir>\hooks\`, creates
 `<ClaudeDir>\attention\`, merges the two hook entries into every settings file it
-was pointed at, registers the scheduled task, and prints what it did and what is
-left to do by hand.
+was pointed at, removes the legacy scheduled task if it is still registered, and
+prints what it did and what is left to do by hand.
 
 | Parameter | Default | |
 |---|---|---|
 | `-ClaudeDir` | `$env:USERPROFILE\.claude` | where the scripts are installed and the primary `settings.json` |
 | `-ExtraClaudeDirs` | `@("$env:USERPROFILE\.claude-max")` | further config dirs whose `settings.json` gets the same entries; a dir that does not exist is skipped, never created |
 | `-DaemonPort` | `8123` | the speech port; the panel listener is this **+ 1**, and a non-default value is patched into the copied scripts' endpoint |
-| `-SkipTask` | — | do not touch the scheduled task |
+| `-RemoveLegacyTask` | — | say explicitly that the old `cto-i47-enrich` task should go; it goes anyway when it exists, so this is mostly for a `-WhatIf` run |
+| `-SkipTask` | — | accepted and ignored: there is no task to register any more |
 
 It also honours `-WhatIf`. Note that `-ExtraClaudeDirs @()` needs
 `pwsh -NoProfile -Command "& '…\install-claude-code.ps1' -ExtraClaudeDirs @()"`;
@@ -294,10 +295,34 @@ matcher's list mention `i47-attention.ps1`", so a hand-edited command line is
 recognised too. **`settings.json` is read at session start**, so an already-open
 session will not pick the hooks up.
 
-The scheduled task is `cto-i47-enrich`: `pwsh -NoProfile -WindowStyle Hidden
--ExecutionPolicy Bypass -File <ClaudeDir>\hooks\i47-enrich.ps1`, one trigger
-repeating every minute forever, hidden, interactive logon, `Limited` run level,
-2-minute execution limit, `IgnoreNew` so a slow pass is never overlapped.
+### The enricher is the daemon's job, not the scheduler's
+
+It used to be a scheduled task, `cto-i47-enrich`, firing every minute. That is
+precisely what a scheduled task is bad at: it runs `pwsh` **in the interactive
+session**, and `-WindowStyle Hidden` hides a console window only *after* it has
+appeared. Once a minute, all day, a window flashed on screen.
+
+So the daemon runs it. `speak.exe --serve` starts
+`pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <script> -Once`
+with `CREATE_NO_WINDOW` — which never allocates a console at all, rather than
+allocating one and hiding it — and stdio pointed at `NUL`. It runs only while at
+least one panel is registered (there is no status worth fetching for a panel
+nobody is looking at), a tick with a run still alive is a skipped tick, and a run
+that outlives 120 s is killed: a stale status beats a stuck poller. Each start
+and exit code goes to the daemon's stderr with the rest of its log.
+
+| Flag | Default | |
+|---|---|---|
+| `--enricher <path>` | `<exe dir>\hooks\i47-enrich.ps1` | the script to run; if it is not there the daemon says so once and carries on |
+| `--enricher-interval <s>` | `60` | seconds between runs, measured from the last start |
+| `--no-enricher` | — | never run it |
+
+`gh` does not flash either: the enricher starts it through
+`ProcessStartInfo` with `UseShellExecute = $false` and `CreateNoWindow = $true`,
+so the child inherits no console from a parent that has none.
+
+The installer unregisters `cto-i47-enrich` when it finds it. If you are upgrading
+by hand: `Unregister-ScheduledTask -TaskName cto-i47-enrich -Confirm:$false`.
 Registration uses `-Force`, so re-running rewrites the definition rather than
 failing.
 
@@ -398,5 +423,5 @@ using the chain outside Fernando's machine.
 | `i47-attention.ps1`, `i47-enrich.ps1`, `i47-haiku.ps1` | `$Endpoint = 'http://127.0.0.1:8124/panel'`; the installer rewrites it for a non-default `-DaemonPort` |
 | `i47-terminal-title.ps1` | `$SpeakExe = 'C:\Dev\www\claude-speak\speak.exe'` |
 | `i47-haiku.ps1` | `$ApiModel = 'claude-haiku-4-5-20251001'` (API fallback only), and prompts that name the user |
-| `install-claude-code.ps1` | the task name `cto-i47-enrich`, and `.claude-max` as the extra config dir |
+| `install-claude-code.ps1` | the legacy task name `cto-i47-enrich` it removes, and `.claude-max` as the extra config dir |
 | all | `~/.claude/attention` as the state directory, resolved from `$env:USERPROFILE` |
