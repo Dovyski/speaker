@@ -501,7 +501,7 @@ must not also scroll the terminal behind it.
 
 ### Tabs
 
-`All` | `Issues (N)` | `PRs (N)`, GitHub's underlined nav: the active tab in
+`All` | `Issues (N)` | `PRs (N)` | `Pending (N)`, GitHub's underlined nav: the active tab in
 `#d1d7e0` over a 2 px `#f78166` accent that replaces the hairline under itself,
 the others in `#9198a1`. Clicking one filters the rows — the six-row cap, the
 `+N more` row, `show less` and the scrolling all apply to the filtered list.
@@ -519,12 +519,28 @@ no strip at all: the panel is six rows in the corner of a terminal, and furnitur
 has to earn its line. A selection whose tab has emptied falls back to showing
 `All` without being forgotten, since the items may well come back.
 
-The tab set is a table of `{id, label, predicate}`, because the interesting tab
-is the one that does not exist yet — `Pending (N)` for questions an agent is
-waiting on an answer to is one row added and nothing else. Which is also why an
-item of an **unknown `kind`** is drawn rather than refused: with a number it gets
-the issue glyph, without one the folder, and it lands in `All`. A producer
-running ahead of this binary degrades to a plausible row instead of a 400.
+The tab set is a table of `{id, label, predicate}`, which is how `Pending`
+arrived: one row added. It is also why an item of an **unknown `kind`** is drawn
+rather than refused — with a number it gets the issue glyph, without one the
+folder, and it lands in `All`. A producer running ahead of this binary degrades
+to a plausible row instead of a 400.
+
+### Pending: questions waiting on you
+
+`kind: "question"` is a row with no repo, no number and no URL — just the
+question an agent is waiting for an answer to, in `title`. It gets the
+`question` Octicon in amber, the question text at full row width in the primary
+ink but *not* bold (a handle is bold; a sentence is not), and it sorts to the
+**top of `All`**, above everything else on the list. Clicking it copies the text
+to the clipboard, which is what you want when the answer is "paste this into the
+other window" — there is nowhere else for it to go, since the terminal asking is
+the one you are already looking at.
+
+Questions outrank every status in the collapsed pill: while any is open the pill
+reads `N pending` with the amber `question` glyph rather than `N items` and the
+worst badge. A red pill means a machine is unhappy about something; an amber one
+means a machine is waiting for *you*, and only the second will not resolve
+itself.
 
 Each row is marked with **GitHub's own icon for its type**, tinted with GitHub's
 own colour for its state — two pieces of information in the space a status dot
@@ -539,7 +555,8 @@ took, and the same glyph the row's page shows:
 | closed issue | `issue-closed` | purple `#8256d0` — GitHub's "completed" |
 | closed pull request | `git-pull-request-closed` | red `#c93c37` |
 | `unknown` state | its type's icon | grey `#768390` |
-| a path, or any numberless item | `file-directory` | grey `#768390` |
+| `kind: question` | `question` | amber `#c69026` (grey once closed) |
+| a path, or any other numberless item | `file-directory` | grey `#768390` |
 | any other `kind`, with a number | `issue-opened` | by state, as above |
 
 `approved` is left plain green rather than given a tick overlay: at 14 px a
@@ -582,10 +599,14 @@ finding the header.
 
 When an utterance is aimed at a window — `speak.exe --title "…" "text"`, or
 `--hwnd` — the card parked in that window's corner **glows with the voice**: an
-ember halo off its own outline, its hairline lit, intensity riding the same
+soft white halo off its own outline, its hairline lit, intensity riding the same
 amplitude envelope the orb is drawn from, so the ring in the corner of the screen
 and the card in the corner of the terminal move together rather than merely
-coinciding. It lights with the first sample and lets go over a second and a half
+coinciding. White, deliberately, and not the ring's ember: on the card that read
+as a warning rather than as a voice, and the panel already spends red, amber and
+green on what its rows *mean*. (`#f0f3f6` rather than pure white, which blooms
+harder than it looks against a pale terminal.) It lights with the first sample
+and lets go over a second and a half
 — linearly, so the halo actually reaches zero rather than merely approaching it,
 with one last frame drawn when it does. The collapsed pill glows the same way, and a card that is hidden (its
 terminal tab in the background) does not glow at all — there is nothing there to
@@ -715,8 +736,8 @@ listener as `/point` — the next port, `8124` by default.
 |---|---|
 | `session` | required; the key a registration is remembered and deleted by |
 | `title` | required; the window title to look for, matched as above |
-| `summary` | optional; the header line, ellipsized. Falls back to `N items` |
-| `items[]` | `kind` (`pr`, `issue`, `path`), `repo`, `number`, `url`, `title`, `status` |
+| `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items` |
+| `items[]` | `kind` (`pr`, `issue`, `path`, `question`), `repo`, `number`, `url`, `title`, `status` |
 
 `url` is optional for a `pr` or an `issue` with a `repo` and a `number` — the
 daemon builds the GitHub URL — and it is the only thing a row click uses, so it
@@ -750,8 +771,9 @@ speak.exe --panel-demo --title "reviewer worker"    rem a real panel for 20 s
 
 `--panel-preview <prefix>` writes `<prefix>-expanded.png`, `-hover.png`,
 `-collapsed.png`, `-all.png` (everything, with `show less`), `-tabs.png` (the
-`PRs` tab active) and `-speaking.png` (mid-utterance, lit, the header carrying the
-caption) at the screen's own scale, from sample data covering every icon
+`PRs` tab active), `-pending.png` (two questions) and `-speaking.png`
+(mid-utterance, lit, the header carrying the caption) at the screen's own scale,
+from sample data covering every icon
 and colour, a path row, a title long enough to be cut and two items too many so
 the `+N more` row appears. Layered
 windows are invisible to GDI screen capture, so rendering them is the only way to

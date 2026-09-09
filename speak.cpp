@@ -2859,6 +2859,8 @@ constexpr const char* kOctPullRequestClosed =
     "M2.5 3.25a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0ZM3.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm9.5 0a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z";
 constexpr const char* kOctMerge =
     "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z";
+constexpr const char* kOctQuestion =
+    "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.92 6.085h.001a.749.749 0 1 1-1.342-.67c.169-.339.436-.701.849-.977C6.845 4.16 7.369 4 8 4a2.756 2.756 0 0 1 1.637.525c.503.377.863.965.863 1.725 0 .448-.115.83-.329 1.15-.205.307-.47.513-.692.662-.109.072-.22.138-.313.195l-.006.004a6.24 6.24 0 0 0-.26.16.952.952 0 0 0-.276.245.75.75 0 0 1-1.248-.832c.184-.264.42-.489.692-.661.103-.067.207-.132.313-.195l.007-.004c.1-.061.182-.11.258-.161a.969.969 0 0 0 .277-.245C8.96 6.514 9 6.427 9 6.25a.612.612 0 0 0-.262-.525A1.27 1.27 0 0 0 8 5.5c-.369 0-.595.09-.74.187a1.01 1.01 0 0 0-.34.398ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z";
 constexpr const char* kOctFileDirectory =
     "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
     "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
@@ -2868,7 +2870,16 @@ struct PanGlyph {
     Rgb         colour;
 };
 
+bool PanelIsQuestion(const PanelItem& item) { return item.kind == "question"; }
+
 PanGlyph PanelGlyphFor(const PanelItem& item) {
+    // A question an agent is waiting on is the one row that is about *you*, so it
+    // gets the amber the review states use for "your move" — and keeps it
+    // whatever else the status says, until the status says it is closed.
+    if (PanelIsQuestion(item)) {
+        return {kOctQuestion,
+                item.status == PanStatus::Closed ? kOctGrey : kOctAmber};
+    }
     const bool pr = item.kind == "pr";
     // A path, or anything numberless, is a folder. Any *other* kind with a
     // number — `question` from the agent-questions flow, whatever comes next — is
@@ -2952,6 +2963,11 @@ constexpr Rgb kPanTextA {0xd1 / 255.f, 0xd7 / 255.f, 0xe0 / 255.f};   // #d1d7e0
 constexpr Rgb kPanTextB {0x91 / 255.f, 0x98 / 255.f, 0xa1 / 255.f};   // #9198a1
 constexpr Rgb kPanHover {0x2a / 255.f, 0x31 / 255.f, 0x3c / 255.f};   // #2a313c
 constexpr Rgb kPanAccent{0xf7 / 255.f, 0x81 / 255.f, 0x66 / 255.f};   // #f78166
+// The speaking halo. Not the ring's ember: on the card that read as a warning
+// rather than as a voice, and the panel already spends red, amber and green on
+// what the rows mean. White says "this one is talking" and nothing else. A hair
+// off pure white, which blooms harder than it looks against a pale terminal.
+constexpr Rgb kPanGlow  {0xf0 / 255.f, 0xf3 / 255.f, 0xf6 / 255.f};   // #f0f3f6
 
 // The scale the card currently being built is drawn at. Panels are only ever
 // built on the panel thread (or on the main thread by --panel-preview), so a
@@ -2979,6 +2995,7 @@ Rgb PanBorder() { return kPanLine; }
 bool PanTabAll(const PanelItem&)  { return true; }
 bool PanTabIssue(const PanelItem& i) { return i.kind == "issue"; }
 bool PanTabPr(const PanelItem& i)    { return i.kind == "pr"; }
+bool PanTabQuestion(const PanelItem& i) { return i.kind == "question"; }
 
 struct PanTab {
     const char* id;
@@ -2991,6 +3008,7 @@ constexpr PanTab kPanTabs[] = {
     {"all",    "All",    PanTabAll,   false},
     {"issues", "Issues", PanTabIssue, true},
     {"prs",    "PRs",    PanTabPr,    true},
+    {"pending", "Pending", PanTabQuestion, true},
 };
 constexpr int kPanTabCount = static_cast<int>(sizeof(kPanTabs) / sizeof(kPanTabs[0]));
 
@@ -3015,15 +3033,26 @@ std::string PanCountText(size_t n) {
 
 // The pill shows the worst item on the list — its icon and its colour — which
 // is what makes a collapsed panel still worth glancing at. PanStatus is declared
-// in that order.
+// in that order, and an open question outranks all of it: a red pill means a
+// machine is unhappy about something, an amber one means a machine is waiting
+// for you, and the second is the one that will not resolve itself.
 const PanelItem* PanWorstItem(const std::vector<PanelItem>& items) {
     const PanelItem* worst = nullptr;
     for (const PanelItem& it : items) {
+        if (PanelIsQuestion(it) && it.status != PanStatus::Closed) return &it;
         if (!worst || static_cast<int>(it.status) > static_cast<int>(worst->status)) {
             worst = &it;
         }
     }
     return worst;
+}
+
+size_t PanPendingCount(const std::vector<PanelItem>& items) {
+    size_t n = 0;
+    for (const PanelItem& it : items) {
+        if (PanelIsQuestion(it) && it.status != PanStatus::Closed) ++n;
+    }
+    return n;
 }
 
 // Rasterized once per content change; the hover highlight and the colours are
@@ -3128,7 +3157,12 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
     // fits its text rather than keeping the expanded width, so a collapsed panel
     // gives the terminal underneath almost all of its corner back.
     if (collapsed) {
-        const TextMask count = PanLine(PanCountText(items.size()), false,
+        // "2 pending" rather than "10 items" when any of them is a question: the
+        // number worth reducing the panel to is the one that needs an answer.
+        const size_t pending = PanPendingCount(items);
+        const std::string count_text =
+            pending ? std::to_string(pending) + " pending" : PanCountText(items.size());
+        const TextMask count = PanLine(count_text, false,
                                        PanScale(kPanWidth) - 2 * pad);
         const int panel_w = pad + icon + igap + count.w + tgap + toggle + pad;
         const int panel_h = std::max({count.h, toggle, icon}) + 2 * PanScale(7);
@@ -3215,9 +3249,19 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         }
         const PanTab& filter = kPanTabs[tabs.empty() ? 0 : tabs[active].index];
 
+        // Questions first, the rest in the order the producer ranked them. Only
+        // `All` mixes kinds, so this only ever reorders there — and there it
+        // should: a question is the one row that is waiting on *you*.
         std::vector<int> view;
         for (size_t i = 0; i < items.size(); ++i) {
-            if (filter.match(items[i])) view.push_back(static_cast<int>(i));
+            if (filter.match(items[i]) && PanelIsQuestion(items[i])) {
+                view.push_back(static_cast<int>(i));
+            }
+        }
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (filter.match(items[i]) && !PanelIsQuestion(items[i])) {
+                view.push_back(static_cast<int>(i));
+            }
         }
 
         // Switching tabs must not move the strip out from under the cursor, so
@@ -3250,7 +3294,9 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             const PanelItem& item = items[view[k]];
             RowBuild r;
             r.item  = view[k];
-            r.label = PanLine(item.Label(), true, text_w);
+            // A handle is bold; a *sentence* is not. A question's label is the
+            // question, so it keeps the primary ink and drops the weight.
+            r.label = PanLine(item.Label(), !PanelIsQuestion(item), text_w);
             // Whatever the label leaves. Below a usable remainder the title is
             // dropped entirely rather than shown as three characters and a dot.
             const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
@@ -3528,17 +3574,17 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
     // of what that used to cost.
     const float gi = glow * (0.30f + 0.55f * Clamp01(voice));
     if (gi > 0.004f && card.halo.size() == n) {
-        static uint32_t ember[256];
+        static uint32_t glow_ink[256];
         static bool     ready = false;
         if (!ready) {
-            for (int i = 0; i < 256; ++i) ember[i] = Pack(kEmber, i / 255.f);
+            for (int i = 0; i < 256; ++i) glow_ink[i] = Pack(kPanGlow, i / 255.f);
             ready = true;
         }
         for (size_t ci = 0; ci < n; ++ci) {
             const uint8_t hm = card.halo[ci];
             if (!hm) continue;
             const int q = static_cast<int>(gi * hm);
-            if (q > 3) frame[ci] = BlendOver(ember[q > 255 ? 255 : q], frame[ci]);
+            if (q > 3) frame[ci] = BlendOver(glow_ink[q > 255 ? 255 : q], frame[ci]);
         }
     }
 
@@ -3657,9 +3703,35 @@ bool PanelOpenable(const std::string& u) {
     return u.size() >= 2 && u[0] == '\\' && u[1] == '\\';
 }
 
+// A question has nowhere to go — the terminal asking it is the one you are
+// already looking at — so clicking it puts the text on the clipboard instead,
+// which is what you want when the answer is "paste this into the other window".
+void PanelCopy(const std::string& text) {
+    const std::wstring wide = Wide(text);
+    const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!mem) return;
+    if (void* dst = GlobalLock(mem)) {
+        std::memcpy(dst, wide.c_str(), bytes);
+        GlobalUnlock(mem);
+        // No owner window: the panel must not take focus to do this, and the
+        // clipboard does not require it to.
+        if (OpenClipboard(nullptr)) {
+            EmptyClipboard();
+            if (SetClipboardData(CF_UNICODETEXT, mem)) mem = nullptr;   // now theirs
+            CloseClipboard();
+        }
+    }
+    if (mem) GlobalFree(mem);
+}
+
 // URLs go to the browser, directories to Explorer — one call does both, which is
 // the whole reason a path row can sit in the same list as a pull request.
 void PanelOpen(const PanelItem& item) {
+    if (PanelIsQuestion(item)) {
+        PanelCopy(item.title);
+        return;
+    }
     if (!PanelOpenable(item.url)) {
         std::fprintf(stderr, "speak: panel row '%s' has nothing openable\n",
                      item.Label().c_str());
@@ -4671,8 +4743,8 @@ void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& bo
 // more" row appears.
 
 const char* kPanSampleSummary = "i47 - wiring the attention panel into the daemon";
-constexpr size_t kPanSampleRows = 8;   // the sample list, so a preview can point
-                                       // at its last row
+constexpr size_t kPanSampleRows = 10;   // the sample list, so a preview can point
+                                        // at its last row
 
 std::vector<PanelItem> SamplePanelItems() {
     const auto make = [](const char* kind, const char* repo, long number,
@@ -4687,6 +4759,11 @@ std::vector<PanelItem> SamplePanelItems() {
         return it;
     };
     return {
+        // Questions sort to the top of `All` on their own, but the producer sends
+        // them in whatever order it found them — so here they are not first.
+        make("question", "", 0,
+             "Should the quantity step apply to archived prices too?",
+             PanStatus::Open),
         make("pr", "optidatacloud/laravel-opticloud", 1375,
              "feat: calendar event reminder as a bottom-right toast",
              PanStatus::ChecksFailing),
@@ -4706,6 +4783,9 @@ std::vector<PanelItem> SamplePanelItems() {
              PanStatus::Draft),
         make("issue", "optidatacloud/optiwork-infra", 27,
              "bastion runbook", PanStatus::Closed),
+        make("question", "", 0,
+             "Merge the partners PR before or after the gateway one?",
+             PanStatus::Open),
     };
 }
 
@@ -4736,6 +4816,7 @@ void PanelPreview(const std::string& prefix) {
         {"-all.png",       "all", false, true,  static_cast<int>(kPanSampleRows),
          0.f, 0.f, "", ""},
         {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", ""},
+        {"-pending.png",   "pending", false, false, -3, 0.f, 0.f, "", ""},
         // Mid-utterance: lit, and the header carrying what is being said.
         {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
          "laravel-opticloud #1375", "checks are green, ready to merge"},
