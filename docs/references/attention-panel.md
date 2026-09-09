@@ -249,7 +249,7 @@ wrong. `checks.total` counts everything, so *passing* is
 ## Collapse
 
 <p align="center">
-  <img src="../panel-collapsed.png" width="240" alt="the collapsed pill: an icon, and how many items">
+  <img src="../panel-collapsed.png" width="240" alt="the collapsed pill: the amber question glyph, 2 pending, and the + that expands it">
 </p>
 
 The header is the summary line, with a `−` at the right. Click either and the
