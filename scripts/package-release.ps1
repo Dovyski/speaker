@@ -163,7 +163,9 @@ Claude Code hooks in hooks\ and the agent skill in skill\ — are here:
     # sha256sum-compatible: "<hash>  <name>", so `sha256sum -c` works too.
     $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     $sums = Join-Path $OutDir 'SHA256SUMS.txt'
-    Set-Content $sums "$hash  $(Split-Path $zip -Leaf)" -Encoding ascii
+    # LF, no trailing newline noise: Set-Content emits CRLF on Windows, which makes
+    # `sha256sum -c` on Linux/Git Bash look for "speak-win-x64.zip".
+    [IO.File]::WriteAllText($sums, "$hash  $(Split-Path $zip -Leaf)`n", [Text.UTF8Encoding]::new($false))
 
     $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
     Write-Host ""
