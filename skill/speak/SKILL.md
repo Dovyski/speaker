@@ -149,15 +149,34 @@ or focus anything.
 A caption and a pointing gesture answer different questions — *what* it is about
 and *where* to go — so the full form of a milestone utterance carries both.
 
+**Name the target with `--session <id>` when you can.** If a line like
+
+```
+Speak session id: 2c212f58-f956-4be3-ad42-c964cecfba2f — pass it as --session to speak.exe when speaking or pointing.
+```
+
+is anywhere in your context, that id *is* the target: the daemon knows which
+window this session's panel is bound to and points at it. No title, no guessing,
+no `--list-targets`, and it survives the terminal being retitled mid-turn.
+`--session` implies `--point`.
+
 ```bash
-# speak, then point at the window whose title contains this text
-"C:/Dev/www/claude-speak/speak.exe" --title "reviewer worker" \
+# speak, then point at this session's own window
+"C:/Dev/www/claude-speak/speak.exe" --session "2c212f58-f956-4be3-ad42-c964cecfba2f" \
     --caption-title "i11 - reviewer worker" --caption "PR #451 reviewed, CI green." \
     "Tests are green."
 
 # point without speaking
+"C:/Dev/www/claude-speak/speak.exe" --point --session "2c212f58-f956-4be3-ad42-c964cecfba2f"
+
+# fallback: point at the window whose title contains this text
 "C:/Dev/www/claude-speak/speak.exe" --point --title "reviewer worker"
 ```
+
+The daemon learns the mapping from the attention panel's registration, so a
+session that has never posted a panel is unknown to it. Pass `--title` as well
+and it falls back to that; otherwise the gesture fails as a bad title would, and
+the speech still happens.
 
 No model is loaded for pointing, so the only cost beyond the animation itself is
 ~240 ms of process start, daemon or not.
@@ -185,8 +204,9 @@ notice, not for speed. `--color` takes a name (`red`, `amber`, `yellow`, `green`
 fallback. Use the colour to mean something — keep the default for routine "done",
 and switch to red or amber when the user needs to act.
 
-**Work out the target with `--list-targets` first.** It prints every pointable
-window as JSON — `hwnd`, `pid`, `process`, `title`, `x`, `y`, `w`, `h`:
+**`--list-targets` is the last resort** — only when there is no session id and
+no title you trust. It prints every pointable window as JSON — `hwnd`, `pid`,
+`process`, `title`, `x`, `y`, `w`, `h`:
 
 ```bash
 "C:/Dev/www/claude-speak/speak.exe" --list-targets
@@ -220,17 +240,21 @@ The daemon serves the same thing on **the next port** (`8124`), loopback only, f
 callers that are not running a shell:
 
 ```bash
+curl -s -X POST http://127.0.0.1:8124/point -d '{"session":"2c212f58-…"}'       # {"ok":true}
 curl -s -X POST http://127.0.0.1:8124/point -d '{"title":"reviewer worker"}'   # {"ok":true}
 curl -s http://127.0.0.1:8124/targets                                          # same as --list-targets
 ```
 
-`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`,
-`duration`, `color` and `size`; a request **must** name its target, since the
+`POST /point` takes `session`, or `title`, or `hwnd`, or `x` and `y`, plus
+optional `pulses`, `duration`, `color` and `size`; a request **must** name its target, since the
 daemon cannot tell where the call came from. It replies when the animation ends
 (~3.5 s), and concurrent requests queue.
 
 ## Rules
 
+- **Subagents do not speak.** Only the top-level session the user is talking to
+  calls `speak.exe`; a subagent reports its result as text and lets its
+  orchestrator say it. Holding a session id changes nothing here.
 - **One call per utterance.** Gather everything you want to say into a single
   string and make one call. On a cold call especially, splitting a summary into
   several calls pays the model load several times.
@@ -260,6 +284,7 @@ daemon cannot tell where the call came from. It replies when the animation ends
 | `--orb-size <px>` | `220` | Square size of the overlay |
 | `--timing` | — | Report ms to first audio and which path served it |
 | `--point` | — | Point at a window; with text, speaks first and points after |
+| `--session <id>` | — | Point at the window bound to this Claude session; preferred over `--title` (implies `--point`) |
 | `--title <substr>` | — | Point at the window whose title contains this (implies `--point`) |
 | `--hwnd <n>` / `--at <x,y>` | — | Point at a window handle / screen position (imply `--point`) |
 | `--pulses <n>` / `--duration <s>` | `3` / `3.5` | Rings, and how long the gesture lasts |
