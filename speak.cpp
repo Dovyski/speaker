@@ -4126,6 +4126,10 @@ std::atomic<bool>     g_pan_trace{false};   // --panel-demo: report what it is d
 std::mutex  g_pan_snapshot_mtx;
 std::string g_pan_snapshot = "[]";
 
+// Read by the enricher runner, which has nothing to do when no session has a
+// panel: there is no status worth fetching for a panel nobody is showing.
+std::atomic<size_t> g_pan_registered{0};
+
 void PanelEnqueue(PanelCmd cmd) {
     std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
     g_pan_queue.push_back(std::move(cmd));
@@ -4312,6 +4316,8 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
             claims[i].hwnd = nullptr;
         }
     }
+
+    g_pan_registered.store(panels->size());
 
     std::string json = "[";
     for (size_t i = 0; i < panels->size(); ++i) {
@@ -4596,6 +4602,104 @@ void EnsurePanelThread() {
     std::call_once(g_pan_thread_once, [] {
         std::thread(PanelThread, 0.f).detach();
     });
+}
+
+// ── running the enricher ────────────────────────────────────────────────────
+// The status on a row — approved, checks failing, merged — comes from `gh`, and
+// that is a poller's job rather than a C++ one, so it lives in
+// hooks\i47-enrich.ps1. It used to be a Windows scheduled task firing every
+// minute, and that is exactly what a scheduled task is bad at: the task runs
+// pwsh *in the interactive session*, and `-WindowStyle Hidden` hides a console
+// window only after it has already appeared. Once a minute, all day, a window
+// flashed on Fernando's screen.
+//
+// The daemon is already resident, already knows whether any panel exists, and
+// can start a process with CREATE_NO_WINDOW — which never allocates a console in
+// the first place. So it owns the poller now.
+
+std::string g_enricher_path;
+int         g_enricher_interval = 60;
+
+// A run that hangs on a network call must not block the next one forever, and a
+// run that outlives its usefulness is worth killing: the panel would rather have
+// a stale status than none.
+constexpr DWORD kEnricherKillMs = 120000;
+
+void RunEnricherLoop() {
+    HANDLE child = nullptr;
+    DWORD  started_at = 0;
+    DWORD  last_start = 0;
+    bool   ever = false;
+
+    for (;;) {
+        Sleep(1000);
+
+        if (child) {
+            const DWORD ran = GetTickCount() - started_at;
+            if (WaitForSingleObject(child, 0) == WAIT_OBJECT_0) {
+                DWORD code = 0;
+                GetExitCodeProcess(child, &code);
+                std::fprintf(stderr, "speak: enricher exited %lu after %lu ms\n",
+                             code, ran);
+                CloseHandle(child);
+                child = nullptr;
+            } else if (ran > kEnricherKillMs) {
+                std::fprintf(stderr,
+                             "speak: enricher still running after %lu ms, killing it\n",
+                             ran);
+                TerminateProcess(child, 1);
+                CloseHandle(child);
+                child = nullptr;
+            }
+            continue;   // one at a time: a tick with a live run is a skipped tick
+        }
+
+        if (g_pan_registered.load() == 0) continue;
+        const DWORD now = GetTickCount();
+        if (ever && now - last_start < static_cast<DWORD>(g_enricher_interval) * 1000) {
+            continue;
+        }
+
+        // stdio to NUL rather than inherited: the daemon's own stderr is its log,
+        // and the poller's chatter belongs in its own file.
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength        = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+                                 0, nullptr);
+
+        std::wstring cmd = L"pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+                           Wide(g_enricher_path) + L"\" -Once";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        if (nul != INVALID_HANDLE_VALUE) {
+            si.dwFlags    = STARTF_USESTDHANDLES;
+            si.hStdInput  = nul;
+            si.hStdOutput = nul;
+            si.hStdError  = nul;
+        }
+        PROCESS_INFORMATION pi{};
+        // CREATE_NO_WINDOW, not a hidden window: the difference is whether a
+        // console is ever created, and that is the difference Fernando can see.
+        const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+                                       nul != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW,
+                                       nullptr, nullptr, &si, &pi);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        last_start = now;
+        ever       = true;
+        if (!ok) {
+            std::fprintf(stderr, "speak: could not start the enricher (%s), error %lu\n",
+                         g_enricher_path.c_str(), GetLastError());
+            // Do not hammer it: a missing pwsh or a missing script will not fix
+            // itself inside a minute.
+            continue;
+        }
+        CloseHandle(pi.hThread);
+        child      = pi.hProcess;
+        started_at = GetTickCount();
+        std::fprintf(stderr, "speak: enricher started (pid %lu)\n", pi.dwProcessId);
+    }
 }
 
 // ── the endpoint ────────────────────────────────────────────────────────────
@@ -5104,6 +5208,9 @@ struct Options {
     bool   point        = false;   // point at a window (before or instead of speaking)
     bool   list_targets = false;
     bool   point_server = true;    // daemon: serve the pointing endpoint
+    bool   enricher     = true;    // daemon: poll GitHub for row statuses
+    std::string enricher_path;     // default: <exe dir>\\hooks\\i47-enrich.ps1
+    int    enricher_interval = 60; // seconds between runs
     int    point_port   = 0;       // 0 = speech port + 1
     PointRequest point_req;
     bool   show_orb    = true;
@@ -5201,6 +5308,23 @@ int RunDaemon(const Options& opt) {
             std::thread(RunBeaconServer, point_port + 1).detach();
         }
 
+        // The status poller, but only if it is there to run: a copy of the binary
+        // without the hooks directory beside it should say so once and carry on.
+        if (opt.enricher) {
+            const DWORD attrs = GetFileAttributesW(Wide(opt.enricher_path).c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                g_enricher_path     = opt.enricher_path;
+                g_enricher_interval = opt.enricher_interval;
+                std::fprintf(stderr, "speak: enricher every %d s from %s\n",
+                             g_enricher_interval, g_enricher_path.c_str());
+                std::thread(RunEnricherLoop).detach();
+            } else {
+                std::fprintf(stderr, "speak: no enricher at %s, statuses will not update\n",
+                             opt.enricher_path.c_str());
+            }
+        }
+
         // Keepalive: an idle daemon gets slow again (CPU clocks down, its working
         // set gets paged out), turning ~100 ms calls into ~500 ms ones. So nudge
         // it periodically with a throwaway word. This goes through our own HTTP
@@ -5238,6 +5362,9 @@ bool SpawnDaemon(const Options& opt) {
     if (opt.threads) cmd += " --threads " + std::to_string(opt.threads);
     if (opt.point_port) cmd += " --point-port " + std::to_string(opt.point_port);
     if (!opt.point_server) cmd += " --no-point-server";
+    if (!opt.enricher) cmd += " --no-enricher";
+    if (!opt.enricher_path.empty()) cmd += " --enricher \"" + opt.enricher_path + "\"";
+    cmd += " --enricher-interval " + std::to_string(opt.enricher_interval);
 
     std::wstring wcmd = Wide(cmd);
     STARTUPINFOW si{};
@@ -5338,6 +5465,11 @@ void Usage() {
         "  --list-targets        list pointable windows as JSON and exit\n"
         "  --point-port <n>      daemon: pointing endpoint port (default port+1)\n"
         "  --no-point-server     daemon: do not serve the pointing endpoint\n"
+        "  --enricher <path>     daemon: the panel status poller to run (default\n"
+        "                        <exe dir>\\hooks\\i47-enrich.ps1), while any panel\n"
+        "                        is registered\n"
+        "  --enricher-interval <s>  seconds between poller runs (default 60)\n"
+        "  --no-enricher         daemon: never run the status poller\n"
         "  --keepalive <sec>     daemon: nudge itself every N seconds so it stays\n"
         "                        fast when idle (default 60)\n"
         "  --no-keepalive        daemon: let it go cold between calls\n"
@@ -5368,6 +5500,7 @@ int main() {
     Options opt;
     opt.models_dir = ExeDir() + "\\models";
     opt.voices_dir = ExeDir() + "\\voices";
+    opt.enricher_path = ExeDir() + "\\hooks\\i47-enrich.ps1";
     bool serve = false, stop = false, status = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -5442,6 +5575,11 @@ int main() {
                 std::strtof(next("--panel-seconds").c_str(), nullptr));
         else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
         else if (a == "--no-point-server") opt.point_server = false;
+        else if (a == "--enricher")     opt.enricher_path = next("--enricher");
+        else if (a == "--no-enricher")  opt.enricher = false;
+        else if (a == "--enricher-interval")
+            opt.enricher_interval =
+                std::max(5, std::atoi(next("--enricher-interval").c_str()));
         else if (a == "--caption")       g_cap_text  = next("--caption");
         else if (a == "--caption-title") g_cap_title = next("--caption-title");
         else if (a == "--subtitle")      g_sub_text  = next("--subtitle");
