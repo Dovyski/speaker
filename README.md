@@ -142,6 +142,7 @@ Click the orb while it is speaking to pause, and again to resume.
 | `--orb-preview <prefix>` | — | Render a strip of frames across time and loudness, and exit |
 | `--timing` | — | Report milliseconds to first audio, and which path served it |
 | `--point` | — | Ring out a window (see [Pointing](#pointing-at-a-window)); alone it only points, with text it speaks first |
+| `--session <id>` | — | Point at the window this Claude session's panel is bound to; preferred over `--title`, falls back to it (implies `--point`) |
 | `--title <substr>` | — | Point at the window whose title contains this (implies `--point`) |
 | `--hwnd <n>` / `--at <x,y>` | — | Point at a window handle / a screen position (imply `--point`) |
 | `--pulses <n>` | `3` | Rings to send out |
@@ -386,7 +387,33 @@ The overlay is click-through everywhere — unlike the orb there is nothing on i
 to click — and it points at *where the window is*, without raising it or taking
 focus. A window that is behind others gets rings drawn over whatever covers it.
 
-### Which window?
+### Which window? Ask by session id
+
+`--title` asks a model to guess a substring of a title it cannot read, and the
+title changes every turn. `--session <id>` removes the guess:
+
+```bat
+speak.exe --point --session 2c212f58-f956-4be3-ad42-c964cecfba2f
+speak.exe --session 2c212f58-… --caption "CI green." "Tests are green."
+```
+
+The table it resolves against is the **attention panel's registrations** — the
+same one `GET /panels` reports — so nothing extra is maintained for pointing: a
+session that has posted a panel is pointable, and one that never has is unknown.
+A `SessionStart` hook puts the id in the model's context, and from then on the
+target is a fact rather than a search. `--session` implies `--point`, like
+`--title`.
+
+The registrations live in the daemon, so a plain `speak.exe` call **asks it**
+(one short `GET /panels` on the pointing port, 400 ms budget) rather than
+resolving locally; inside the daemon the lookup is local, since asking itself
+through its own single-threaded listener would deadlock. Precedence is
+`session`, then `title`, then `hwnd`, then `x`/`y`, and an unresolved session is
+not an error on its own — it falls through to the `--title` an agent was told to
+pass alongside it. Alone, it fails the way a bad title does: exit 3 and the
+candidate list.
+
+### Which window, with nothing to go on?
 
 This is the part that needs care, and the reason `--title` exists. With no target
 given, `speak.exe` works out where the call came from:
@@ -432,7 +459,7 @@ $ curl -s http://127.0.0.1:8124/health
 {"ok":true,"service":"speak-pointer"}
 ```
 
-`POST /point` takes `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`,
+`POST /point` takes `session`, or `title`, or `hwnd`, or `x` and `y`, plus optional `pulses`,
 `duration`, `color` and `size` — the flags' JSON counterparts, same defaults, and
 an unparseable colour is a 400 rather than a silent ember. It must be told a
 target: the caller is at the other end of a socket,
