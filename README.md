@@ -615,6 +615,76 @@ and `#9198a1` secondary text, and a hover band one step lighter at `#2a313c`.
 It ignores `--caption-variant` entirely — a coloured card would claim the meaning
 that belongs to the icons.
 
+### Hover: the popover
+
+A row has space for a handle, a glyph and a title with its end cut off.
+Everything else the enricher knows about it goes in a popover: **hover a pull
+request or issue row for about a third of a second** and a second card opens to
+the left of the first, aligned with the row that summoned it.
+
+<!-- %TEMP%\i47panel-popover-pr.png from --panel-preview -->
+
+Top to bottom: the type icon, `repo#N`, and the status *spelled out* (`Changes
+requested`, not a coloured dot); the **full title**, wrapped to at most three
+lines; the author, with their avatar; the labels as pills in GitHub's own label
+colours; `Assignees`; for pull requests `Reviewers`, each with the verdict beside
+them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a grey
+speech bubble for `COMMENTED`, a hollow circle for a review that has been
+requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
+1 failing`.
+
+A row whose `details` never arrived still gets a popover — its own title and its
+status, which is more than the row could show. Nothing here is interactive: the
+window is `WS_EX_TRANSPARENT`, which both says "display only" and keeps
+`WindowFromPoint` skipping it, so the popover cannot steal the hover that opened
+it. It closes on leaving the row, on scrolling, on switching tabs, on collapsing,
+and with the card itself — all of which fall out of one rule rather than five,
+since the thing being watched is a *key* built from the session, the tab, the
+scroll offset and the row, and any change to it restarts the dwell.
+
+It is clamped to the monitor's work area, and if there is no room to the left of
+the card (a terminal against the left edge of a narrow screen) it goes to the
+right instead rather than covering the rows it is describing.
+
+**Avatars** are local PNGs the enricher has already downloaded to
+`~/.claude/attention/avatars/<login>.png`; the panel only reads them. They are
+decoded with WIC on first use, scaled, cut to a circle, and cached by path,
+mtime *and* diameter — the failures too, so a login whose file never arrived
+costs one `GetFileAttributesEx` and one decode attempt rather than one per
+frame. A missing or unreadable file falls back to a grey disc with the login's
+initial, which is what every other product does for the same reason.
+
+### The `details` contract
+
+`items[]` may carry a `details` object, filled in by the enricher and passed
+through untouched by the producer and the daemon. Every field is optional: the
+enricher fills it over several passes, and a half-filled one should show what it
+has.
+
+```json
+"details": {
+  "title": "<the full title, before the row cut it>",
+  "author":    {"login": "dovyski", "avatar": "<absolute path to a local png>"},
+  "assignees": [{"login": "…", "avatar": "…"}],
+  "labels":    [{"name": "bug", "color": "d73a4a"}],
+  "reviews":   [{"login": "…", "avatar": "…", "state": "APPROVED|CHANGES_REQUESTED|COMMENTED|PENDING"}],
+  "review_requests": [{"login": "…", "avatar": "…"}],
+  "checks":    {"total": 6, "failing": 1, "pending": 1}
+}
+```
+
+`reviews` is the latest review per reviewer; `review_requests` are the ones who
+have not reviewed yet, and they are merged into the `Reviewers` list as
+`PENDING` (a login in both keeps its review). `labels[].color` is GitHub's own
+six-digit hex, with or without a `#`, and the pill's text is picked black or
+white by the colour's luminance — a pill is unreadable the moment that guesses
+wrong. `checks.total` counts everything, so *passing* is
+`total - failing - pending`.
+
+`--panel-preview` writes `<prefix>-popover-pr.png` and `-popover-issue.png` from
+a fully populated sample, alongside two generated avatar PNGs so the previews
+show real decoded circles rather than the fallback disc.
+
 ### Collapse
 
 The header is the summary line, with a `−` at the right. Click either and the
