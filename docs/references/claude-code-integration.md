@@ -48,7 +48,8 @@ Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>
    hooks/i47-enrich.ps1  — run by the daemon, every 60 s while a panel exists
         ├─ every session json touched in the last 48 h
         ├─ `gh pr view` / `gh issue view --json …`, cached in status-cache.json
-        ├─ writes back `status` and empty `title`s
+        ├─ writes back `status`, empty `title`s and the `details` popover block
+        ├─ downloads each login's avatar once into attention/avatars/<login>.png
         └─ re-POSTs the files it changed
                 │
                 ▼
@@ -197,7 +198,19 @@ there is exactly one state directory per user even with several
       "title": "feat: calendar event reminder as a bottom-right toast (issue #1372)",
       "status": "merged",
       "relevance": "worked",
-      "last_seen": "2026-09-09T12:04:24Z"
+      "last_seen": "2026-09-09T12:04:24Z",
+      "details": {
+        "title": "feat: calendar event reminder as a bottom-right toast (issue #1372)",
+        "author": { "login": "Dovyski", "avatar": "C:\\Users\\<user>\\.claude\\attention\\avatars\\Dovyski.png" },
+        "assignees": [ { "login": "Dovyski", "avatar": "C:\\Users\\<user>\\.claude\\attention\\avatars\\Dovyski.png" } ],
+        "labels": [ { "name": "copilot 🤖", "color": "b60205" } ],
+        "reviews": [ { "login": "ketlymachado", "avatar": "…\\ketlymachado.png", "state": "APPROVED" },
+                     { "login": "coderabbitai", "avatar": "…\\coderabbitai.png", "state": "COMMENTED" } ],
+        "review_requests": [ { "login": "dev", "avatar": null, "team": true } ],
+        "checks": { "total": 8, "failing": 0, "pending": 0 },
+        "updated_at": "2026-09-09T11:55:29Z",
+        "fetched_at": "2026-09-09T20:12:10Z"
+      }
     },
     { "kind": "question", "url": "", "title": "Merge the pending pair now or wait for D50?",
       "status": "open", "last_seen": "2026-09-09T12:04:24Z" },
@@ -222,6 +235,42 @@ there is exactly one state directory per user even with several
   except the Haiku verdict.
 - Items are pruned at 48 h since `last_seen` and capped at 30, most recent first.
 - `summary` and `question` rows only ever come from the Haiku worker.
+- `details` is the P6 hover popover's whole content, written only by the
+  enricher (`pr` and `issue` rows; never `path` or `question`). The producer and
+  the Haiku worker copy every property of an item they did not author, so it
+  survives their rewrites, and it is part of the `POST /panel` body. A daemon
+  that does not know about it simply ignores it.
+
+| Key | |
+|---|---|
+| `title` | the full title, unabridged — the row itself is truncated |
+| `author` | `{login, avatar}`; `avatar` is an absolute path to a PNG, or `null` |
+| `assignees` | capped at 6, `assignees_more` counts the rest |
+| `labels` | `{name, color}`, GitHub's own hex without the `#`, capped at 8 (`labels_more`) |
+| `reviews` | PRs only: the **latest** review per reviewer, the PR author's own excluded, `PENDING` drafts dropped, `DISMISSED` folded into `COMMENTED`. Sorted `CHANGES_REQUESTED` → `APPROVED` → `COMMENTED`, then most recent first, so the cap of 10 (`reviews_more`) never drops a human verdict for a bot comment |
+| `review_requests` | PRs only: reviewers who have not answered yet — this is what `PENDING` means on the popover. A requested *team* has no login, so it appears as `{login: "<team name>", avatar: null, team: true}` |
+| `checks` | PRs only: `{total, failing, pending}` counted off `statusCheckRollup` |
+| `updated_at` | GitHub's `updatedAt`, normalised to `…Z` |
+| `fetched_at` | when the popover content last *changed*. A refresh that finds nothing new does not rewrite the file (and so does not re-POST the card once a minute), which is exactly why this is not simply the last `gh` call |
+
+### `avatars/<login>.png` — one file per person
+
+`gh`'s JSON has no `avatarUrl` (it gives `login`, `name` and sometimes
+`databaseId`), so the enricher derives the URL: the CDN form
+`avatars.githubusercontent.com/u/<databaseId>?s=64` when gh gave an id,
+otherwise `github.com/<login>.png?size=64`, which redirects to the same place.
+An `avatarUrl` is honoured first if a future gh starts returning one, with
+`?s=64` appended (`&s=64` when the URL already has a query).
+
+- downloaded only when the file is missing or older than 7 days, 5 s timeout,
+  and **re-encoded to real PNG** when GitHub answers with a JPEG (it often
+  does, even from a `.png` URL) so the daemon has one format to decode. A file
+  that does not end up carrying the PNG signature is deleted.
+- a failure leaves `avatar` as `null` — the daemon draws a grey disc — and the
+  login is recorded in `avatars/.failed.json` so it is not retried for 24 h.
+  GitHub App bots (`github-code-quality`) legitimately have no user avatar.
+- an existing file is never deleted on a failed refresh: a week-old picture
+  beats a grey disc.
 
 ### `status-cache.json` — the enricher's GitHub cache
 
@@ -237,7 +286,11 @@ there is exactly one state directory per user even with several
 }
 ```
 
-Keyed `repo#kind#number`. TTL is 60 s while open and 30 min once closed or
+Keyed `repo#kind#number`. Each entry also carries the `details` object the item
+copies, so a popover costs no `gh` call of its own — it comes out of the very
+same `gh pr view` / `gh issue view` response as the badge, under the same TTLs.
+An entry that has a `status` but no `details` (one cached before P6) is refetched
+on the next pass rather than waiting out the 30 min closed TTL. TTL is 60 s while open and 30 min once closed or
 merged, at most 40 `gh` calls a pass, 4 in parallel, 15 s per call. `_missing`
 counts consecutive failures; at 3 the item is given up on (this is what retires a
 repo name the regex invented). Entries no session references and not refreshed
@@ -251,7 +304,7 @@ enricher then re-fetches it as a PR and fixes `kind` in the session file.
 |---|---|---|
 | `producer.log` | `i47-attention.ps1` | `event`, `delta_bytes`, `items_total`, `items_sent`, `title`, `post_status`, `haiku`, `ms`, `errors` |
 | `haiku.log` | `i47-haiku.ps1` | `model`, `delta_chars`, `attempts`, `summary`, `worked`, `mentioned`, `q_open`, `cost_usd`, `ms` |
-| `enricher.log` | `i47-enrich.ps1` | `sessions`, `items`, `gh_calls`, `changed`, `ms`, `errors` |
+| `enricher.log` | `i47-enrich.ps1` | `sessions`, `items`, `gh_calls`, `changed`, `avatars`, `ms`, `errors` |
 | `p0-spike.log` | `i47-terminal-title.ps1` | `chain`, `methods`, `title_source`, `hwnd`, `candidates` |
 
 ```json
@@ -455,6 +508,8 @@ or a `POST` with empty `items`. Registrations expire 48 h after their last
 | A question row that is already answered | The Haiku worker clears questions when the user has spoken since, unless the model re-lists them as open. Check `q_open` / `q_resolved` in `haiku.log`. |
 | `speak.exe --session <id>` cannot find the window | The daemon holds no panel registration for that session: it was restarted, or the session has not finished a turn yet. Check `GET /panels`; meanwhile pass `--title` too, which is what `--session` falls back to. |
 | No "Speak session id" line in a session's context | The `SessionStart` hook is missing from *that* config dir's `settings.json`, or the session predates its registration — hooks are read at session start. The id is also the name of the session's file in `~/.claude/attention/`. |
+| A popover with grey discs instead of avatars | `~/.claude/attention/avatars/` is empty or the login is in `.failed.json`. Delete that file to retry at once; a GitHub App bot has no avatar to fetch at all. |
+| A popover that never updates | `details` only changes when its content does. Check `avatars`/`changed` in `enricher.log`, and remember the item's `fetched_at` is the last *change*, not the last fetch. |
 | `haiku.log` says `skip:locked` | A previous worker is still running (`<session>.haiku.lock`, considered stale after 5 minutes). `skip:no-verdict` after `cli: timeout` means the model call exceeded 40 s and both attempts failed — harmless, the next turn tries again. |
 
 ## What is machine-specific
