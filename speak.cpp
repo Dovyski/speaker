@@ -198,6 +198,9 @@ struct OrbGeometry {
 OrbGeometry g_geom;
 
 int CaptionStripWidth();
+// Defined with the socket helpers, called from the overlay loop below: one
+// datagram per frame telling a daemon's panel how loud this utterance is.
+void BeaconSend(float level, bool active);
 bool InsideCaptionClose(HWND hwnd, POINT screen_pt);
 
 // True for points inside the ring, which is the only part that reacts to a click.
@@ -1113,6 +1116,9 @@ void OrbThread() {
 
         ComposeFrame(pixels, level, voice, fade, anim, pause);
         PushOrb(hwnd, mem_dc);
+        // The panel in the target window glows off the same envelope the ring
+        // does, so the two move together rather than merely coinciding.
+        if ((frame & 1) == 0) BeaconSend(voice, !closing);
         Sleep(16);
     }
 
@@ -1404,6 +1410,74 @@ bool DaemonAlive(int port, int timeout_ms) {
 // Renders mono 24 kHz float audio pulled from `src` to the default device,
 // recording an amplitude envelope and the live playback position as it goes.
 // Returns false on a fatal audio error.
+// ── the speaking beacon ─────────────────────────────────────────────────────
+// When speech is aimed at a window (`--title`, `--hwnd`), the panel parked in
+// that window's corner should say so — glowing with the voice, and showing the
+// caption the utterance carries. The awkward part is *where the two live*: the
+// panel belongs to the resident daemon, while the audio, the amplitude envelope
+// and the caption all belong to the one-shot client process that is playing.
+//
+// So the client broadcasts. One fixed-size datagram per frame to loopback, each
+// carrying the whole state — target, level, caption — so the protocol has no
+// setup, no teardown and no session: a gap in the datagrams *is* the end of the
+// utterance, which also means a client killed mid-sentence cannot leave a panel
+// glowing forever. Upstream's TTSServer has its routes hardcoded in a file CMake
+// downloads at a pinned SHA, so a field on POST /tts was never an option; and a
+// 60 Hz stream of tiny HTTP requests through the pointing listener would have
+// blocked /panel behind it.
+
+constexpr uint32_t kBeaconMagic   = 0x424B5053;   // "SPKB"
+constexpr uint32_t kBeaconVersion = 1;
+
+#pragma pack(push, 1)
+struct SpeakBeacon {
+    uint32_t magic   = kBeaconMagic;
+    uint32_t version = kBeaconVersion;
+    uint64_t hwnd    = 0;      // the window the speech is aimed at
+    float    level   = 0.f;    // live amplitude, 0..1 — the orb's own value
+    uint32_t active  = 0;      // 0 while fading out, so the end is explicit too
+    char     caption_title[128]{};
+    char     caption[192]{};
+};
+#pragma pack(pop)
+
+// Set by the client once its target is resolved; 0 means "say nothing".
+std::atomic<uint64_t> g_beacon_hwnd{0};
+int                   g_beacon_port = 0;
+
+void BeaconCopy(char* dst, size_t n, const std::string& src) {
+    const size_t len = std::min(n - 1, src.size());
+    std::memcpy(dst, src.data(), len);
+    dst[len] = 0;
+}
+
+// One unconnected UDP socket for the life of the process. Nothing listening is
+// not an error: the panel is optional scenery.
+void BeaconSend(float level, bool active) {
+    const uint64_t target = g_beacon_hwnd.load();
+    if (!target || g_beacon_port <= 0) return;
+
+    static SOCKET fd = INVALID_SOCKET;
+    if (fd == INVALID_SOCKET) {
+        if (!WinsockInit()) return;
+        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd == INVALID_SOCKET) return;
+    }
+    SpeakBeacon msg;
+    msg.hwnd   = target;
+    msg.level  = level;
+    msg.active = active ? 1u : 0u;
+    BeaconCopy(msg.caption_title, sizeof(msg.caption_title), g_cap_title);
+    BeaconCopy(msg.caption, sizeof(msg.caption), g_cap_text);
+
+    sockaddr_in to{};
+    to.sin_family      = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port        = htons(static_cast<unsigned short>(g_beacon_port));
+    sendto(fd, reinterpret_cast<const char*>(&msg), sizeof(msg), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
 bool PlayStream(PcmSource* src, std::vector<float>* recorded, double* first_audio_ms) {
     IMMDeviceEnumerator* enumerator = nullptr;
     IMMDevice*           device     = nullptr;
@@ -2050,6 +2124,23 @@ bool ResolvePoint(const PointRequest& req, POINT* out, std::string* err,
 }
 
 // Runs a pointing request to completion. Must be called on a DPI-aware thread.
+// The *window* a pointing request names, for the caller that wants the handle
+// rather than the centre of it. Same rule pointing uses — a unique
+// contains-match, case-insensitive — and the same refusal to guess: an ambiguous
+// title gives nothing rather than an arbitrary sibling.
+HWND ResolveTargetHwnd(const PointRequest& req) {
+    if (req.hwnd) return IsWindow(req.hwnd) ? req.hwnd : nullptr;
+    if (req.title.empty()) return nullptr;
+    const std::string needle = LowerAscii(req.title);
+    HWND              found  = nullptr;
+    for (const WindowTarget& t : EnumTargets()) {
+        if (LowerAscii(t.title).find(needle) == std::string::npos) continue;
+        if (found) return nullptr;
+        found = t.hwnd;
+    }
+    return found;
+}
+
 bool Point(const PointRequest& req, std::string* err, std::string* candidates) {
     POINT centre{};
     if (!ResolvePoint(req, &centre, err, candidates)) return false;
@@ -2676,7 +2767,8 @@ void PanFillPolys(const PanPolys& polys, std::vector<uint8_t>* mask, int w, int 
 // Rasterizes one icon into the card's colour layer. Small and few, so it is not
 // worth a cache: a rebuild happens only when the content changes.
 void StampOcticon(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int size,
-                  const char* path, const Rgb& colour) {
+                  const char* path, const Rgb& colour, int top = 0,
+                  int bottom = 1 << 24) {
     if (size <= 0) return;
     PanPolys polys;
     if (!PanSvgPath(path, size / 16.f, &polys)) {
@@ -2687,7 +2779,7 @@ void StampOcticon(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, i
     PanFillPolys(polys, &mask, size, size);
     for (int y = 0; y < size; ++y) {
         const int cy = y0 + y;
-        if (cy < 0 || cy >= ch) continue;
+        if (cy < top || cy >= bottom || cy < 0 || cy >= ch) continue;
         for (int x = 0; x < size; ++x) {
             const int cx = x0 + x;
             if (cx < 0 || cx >= cw) continue;
@@ -2743,9 +2835,15 @@ struct PanGlyph {
 };
 
 PanGlyph PanelGlyphFor(const PanelItem& item) {
-    const bool issue = item.kind == "issue";
-    const bool pr    = item.kind == "pr";
-    if (!issue && !pr) return {kOctFileDirectory, kOctGrey};   // a work dir
+    const bool pr = item.kind == "pr";
+    // A path, or anything numberless, is a folder. Any *other* kind with a
+    // number — `question` from the agent-questions flow, whatever comes next — is
+    // drawn like an issue rather than refused: a producer running ahead of this
+    // binary should degrade to a plausible row, not to a folder or to nothing.
+    if (!pr && (item.kind == "path" || item.number <= 0)) {
+        return {kOctFileDirectory, kOctGrey};
+    }
+    const bool issue = !pr;
 
     switch (item.status) {
         case PanStatus::Merged: return {kOctMerge, kOctPurple};
@@ -2790,6 +2888,15 @@ constexpr int kPanHeadGap   = 7;    // padding added to the header row
 constexpr int kPanRuleGap   = 5;    // header rule to the first row
 constexpr int kPanStroke    = 2;
 constexpr int kPanMaxRows   = 6;    // past this, the rest collapse into "+N more"
+constexpr int kPanTabPx     = 12;   // the tab strip's type
+constexpr int kPanTabPadX   = 8;    // inside a tab, either side of its label
+constexpr int kPanTabGap    = 4;    // between tabs
+constexpr int kPanTabPadY   = 6;
+constexpr int kPanTabRule   = 2;    // the active tab's accent, GitHub's weight
+constexpr int kPanScrollBar = 3;    // the scroll indicator, at 96 dpi
+constexpr int kPanScrollPx  = 56;   // how far one wheel notch moves the list
+constexpr float kPanMaxFrac = 0.70f;  // ceiling on a full list: this much of the
+                                      // target's client height
 constexpr int kPanTick      = 40;   // ms between follow/hover passes
 constexpr int kPanResolveMs = 500;  // ms between title→window resolver passes
 // A registration is dropped this long after its last POST. Long enough that a
@@ -2810,6 +2917,7 @@ constexpr Rgb kPanLine  {0x3d / 255.f, 0x44 / 255.f, 0x4d / 255.f};   // #3d444d
 constexpr Rgb kPanTextA {0xd1 / 255.f, 0xd7 / 255.f, 0xe0 / 255.f};   // #d1d7e0
 constexpr Rgb kPanTextB {0x91 / 255.f, 0x98 / 255.f, 0xa1 / 255.f};   // #9198a1
 constexpr Rgb kPanHover {0x2a / 255.f, 0x31 / 255.f, 0x3c / 255.f};   // #2a313c
+constexpr Rgb kPanAccent{0xf7 / 255.f, 0x81 / 255.f, 0x66 / 255.f};   // #f78166
 
 // The scale the card currently being built is drawn at. Panels are only ever
 // built on the panel thread (or on the main thread by --panel-preview), so a
@@ -2826,6 +2934,46 @@ Rgb PanFill()   { return kPanBg; }
 Rgb PanInk()    { return kPanTextA; }
 Rgb PanDimInk() { return kPanTextB; }
 Rgb PanBorder() { return kPanLine; }
+
+// ── the tab strip ───────────────────────────────────────────────────────────
+// A table rather than a switch, because the interesting tab is the one that does
+// not exist yet: `Pending (N)` for questions an agent is waiting on Fernando to
+// answer is one row added here and nothing else. A tab with nothing in it is not
+// shown, and if that leaves only `All` there is no strip at all — the panel is
+// six rows in the corner of a terminal, and furniture has to earn its line.
+
+bool PanTabAll(const PanelItem&)  { return true; }
+bool PanTabIssue(const PanelItem& i) { return i.kind == "issue"; }
+bool PanTabPr(const PanelItem& i)    { return i.kind == "pr"; }
+
+struct PanTab {
+    const char* id;
+    const char* label;
+    bool (*match)(const PanelItem&);
+    bool counted;   // "Issues (3)"; `All` is a mode, not a quantity
+};
+
+constexpr PanTab kPanTabs[] = {
+    {"all",    "All",    PanTabAll,   false},
+    {"issues", "Issues", PanTabIssue, true},
+    {"prs",    "PRs",    PanTabPr,    true},
+};
+constexpr int kPanTabCount = static_cast<int>(sizeof(kPanTabs) / sizeof(kPanTabs[0]));
+
+int PanTabIndex(const std::string& id) {
+    for (int i = 0; i < kPanTabCount; ++i) {
+        if (id == kPanTabs[i].id) return i;
+    }
+    return 0;
+}
+
+size_t PanTabTally(const PanTab& tab, const std::vector<PanelItem>& items) {
+    size_t n = 0;
+    for (const PanelItem& it : items) {
+        if (tab.match(it)) ++n;
+    }
+    return n;
+}
 
 std::string PanCountText(size_t n) {
     return std::to_string(n) + (n == 1 ? " item" : " items");
@@ -2859,10 +3007,48 @@ struct PanelCard {
     int                   rule_y = -1;       // hairline under the header, -1 for none
     struct Row {
         RECT hit;
-        int  item;   // index into items, or -1 for the "+N more" row
+        int  item;   // index into items, or one of the two controls below
     };
     std::vector<Row> rows;
+    struct Tab {
+        RECT hit;
+        int  index;   // into kPanTabs
+    };
+    std::vector<Tab> tabs;
+    int              scroll_max = 0;   // >0 when the list is taller than its viewport
 };
+
+// Every row is clickable, so the two that are controls rather than items get
+// their own indices rather than being "not a row".
+constexpr int kPanRowMore = -1;   // "+N more"  -> show everything
+constexpr int kPanRowLess = -2;   // "show less" -> back to the first six
+
+// The rows live in a viewport that can be shorter than they are, so everything
+// drawn into it is clipped vertically. Cheaper and simpler than compositing a
+// separate rows layer: the header sits outside the same band and must survive.
+void PanStampMask(std::vector<uint8_t>* layer, int layer_w, int layer_h,
+                  const TextMask& m, int x0, int y0, int top, int bottom) {
+    for (int y = 0; y < m.h; ++y) {
+        const int cy = y0 + y;
+        if (cy < top || cy >= bottom || cy < 0 || cy >= layer_h) continue;
+        for (int x = 0; x < m.w; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= layer_w) continue;
+            (*layer)[static_cast<size_t>(cy) * layer_w + cx] =
+                m.a[static_cast<size_t>(y) * m.w + x];
+        }
+    }
+}
+
+void PanFillRect(std::vector<uint32_t>* deco, int w, int h, RECT r, const Rgb& colour,
+                 float alpha) {
+    for (int y = std::max<int>(0, r.top); y < std::min<int>(h, r.bottom); ++y) {
+        for (int x = std::max<int>(0, r.left); x < std::min<int>(w, r.right); ++x) {
+            uint32_t& dst = (*deco)[static_cast<size_t>(y) * w + x];
+            dst = BlendOver(Pack(colour, alpha), dst);
+        }
+    }
+}
 
 // One line, cut with an ellipsis rather than wrapped: a row is a handle, not a
 // paragraph. DT_SINGLELINE turns off the rasterizer's word breaking, and the
@@ -2872,8 +3058,18 @@ TextMask PanLine(const std::string& text, bool bold, int max_w) {
                       DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
+// `max_h` caps the card (0 = no ceiling) and `scroll` is clamped in place, so a
+// list longer than its viewport can be wheeled through. Both only ever matter
+// once the "+N more" row has been clicked.
+// `cap_title`/`cap` take the header line over while the panel is speaking: what
+// the voice is saying about this terminal is more urgent than what it is working
+// on, and it is the same line either way rather than a row that appears and
+// shoves the list down.
 void BuildPanelCard(PanelCard* out, const std::string& summary,
-                    const std::vector<PanelItem>& items, bool collapsed, float scale) {
+                    const std::vector<PanelItem>& items, bool collapsed,
+                    const std::string& tab, bool expanded_all, float scale, int max_h,
+                    int* scroll, const std::string& cap_title = std::string(),
+                    const std::string& cap = std::string()) {
     *out = PanelCard{};
     g_pan_scale = scale;
 
@@ -2929,9 +3125,55 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // The header doubles as the summary line: one row is enough for "what is
         // this terminal doing", and giving the toggle its own row would spend a
         // line of the terminal on furniture.
-        const std::string head_text = summary.empty() ? PanCountText(items.size()) : summary;
-        const TextMask head = PanLine(head_text, false, inner - toggle - tgap);
-        const int head_h = std::max(head.h, toggle) + PanScale(kPanHeadGap);
+        const bool  spoken   = !cap_title.empty() || !cap.empty();
+        const int   head_w   = inner - toggle - tgap;
+        const std::string head_text =
+            spoken ? cap_title
+                   : (summary.empty() ? PanCountText(items.size()) : summary);
+        const TextMask head = PanLine(head_text, spoken, head_w);
+        // Speaking: a bold title and the caption beside it, laid out like a row.
+        TextMask head_rest;
+        if (spoken && !cap.empty()) {
+            const int rest = head_w - head.w - (head.w ? PanScale(kPanLabelGap) : 0);
+            if (rest >= PanScale(56)) head_rest = PanLine(cap, false, rest);
+        }
+        const int head_h =
+            std::max({head.h, head_rest.h, toggle}) + PanScale(kPanHeadGap);
+
+        // Which tabs exist for this list, and which of them is showing. An empty
+        // tab is not offered, and a selection whose tab has emptied falls back to
+        // `All` without being forgotten — the items may well come back.
+        struct TabBuild {
+            int      index;
+            TextMask label;
+            int      w = 0;
+        };
+        std::vector<TabBuild> tabs;
+        int                   active = 0;
+        for (int i = 0; i < kPanTabCount; ++i) {
+            const size_t n = PanTabTally(kPanTabs[i], items);
+            if (i > 0 && n == 0) continue;
+            TabBuild t;
+            t.index = i;
+            std::string label = kPanTabs[i].label;
+            if (kPanTabs[i].counted) label += " (" + std::to_string(n) + ")";
+            t.label = RenderText(Wide(label), PanScale(kPanTabPx), true, inner, 1,
+                                 DT_SINGLELINE | DT_END_ELLIPSIS);
+            t.w     = t.label.w + 2 * PanScale(kPanTabPadX);
+            if (tab == kPanTabs[i].id) active = static_cast<int>(tabs.size());
+            tabs.push_back(std::move(t));
+        }
+        if (tabs.size() < 2) tabs.clear();   // only `All`: no strip worth the line
+        int tab_h = 0;
+        for (const TabBuild& t : tabs) {
+            tab_h = std::max(tab_h, t.label.h + 2 * PanScale(kPanTabPadY));
+        }
+        const PanTab& filter = kPanTabs[tabs.empty() ? 0 : tabs[active].index];
+
+        std::vector<int> view;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (filter.match(items[i])) view.push_back(static_cast<int>(i));
+        }
 
         struct RowBuild {
             TextMask label, title;
@@ -2939,32 +3181,48 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         };
         std::vector<RowBuild> built;
         const int text_w = inner - icon - igap;
-        const size_t shown = std::min<size_t>(items.size(), kPanMaxRows);
-        for (size_t i = 0; i < shown; ++i) {
+        const size_t shown =
+            expanded_all ? view.size() : std::min<size_t>(view.size(), kPanMaxRows);
+        for (size_t k = 0; k < shown; ++k) {
+            const PanelItem& item = items[view[k]];
             RowBuild r;
-            r.item  = static_cast<int>(i);
-            r.label = PanLine(items[i].Label(), true, text_w);
+            r.item  = view[k];
+            r.label = PanLine(item.Label(), true, text_w);
             // Whatever the label leaves. Below a usable remainder the title is
             // dropped entirely rather than shown as three characters and a dot.
             const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
-            std::string title = items[i].title;
-            if (title == items[i].Label()) title.clear();
+            std::string title = item.title;
+            if (title == item.Label()) title.clear();
             if (!title.empty() && rest >= PanScale(56)) r.title = PanLine(title, false, rest);
             r.h = std::max({r.label.h, r.title.h, icon}) + PanScale(kPanRowGap);
             built.push_back(std::move(r));
         }
-        if (items.size() > shown) {
+        // The last row is a control either way: what is hidden, or the way back.
+        if (view.size() > shown || (expanded_all && view.size() > kPanMaxRows)) {
             RowBuild r;
-            r.item  = -1;
-            r.label = PanLine("+" + std::to_string(items.size() - shown) + " more", false,
-                              inner);
+            const bool more = view.size() > shown;
+            r.item  = more ? kPanRowMore : kPanRowLess;
+            r.label = PanLine(more ? "+" + std::to_string(view.size() - shown) + " more"
+                                   : std::string("show less"),
+                              false, inner);
             r.h     = r.label.h + PanScale(kPanRowGap);
             built.push_back(std::move(r));
         }
 
         int rows_h = 0;
         for (const RowBuild& r : built) rows_h += r.h;
-        const int panel_h = pad + head_h + PanScale(kPanRuleGap) + rows_h + pad;
+
+        // A full list must not swallow the terminal it is sitting in, so it is
+        // capped and the overflow is wheeled through instead.
+        const int chrome  = pad + head_h + tab_h + PanScale(kPanRuleGap) + pad;
+        int       view_h  = rows_h;
+        if (max_h > 0 && chrome + rows_h > max_h) {
+            view_h = std::max(PanScale(48), max_h - chrome);
+        }
+        out->scroll_max = std::max(0, rows_h - view_h);
+        int at = scroll ? std::max(0, std::min(*scroll, out->scroll_max)) : 0;
+        if (scroll) *scroll = at;
+        const int panel_h = chrome + view_h;
 
         out->margin  = margin;
         out->panel_w = panel_w;
@@ -2982,8 +3240,13 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // The whole top band, padding included: the header is meant to be an easy
         // thing to hit, since it is the one control on the card.
         out->header = RECT{margin, margin, margin + panel_w, y + head_h};
-        StampMask(&out->dim, out->w, out->h, head, margin + pad,
+        StampMask(spoken ? &out->ink : &out->dim, out->w, out->h, head, margin + pad,
                   y + (head_h - head.h) / 2);
+        if (head_rest.w) {
+            StampMask(&out->dim, out->w, out->h, head_rest,
+                      margin + pad + head.w + PanScale(kPanLabelGap),
+                      y + (head_h - head_rest.h) / 2);
+        }
         const int tx = margin + panel_w - pad - toggle;
         const int ty = y + (head_h - toggle) / 2;
         const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
@@ -2993,32 +3256,73 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             return SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc) - tw;
         });
         y += head_h;
-        out->rule_y = y + PanScale(2);
+
+        // The strip sits on the hairline, GitHub's underlined nav: the active
+        // tab's accent replaces that line under itself, which is what makes the
+        // pair read as one control rather than as a label above a border.
+        if (!tabs.empty()) {
+            int tx_at = margin + pad - PanScale(kPanTabPadX);
+            for (size_t i = 0; i < tabs.size(); ++i) {
+                const TabBuild& t = tabs[i];
+                const RECT hit{tx_at, y, tx_at + t.w, y + tab_h};
+                out->tabs.push_back(PanelCard::Tab{hit, t.index});
+                const bool on = (static_cast<int>(i) == active);
+                StampMask(on ? &out->ink : &out->dim, out->w, out->h, t.label,
+                          tx_at + PanScale(kPanTabPadX), y + (tab_h - t.label.h) / 2);
+                if (on) {
+                    PanFillRect(&out->deco, out->w, out->h,
+                                RECT{tx_at, y + tab_h - PanScale(kPanTabRule),
+                                     tx_at + t.w, y + tab_h},
+                                kPanAccent, 1.f);
+                }
+                tx_at += t.w + PanScale(kPanTabGap);
+            }
+            y += tab_h;
+        }
+        out->rule_y = y + (tabs.empty() ? PanScale(2) : -1);
         y += PanScale(kPanRuleGap);
+
+        const int view_top = y, view_bottom = y + view_h;
+        y -= at;   // the whole list slides under the viewport
 
         for (const RowBuild& r : built) {
             // Rows claim the full width bar a hair each side, so the highlight
             // reads as a band across the card rather than as a button in it.
             const int slop = PanScale(4);
-            out->rows.push_back(PanelCard::Row{
-                RECT{margin + slop, y, margin + panel_w - slop, y + r.h}, r.item});
+            const int top = std::max(y, view_top), bot = std::min(y + r.h, view_bottom);
+            if (bot > top) {
+                out->rows.push_back(PanelCard::Row{
+                    RECT{margin + slop, top, margin + panel_w - slop, bot}, r.item});
+            }
             if (r.item < 0) {
-                StampMask(&out->dim, out->w, out->h, r.label, margin + pad,
-                          y + (r.h - r.label.h) / 2);
+                PanStampMask(&out->dim, out->w, out->h, r.label, margin + pad,
+                             y + (r.h - r.label.h) / 2, view_top, view_bottom);
             } else {
                 const PanGlyph g = PanelGlyphFor(items[r.item]);
                 StampOcticon(&out->deco, out->w, out->h, margin + pad,
-                             y + (r.h - icon) / 2, icon, g.path, g.colour);
+                             y + (r.h - icon) / 2, icon, g.path, g.colour,
+                             view_top, view_bottom);
                 const int lx = margin + pad + icon + igap;
-                StampMask(&out->ink, out->w, out->h, r.label, lx,
-                          y + (r.h - r.label.h) / 2);
+                PanStampMask(&out->ink, out->w, out->h, r.label, lx,
+                             y + (r.h - r.label.h) / 2, view_top, view_bottom);
                 if (r.title.w) {
-                    StampMask(&out->dim, out->w, out->h, r.title,
-                              lx + r.label.w + PanScale(kPanLabelGap),
-                              y + (r.h - r.title.h) / 2);
+                    PanStampMask(&out->dim, out->w, out->h, r.title,
+                                 lx + r.label.w + PanScale(kPanLabelGap),
+                                 y + (r.h - r.title.h) / 2, view_top, view_bottom);
                 }
             }
             y += r.h;
+        }
+
+        // No scrollbar chrome, just enough of a mark to say there is more and
+        // roughly where you are in it.
+        if (out->scroll_max > 0) {
+            const int bw = PanScale(kPanScrollBar);
+            const int bx = margin + panel_w - PanScale(5) - bw;
+            const int bh = std::max(PanScale(18), view_h * view_h / std::max(1, rows_h));
+            const int by = view_top + (view_h - bh) * at / out->scroll_max;
+            PanFillRect(&out->deco, out->w, out->h,
+                        RECT{bx, by, bx + bw, by + bh}, kPanLine, 0.95f);
         }
     }
 
@@ -3041,7 +3345,8 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
 
 // Shadow, fill, hairline, the hovered band, badges, text. `hover` is the row
 // rectangle to light up (the header counts as one), or null.
-void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, float fade) {
+void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, float fade,
+                  float glow, float voice) {
     const Rgb fill   = PanFill();
     const Rgb border = PanBorder();
     const Rgb ink    = PanInk();
@@ -3050,6 +3355,10 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
     const float sigma = std::max(1.f, PanScale(kPanShadow) * 0.52f);
     const int   drop  = PanScale(5);
     const float hr    = static_cast<float>(PanScale(6));   // the highlight's corners
+    // Loud passages reach further out and burn brighter, but the halo never
+    // vanishes between syllables — the same asymmetry the ring's own envelope has.
+    const float gi    = glow * (0.30f + 0.55f * Clamp01(voice));
+    const float gsig  = std::max(1.f, PanScale(6) * (1.f + 0.60f * Clamp01(voice)));
 
     std::memset(frame, 0, static_cast<size_t>(card.w) * card.h * 4);
     for (int y = 0; y < card.h; ++y) {
@@ -3065,14 +3374,36 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
                     std::max(card.dist[static_cast<size_t>(sy) * card.w + x], 0.f);
                 shadow = kPanShadowA * std::exp(-(sd / sigma) * (sd / sigma));
             }
-            if (inside <= 0.004f && shadow <= 0.004f) continue;
+            // A halo leaving the card's own outline, outside it only: the card is
+            // opaque, so there is nothing for an inward glow to light. Computed
+            // before the early-out, or the glow would be clipped off the top edge
+            // where the drop shadow (sampled a few rows up) contributes nothing.
+            float halo = 0.f;
+            if (gi > 0.004f && d > -1.f) {
+                const float t = std::max(d, 0.f) / gsig;
+                halo = gi * std::exp(-t * t) * 0.62f;
+            }
+            if (inside <= 0.004f && shadow <= 0.004f && halo <= 0.004f) continue;
 
             uint32_t p = 0;
             if (shadow > 0.004f) p = Pack(kShadowInk, Clamp01(shadow));
+            if (halo > 0.004f) p = BlendOver(Pack(kEmber, halo), p);
             if (inside > 0.004f) {
                 p = BlendOver(Pack(fill, inside * kPanFillAlpha), p);
-                const float edge = inside * (1.f - SmoothStep(-1.8f, -0.3f, d));
-                if (edge > 0.004f) p = BlendOver(Pack(border, edge * kPanFillAlpha), p);
+                // A band a pixel or two wide just *inside* the edge. Note the
+                // direction: `dist` is negative inside, so the ramp has to rise
+                // towards the boundary. Getting that backwards paints the whole
+                // card in the border colour, which is invisible when the border
+                // is 13% off the fill (as the caption toast's is) and very much
+                // not when it is #3d444d on #212830.
+                const float edge = inside * SmoothStep(-1.8f, -0.3f, d);
+                if (edge > 0.004f) {
+                    // The hairline takes the colour too, so the outline reads as
+                    // lit rather than as a card with something behind it.
+                    const Rgb line = gi > 0.004f ? Mix(border, kEmber, Clamp01(gi))
+                                                 : border;
+                    p = BlendOver(Pack(line, edge * kPanFillAlpha), p);
+                }
                 if (card.rule_y >= 0 && y == card.rule_y &&
                     x > card.margin && x < card.margin + card.panel_w) {
                     p = BlendOver(Pack(kPanLine, 1.f), p);
@@ -3101,10 +3432,15 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
 
 // ── a live panel ────────────────────────────────────────────────────────────
 
-// Nothing outside is clickable, so a row index of -1 is the header and -2 is
-// "no row". Kept as ints rather than an enum because rows are indices.
-constexpr int kPanHitNone   = -2;
-constexpr int kPanHitHeader = -1;
+// What is under the pointer. Three kinds of thing are clickable now — the
+// header, a tab, a row — so this is a pair rather than an index with sentinels.
+struct PanHit {
+    enum class Kind { None, Header, Tab, Row } kind = Kind::None;
+    int index = -1;
+
+    bool operator==(const PanHit& o) const { return kind == o.kind && index == o.index; }
+    bool operator!=(const PanHit& o) const { return !(*this == o); }
+};
 
 // A *registration*, not a window: a session says what it is working on and which
 // window title to look for, and that outlives any particular window. Windows
@@ -3120,8 +3456,20 @@ struct Panel {
     std::vector<PanelItem> items;
     time_t    updated_at = 0;        // last POST; registrations expire 48 h after it
     bool      collapsed = false;
+    // These three survive a POST and a collapse: what the card is showing is the
+    // reader's business, not the producer's.
+    std::string tab = "all";         // which tab is selected, by id
+    bool      expanded_all = false;  // the "+N more" row has been clicked
+    int       scroll   = 0;          // px the full list is wheeled down by
+    int       max_h    = 0;          // ceiling from the target's client height
     bool      dirty     = true;      // content changed: the card needs rebuilding
-    int       hover     = kPanHitNone;
+    PanHit    hover{};
+    // The speaking glow: `glow` eases in and out so the card arrives and leaves
+    // with the voice rather than snapping, `voice` is the live envelope, and the
+    // captions replace the summary line while it lasts.
+    float       glow = 0.f, voice = 0.f;
+    bool        speaking = false;
+    std::string cap_title, cap;
     float     scale     = 1.f;
     PanelCard card;
 
@@ -3157,16 +3505,21 @@ bool PanelInside(const Panel* p, POINT screen) {
            y >= p->card.margin && y < p->card.margin + p->card.panel_h;
 }
 
-int PanelRowAt(const Panel* p, POINT screen) {
-    if (!PanelInside(p, screen)) return kPanHitNone;
+PanHit PanelHitAt(const Panel* p, POINT screen) {
+    if (!PanelInside(p, screen)) return {};
     POINT q{screen.x - p->pos.x, screen.y - p->pos.y};
-    if (PtInRect(&p->card.header, q)) return kPanHitHeader;
-    for (size_t i = 0; i < p->card.rows.size(); ++i) {
-        if (p->card.rows[i].item >= 0 && PtInRect(&p->card.rows[i].hit, q)) {
-            return static_cast<int>(i);
+    if (PtInRect(&p->card.header, q)) return {PanHit::Kind::Header, 0};
+    for (size_t i = 0; i < p->card.tabs.size(); ++i) {
+        if (PtInRect(&p->card.tabs[i].hit, q)) {
+            return {PanHit::Kind::Tab, static_cast<int>(i)};
         }
     }
-    return kPanHitNone;
+    for (size_t i = 0; i < p->card.rows.size(); ++i) {
+        if (PtInRect(&p->card.rows[i].hit, q)) {
+            return {PanHit::Kind::Row, static_cast<int>(i)};
+        }
+    }
+    return {};
 }
 
 // A row's target is handed to ShellExecute, so it is worth being narrow about
@@ -3200,7 +3553,7 @@ void PanelCompose(Panel* p);   // defined with the render pass below
 void PanelToggle(Panel* p) {
     p->collapsed = !p->collapsed;
     p->dirty     = true;
-    p->hover     = kPanHitNone;
+    p->hover     = PanHit{};
 }
 
 LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3217,13 +3570,23 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!p) break;
             POINT cur{};
             GetCursorPos(&cur);
-            const int hit = PanelRowAt(p, cur);
-            if (hit == kPanHitHeader) {
+            const PanHit hit = PanelHitAt(p, cur);
+            if (hit.kind == PanHit::Kind::Header) {
                 PanelToggle(p);
-            } else if (hit >= 0) {
-                const int idx = p->card.rows[hit].item;
+            } else if (hit.kind == PanHit::Kind::Tab) {
+                p->tab    = kPanTabs[p->card.tabs[hit.index].index].id;
+                p->scroll = 0;
+                p->dirty  = true;
+                p->hover  = PanHit{};
+            } else if (hit.kind == PanHit::Kind::Row) {
+                const int idx = p->card.rows[hit.index].item;
                 if (idx >= 0 && idx < static_cast<int>(p->items.size())) {
                     PanelOpen(p->items[idx]);
+                } else if (idx == kPanRowMore || idx == kPanRowLess) {
+                    p->expanded_all = (idx == kPanRowMore);
+                    p->scroll       = 0;
+                    p->dirty        = true;
+                    p->hover        = PanHit{};
                 }
             }
             return 0;
@@ -3247,16 +3610,32 @@ void PanelCompose(Panel* p) {
     if (!p->bits) return;
     g_pan_scale = p->scale;
     const RECT* hover = nullptr;
-    if (p->hover == kPanHitHeader) {
-        hover = &p->card.header;
-    } else if (p->hover >= 0 && p->hover < static_cast<int>(p->card.rows.size())) {
-        hover = &p->card.rows[p->hover].hit;
+    const int   i     = p->hover.index;
+    switch (p->hover.kind) {
+        case PanHit::Kind::Header:
+            hover = &p->card.header;
+            break;
+        case PanHit::Kind::Tab:
+            if (i >= 0 && i < static_cast<int>(p->card.tabs.size())) {
+                hover = &p->card.tabs[i].hit;
+            }
+            break;
+        case PanHit::Kind::Row:
+            if (i >= 0 && i < static_cast<int>(p->card.rows.size())) {
+                hover = &p->card.rows[i].hit;
+            }
+            break;
+        default:
+            break;
     }
-    ComposePanel(static_cast<uint32_t*>(p->bits), p->card, hover, 1.f);
+    ComposePanel(static_cast<uint32_t*>(p->bits), p->card, hover, 1.f, p->glow,
+                 p->voice);
 }
 
 void PanelRender(Panel* p) {
-    BuildPanelCard(&p->card, p->summary, p->items, p->collapsed, p->scale);
+    BuildPanelCard(&p->card, p->summary, p->items, p->collapsed, p->tab,
+                   p->expanded_all, p->scale, p->max_h, &p->scroll, p->cap_title,
+                   p->cap);
     if (p->card.w != p->dib_w || p->card.h != p->dib_h) {
         p->ReleaseDib();
         HDC screen = GetDC(nullptr);
@@ -3426,6 +3805,59 @@ int ResolvePanelTarget(const std::string& title, HWND* out, std::string* err,
     return PanelResolve(PanelPools::Snapshot(), title, out, err, candidates);
 }
 
+// ── the receiving end of the beacon ─────────────────────────────────────────
+// Keyed by target window, not by session or by title: the card *shown* on that
+// hwnd is the context for that window, whichever registration happens to own it,
+// which is the same rule the resolver uses to decide what is shown there at all.
+
+struct SpeakingAt {
+    float       level = 0.f;
+    std::string cap_title, cap;
+    bool        active = false;
+    DWORD       heard  = 0;      // GetTickCount of the last datagram
+};
+
+std::mutex                              g_speaking_mtx;
+std::unordered_map<HWND, SpeakingAt>    g_speaking;
+
+// Its own thread, and a blocking recvfrom: an utterance's worth of datagrams
+// must not wait behind a panel POST, nor hold one up.
+void RunBeaconServer(int port) {
+    if (!WinsockInit()) return;
+    SOCKET fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == INVALID_SOCKET) return;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // never off this machine
+    addr.sin_port        = htons(static_cast<unsigned short>(port));
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        std::fprintf(stderr, "speak: speaking beacon could not take port %d\n", port);
+        closesocket(fd);
+        return;
+    }
+    for (;;) {
+        SpeakBeacon msg;
+        const int n = recv(fd, reinterpret_cast<char*>(&msg), sizeof(msg), 0);
+        if (n == SOCKET_ERROR) break;
+        if (n != static_cast<int>(sizeof(msg)) || msg.magic != kBeaconMagic ||
+            msg.version != kBeaconVersion || !msg.hwnd) {
+            continue;
+        }
+        msg.caption_title[sizeof(msg.caption_title) - 1] = 0;
+        msg.caption[sizeof(msg.caption) - 1] = 0;
+
+        SpeakingAt at;
+        at.level     = Clamp01(msg.level);
+        at.cap_title = msg.caption_title;
+        at.cap       = msg.caption;
+        at.active    = msg.active != 0;
+        at.heard     = GetTickCount();
+        std::lock_guard<std::mutex> lock(g_speaking_mtx);
+        g_speaking[reinterpret_cast<HWND>(static_cast<uintptr_t>(msg.hwnd))] = at;
+    }
+    closesocket(fd);
+}
+
 // ── the panel thread ────────────────────────────────────────────────────────
 // One thread owns every panel window: they are created there, drawn there, bound
 // to a target there and their clicks are handled there, so nothing about a panel
@@ -3454,6 +3886,36 @@ std::string g_pan_snapshot = "[]";
 void PanelEnqueue(PanelCmd cmd) {
     std::lock_guard<std::mutex> lock(g_pan_queue_mtx);
     g_pan_queue.push_back(std::move(cmd));
+}
+
+// The live registrations, for the mouse hook — which runs on this same thread,
+// so it needs no lock, only a way to reach them.
+std::vector<std::unique_ptr<Panel>>* g_pan_live = nullptr;
+
+// A layered WS_EX_NOACTIVATE window never has focus, and WM_MOUSEWHEEL goes to
+// the focused window rather than the one under the pointer — so the panel would
+// never see a wheel event at all. Hence a low-level mouse hook, installed on the
+// panel thread and called on its message queue. Swallowing the notch (returning
+// 1) is the point as much as reading it: scrolling the list must not also scroll
+// the terminal underneath.
+LRESULT CALLBACK PanelMouseHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && wp == WM_MOUSEWHEEL && g_pan_live) {
+        const auto* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+        const int   delta = GET_WHEEL_DELTA_WPARAM(m->mouseData);
+        const HWND  under = WindowFromPoint(m->pt);
+        for (std::unique_ptr<Panel>& up : *g_pan_live) {
+            if (up->hwnd != under || up->card.scroll_max <= 0) continue;
+            g_pan_scale = up->scale;
+            const int step = PanScale(kPanScrollPx) * (delta > 0 ? -1 : 1);
+            const int want = std::max(0, std::min(up->scroll + step, up->card.scroll_max));
+            if (want != up->scroll) {
+                up->scroll = want;
+                up->dirty  = true;
+            }
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 // Z-order only. Following the target's *geometry* is done by polling below: a
@@ -3619,6 +4081,9 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
                 ",\"resolved\":" + (p->target ? "true" : "false") +
                 ",\"items\":" + std::to_string(p->items.size()) +
                 ",\"collapsed\":" + (p->collapsed ? "true" : "false") +
+                ",\"tab\":\"" + JsonEscape(p->tab) + "\"" +
+                ",\"expanded_all\":" + (p->expanded_all ? "true" : "false") +
+                ",\"speaking\":" + (p->speaking ? "true" : "false") +
                 ",\"updated_at\":\"" + PanelIso8601(p->updated_at) + "\"}";
     }
     json += "]";
@@ -3645,6 +4110,9 @@ void PanelThread(float seconds) {
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     std::vector<std::unique_ptr<Panel>> panels;
+    g_pan_live = &panels;
+    HHOOK mouse = SetWindowsHookExW(WH_MOUSE_LL, PanelMouseHook,
+                                    GetModuleHandleW(nullptr), 0);
     const DWORD started = GetTickCount();
     int         until_resolve = 0;   // ticks left before the next resolver pass
 
@@ -3679,6 +4147,20 @@ void PanelThread(float seconds) {
         POINT cursor{};
         GetCursorPos(&cursor);
 
+        std::unordered_map<HWND, SpeakingAt> speaking;
+        {
+            std::lock_guard<std::mutex> lock(g_speaking_mtx);
+            const DWORD now = GetTickCount();
+            for (auto it = g_speaking.begin(); it != g_speaking.end();) {
+                // Two seconds of silence and the entry goes: the fade below is
+                // over long before that, and a client killed mid-sentence must
+                // not leave a card lit.
+                if (now - it->second.heard > 2000) it = g_speaking.erase(it);
+                else ++it;
+            }
+            speaking = g_speaking;
+        }
+
         for (size_t i = panels.size(); i-- > 0;) {
             Panel* p = panels[i].get();
 
@@ -3708,6 +4190,47 @@ void PanelThread(float seconds) {
                 p->scale = scale;
                 p->dirty = true;
             }
+            // A full list is capped at a fraction of the window it sits in, so it
+            // can never bury the terminal it is meant to annotate.
+            const int max_h =
+                static_cast<int>((client.bottom - client.top) * kPanMaxFrac);
+            if (max_h != p->max_h) {
+                p->max_h = max_h;
+                p->dirty = true;
+            }
+            // A datagram inside the last quarter second means the voice is
+            // still going; anything older is the tail.
+            bool  live  = false;
+            float voice = 0.f;
+            const auto found = speaking.find(p->target);
+            if (found != speaking.end()) {
+                live  = found->second.active &&
+                        GetTickCount() - found->second.heard < 250;
+                voice = found->second.level;
+                if (live && (p->cap_title != found->second.cap_title ||
+                             p->cap != found->second.cap)) {
+                    p->cap_title = found->second.cap_title;
+                    p->cap       = found->second.cap;
+                    p->dirty     = true;
+                }
+            }
+            // ~1.5 s to fall, a few frames to rise: the card lights with the
+            // first sample and lets go slowly, like the ring.
+            const float target_glow = live ? 1.f : 0.f;
+            const float ease = live ? 0.25f : kPanTick / 1500.f;
+            p->glow += (target_glow - p->glow) * ease;
+            if (!live && p->glow < 0.01f) p->glow = 0.f;
+            p->voice += (voice * (live ? 1.f : 0.f) - p->voice) * 0.35f;
+            if (p->speaking != live) {
+                p->speaking = live;
+                // Coming back: the summary returns to the header line.
+                if (!live) {
+                    p->cap_title.clear();
+                    p->cap.clear();
+                    p->dirty = true;
+                }
+            }
+
             bool redrawn = false;
             if (p->dirty || !p->bits) {
                 PanelRender(p);
@@ -3737,10 +4260,16 @@ void PanelThread(float seconds) {
             // Hover from the cursor rather than from WM_MOUSEMOVE: it needs no
             // WM_MOUSELEAVE tracking, and WindowFromPoint is also the occlusion
             // test — a row does not light up through whatever is covering it.
-            int hover = kPanHitNone;
-            if (WindowFromPoint(cursor) == p->hwnd) hover = PanelRowAt(p, cursor);
+            PanHit hover{};
+            if (WindowFromPoint(cursor) == p->hwnd) hover = PanelHitAt(p, cursor);
             if (hover != p->hover) {
                 p->hover = hover;
+                PanelCompose(p);
+                redrawn = true;
+            }
+            // The glow moves every frame, which is a recompose and never a
+            // rebuild: no text is re-measured to make a card breathe.
+            if (p->glow > 0.f && !redrawn) {
                 PanelCompose(p);
                 redrawn = true;
             }
@@ -3768,8 +4297,10 @@ void PanelThread(float seconds) {
         Sleep(kPanTick);
     }
 
+    if (mouse) UnhookWindowsHookEx(mouse);
     for (size_t i = panels.size(); i-- > 0;) PanelDestroy(&panels[i]);
     panels.clear();
+    g_pan_live = nullptr;
     if (hook) UnhookWinEvent(hook);
 }
 
@@ -3960,6 +4491,8 @@ void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& bo
 // more" row appears.
 
 const char* kPanSampleSummary = "i47 - wiring the attention panel into the daemon";
+constexpr size_t kPanSampleRows = 8;   // the sample list, so a preview can point
+                                       // at its last row
 
 std::vector<PanelItem> SamplePanelItems() {
     const auto make = [](const char* kind, const char* repo, long number,
@@ -4005,23 +4538,39 @@ void PanelPreview(const std::string& prefix) {
     const std::vector<PanelItem> items = SamplePanelItems();
     struct Shot {
         const char* suffix;
+        const char* tab;
         bool        collapsed;
-        int         hover;   // row to light up, -3 for none
+        bool        all;
+        int         hover;    // row to light up, -3 for none
+        float       glow;     // the speaking halo, 0..1
+        float       voice;    // the amplitude driving it
+        const char* cap_title;
+        const char* cap;
     };
     const Shot shots[] = {
-        {"-expanded.png",  false, -3},
-        {"-hover.png",     false, 1},
-        {"-collapsed.png", true,  -3},
+        {"-expanded.png",  "all", false, false, -3, 0.f, 0.f, "", ""},
+        {"-hover.png",     "all", false, false, 1,  0.f, 0.f, "", ""},
+        {"-collapsed.png", "all", true,  false, -3, 0.f, 0.f, "", ""},
+        // Everything, with the way back on the last row — and that row hovered,
+        // since being clickable is the whole point of it.
+        {"-all.png",       "all", false, true,  static_cast<int>(kPanSampleRows),
+         0.f, 0.f, "", ""},
+        {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", ""},
+        // Mid-utterance: lit, and the header carrying what is being said.
+        {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
+         "laravel-opticloud #1375", "checks are green, ready to merge"},
     };
     for (const Shot& shot : shots) {
         PanelCard card;
-        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, scale);
+        int       scroll = 0;
+        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, shot.tab,
+                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
         std::vector<uint32_t> px(static_cast<size_t>(card.w) * card.h);
         const RECT* hover = nullptr;
         if (shot.hover >= 0 && shot.hover < static_cast<int>(card.rows.size())) {
             hover = &card.rows[shot.hover].hit;
         }
-        ComposePanel(px.data(), card, hover, 1.f);
+        ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
         const std::string path = prefix + shot.suffix;
         WritePng(path, px, card.w, card.h);
         std::printf("%s (%dx%d)\n", path.c_str(), card.w, card.h);
@@ -4332,6 +4881,9 @@ int RunDaemon(const Options& opt) {
         if (opt.point_server) {
             const int point_port = opt.point_port ? opt.point_port : opt.port + 1;
             std::thread(RunPointServer, point_port).detach();
+            // And the speaking beacon on the one after that: UDP, so a 60 Hz
+            // stream of level updates cannot queue behind a /panel POST.
+            std::thread(RunBeaconServer, point_port + 1).detach();
         }
 
         // Keepalive: an idle daemon gets slow again (CPU clocks down, its working
@@ -4726,6 +5278,16 @@ int main() {
             return 1;
         }
         source = std::make_unique<EngineSource>(engine.get(), opt.text, opt.voice);
+    }
+
+    // Aimed at a window? Then a panel parked in that window's corner should
+    // glow with this utterance. The handle has to be known before the first
+    // sample, so it is resolved here rather than at the pointing call afterwards
+    // — and only the handle is needed, so no DPI-aware thread is involved.
+    if (opt.point || opt.point_req.hwnd || !opt.point_req.title.empty()) {
+        g_beacon_port = (opt.point_port ? opt.point_port : opt.port + 1) + 1;
+        g_beacon_hwnd.store(
+            reinterpret_cast<uintptr_t>(ResolveTargetHwnd(opt.point_req)));
     }
 
     std::thread orb;

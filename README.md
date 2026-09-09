@@ -42,6 +42,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **Click the orb to pause**, click again to resume from the same word
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Attention panel** — a clickable list of the PRs, issues and work dirs a terminal is on, parked in its corner
+- **The panel glows** with the voice when speech is aimed at its window, and shows the caption while it talks
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
 - **UTF-8 / accents** — arguments are read as wide chars, so `"Olá, tudo bem?"` works
@@ -474,8 +475,38 @@ Each row is an icon, a short handle (`repo#1375`, or a path's last segment) and
 the title, cut with an ellipsis. **Click a row** and it opens: pull requests and
 issues in the browser, paths in Explorer — one `ShellExecute` does both, which is
 why the two can sit in the same list. Six rows are shown; anything past that
-becomes a `+N more` line, since the point is the top of a ranked list, not the
-whole backlog.
+becomes a **`+N more` row, which is itself clickable** — click it and the panel
+shows everything, with `show less` on the last row to get back to six. Six is the
+right default (the point is the top of a ranked list, not the whole backlog) but
+not a verdict.
+
+A full list is capped at 70% of the target window's client height, so it can
+never bury the terminal it is meant to annotate; past that it scrolls under the
+mouse wheel, with a thin `#3d444d` mark at the right edge and no other scrollbar
+chrome. The wheel needs a low-level mouse hook rather than `WM_MOUSEWHEEL`: a
+`WS_EX_NOACTIVATE` window never has focus, and the wheel goes to the focused
+window, not the one under the pointer. Swallowing the notch is half the reason to
+do it that way — scrolling the list must not also scroll the terminal behind it.
+
+### Tabs
+
+`All` | `Issues (N)` | `PRs (N)`, GitHub's underlined nav: the active tab in
+`#d1d7e0` over a 2 px `#f78166` accent that replaces the hairline under itself,
+the others in `#9198a1`. Clicking one filters the rows — the six-row cap, the
+`+N more` row, `show less` and the scrolling all apply to the filtered list.
+`All` is everything, work directories included.
+
+A tab with nothing in it is not offered, and if that leaves only `All` there is
+no strip at all: the panel is six rows in the corner of a terminal, and furniture
+has to earn its line. A selection whose tab has emptied falls back to showing
+`All` without being forgotten, since the items may well come back.
+
+The tab set is a table of `{id, label, predicate}`, because the interesting tab
+is the one that does not exist yet — `Pending (N)` for questions an agent is
+waiting on an answer to is one row added and nothing else. Which is also why an
+item of an **unknown `kind`** is drawn rather than refused: with a number it gets
+the issue glyph, without one the folder, and it lands in `All`. A producer
+running ahead of this binary degrades to a plausible row instead of a 400.
 
 Each row is marked with **GitHub's own icon for its type**, tinted with GitHub's
 own colour for its state — two pieces of information in the space a status dot
@@ -489,8 +520,9 @@ took, and the same glyph the row's page shows:
 | `merged` | `git-merge` | purple `#8256d0` |
 | closed issue | `issue-closed` | purple `#8256d0` — GitHub's "completed" |
 | closed pull request | `git-pull-request-closed` | red `#c93c37` |
-| `unknown` | its type's icon | grey `#768390` |
-| a path | `file-directory` | grey `#768390` |
+| `unknown` state | its type's icon | grey `#768390` |
+| a path, or any numberless item | `file-directory` | grey `#768390` |
+| any other `kind`, with a number | `issue-opened` | by state, as above |
 
 `approved` is left plain green rather than given a tick overlay: at 14 px a
 second mark inside the glyph turns into grit, and a row's job is "which thing,
@@ -520,12 +552,50 @@ colour among them.
 That is enough to know whether the window wants attention, while giving the
 terminal underneath its corner back.
 
-Collapsed state belongs to the *session*, not to the payload: a new `POST` on a
-collapsed panel bumps the pill and nothing else, and a card that hides because
-its tab went to the background comes back collapsed. A card unfolding itself
+What the card is *showing* — collapsed or not, which tab, whether the list is
+fully expanded — belongs to the **session**, not to the payload: a new `POST` on
+a collapsed panel bumps the pill and nothing else, and a card that hides because
+its terminal tab went to the background comes back exactly as it was. A card unfolding itself
 while you read the terminal is exactly what collapsing it was meant to stop.
 Right click anywhere on the card toggles it too, so the gesture does not require
 finding the header.
+
+### Speaking
+
+When an utterance is aimed at a window — `speak.exe --title "…" "text"`, or
+`--hwnd` — the card parked in that window's corner **glows with the voice**: an
+ember halo off its own outline, its hairline lit, intensity riding the same
+amplitude envelope the orb is drawn from, so the ring in the corner of the screen
+and the card in the corner of the terminal move together rather than merely
+coinciding. It lights with the first sample and lets go over about a second and a
+half. The collapsed pill glows the same way, and a card that is hidden (its
+terminal tab in the background) does not glow at all — there is nothing there to
+light.
+
+While it lasts, the header line carries what is being *said* instead of what the
+session is working on: `--caption-title` in bold, `--caption` beside it, back to
+the summary when the voice stops. What the voice is saying about this terminal is
+the more urgent of the two, and it is the same line either way rather than a row
+that appears and shoves the list down.
+
+The card is matched by **resolved `hwnd`**, never by comparing titles: whichever
+registration owns the card currently shown in that window is the context for that
+window, which is the same rule that decided what is shown there in the first
+place.
+
+Getting the two halves to meet is the interesting part. The panel belongs to the
+resident daemon, while the audio, the amplitude envelope and the caption all
+belong to the one-shot client process doing the playing — and upstream's
+`TTSServer` has its routes hardcoded in a file CMake downloads at a pinned SHA,
+so a field on `POST /tts` was never available. So the client **broadcasts**: one
+fixed-size UDP datagram per frame to loopback on the port after the pointing one
+(`8125` by default), each carrying the whole state — target window, level,
+caption. No setup, no teardown, no session; a gap in the datagrams *is* the end
+of the utterance, which also means a client killed mid-sentence cannot leave a
+card glowing forever. A 60 Hz stream of tiny HTTP requests would have queued
+`/panel` behind it.
+
+`GET /panels` reports it as `speaking`.
 
 ### Which window? (it changes)
 
@@ -630,7 +700,8 @@ a UNC path, and nothing else.
   to `DELETE` when its last pull request merges. `DELETE /panel?session=<id>`
   does the same.
 - `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
-  `resolved`, the item count, `collapsed` and `updated_at` — which is the first
+  `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking` and
+  `updated_at` — which is the first
   thing to look at when a card is not where it should be. It is a snapshot
   published by the resolver, so it is at most half a second stale.
 - Everything answers immediately. Unlike `/point`, this is a thing that stays on
@@ -643,8 +714,10 @@ speak.exe --panel-preview p                        rem three PNGs, then exit
 speak.exe --panel-demo --title "reviewer worker"    rem a real panel for 20 s
 ```
 
-`--panel-preview <prefix>` writes `<prefix>-expanded.png`, `-hover.png` and
-`-collapsed.png` at the screen's own scale, from sample data covering every icon
+`--panel-preview <prefix>` writes `<prefix>-expanded.png`, `-hover.png`,
+`-collapsed.png`, `-all.png` (everything, with `show less`), `-tabs.png` (the
+`PRs` tab active) and `-speaking.png` (mid-utterance, lit, the header carrying the
+caption) at the screen's own scale, from sample data covering every icon
 and colour, a path row, a title long enough to be cut and two items too many so
 the `+N more` row appears. Layered
 windows are invisible to GDI screen capture, so rendering them is the only way to
