@@ -52,7 +52,7 @@ function Add-Err([string]$where, $e) {
 $log = [ordered]@{
     ts = (Get-Date).ToString('o'); session = $Session
     delta_chars = 0; model = $null; ms = $null; cost_usd = $null
-    in_tokens = $null; out_tokens = $null; attempts = 0
+    in_tokens = $null; out_tokens = $null; cache_w = $null; cache_r = $null; attempts = 0
     summary = $null; worked = 0; mentioned = 0
     q_open = 0; q_resolved = 0; errors = @()
 }
@@ -265,6 +265,15 @@ foreach ($it in @($state.items)) {
 $itemsBlock = if ($itemLines.Count) { $itemLines -join "`n" } else { '(none)' }
 $openQBlock = if ($openQ.Count) { (@($openQ | ForEach-Object { '- ' + $_ }) -join "`n") } else { '(none)' }
 
+# On the first run for a session every `current` value is a regex default, so
+# nothing is sticky and an item needs positive evidence to count as worked.
+# Afterwards `current` is our own previous judgement and survives a quiet turn.
+$stickyRule = if ($hcursor -gt 0) {
+    'The "current" value is our own previous judgement. Keep it unless this delta contradicts it: change "mentioned" to "worked" only when the delta shows real work on that item, and "worked" to "mentioned" only when the delta shows it is merely context.'
+} else {
+    'This is the first classification of this session, so every "current" value is a regex default and carries no judgement. Answer "worked" ONLY when the delta shows positive evidence for that item. With no such evidence, answer "mentioned".'
+}
+
 $prompt = @"
 You classify one terminal running Claude Code. Answer with JSON only.
 
@@ -279,11 +288,11 @@ $delta
 --- end of delta ---
 
 Produce:
-1. summary: at most 70 characters, what THIS terminal is doing right now. No trailing period, do not start with "the session".
+1. summary: at most 70 characters, what THIS terminal is doing right now. No trailing period, do not start with "the session". Describe the work in the delta, never this classification task and never the tracked item list.
 2. items: one entry for EVERY key listed in TRACKED ITEMS, with relevance:
    - "worked": this session created / edited / reviewed / merged / actively tracks it. Evidence: a gh command run here for it, a branch or work directory for it here, files edited for it, or the user and the assistant explicitly working on it.
    - "mentioned": referenced only as context. A row in a table about other people's or other sessions' work, a name inside a brief handed to a subagent, a memory recall, an example, or something merely talked about.
-   The "current" value is an input, not the truth. Only change "mentioned" to "worked" when THIS delta shows work on that item. Keep an item "worked" unless the delta shows it was only ever context.
+   $stickyRule
 3. questions_open: questions the ASSISTANT asked the USER (Fernando) that are still waiting for his answer. Short, at most 90 characters each, phrased as the question. Exclude rhetorical questions, questions the user already answered in the delta, questions asked to subagents, and offers of further work.
 4. questions_resolved: entries from CURRENTLY OPEN QUESTIONS that the delta shows answered or made obsolete. Copy their text exactly.
 "@
@@ -326,6 +335,9 @@ function Invoke-Cli([string]$text) {
     $psi.CreateNoWindow   = $true
     $psi.WorkingDirectory = $env:TEMP
     $psi.EnvironmentVariables['I47_NESTED'] = '1'
+    # without this Haiku burns ~9.5k thinking tokens on this tiny classification
+    # (102 s / $0.06 a run); with it: ~2 s / $0.003
+    $psi.EnvironmentVariables['MAX_THINKING_TOKENS'] = '0'
     $p  = [System.Diagnostics.Process]::Start($psi)
     $so = $p.StandardOutput.ReadToEndAsync()
     $se = $p.StandardError.ReadToEndAsync()
@@ -347,7 +359,12 @@ function Invoke-Cli([string]$text) {
     try { $log.model = [string](@($envl.modelUsage.PSObject.Properties.Name)[0]) } catch {}
     if (-not $log.model) { $log.model = 'haiku (cli)' }
     $log.cost_usd = $envl.total_cost_usd
-    try { $log.in_tokens = [int]$envl.usage.input_tokens; $log.out_tokens = [int]$envl.usage.output_tokens } catch {}
+    try {
+        $log.in_tokens  = [int]$envl.usage.input_tokens
+        $log.out_tokens = [int]$envl.usage.output_tokens
+        $log.cache_w    = [int]$envl.usage.cache_creation_input_tokens
+        $log.cache_r    = [int]$envl.usage.cache_read_input_tokens
+    } catch {}
     return [string]$envl.result
 }
 
@@ -486,7 +503,13 @@ $log.q_open = $openOrder.Count
 $state.items = @($keep.ToArray())
 
 $sum = ([string]$verdict.summary).Trim()
-if ($sum.Length -gt 90) { $sum = $sum.Substring(0, 90) }
+if ($sum.Length -gt 70) {
+    # cut on a word boundary, not mid-word
+    $sum = $sum.Substring(0, 70)
+    $sp = $sum.LastIndexOf(' ')
+    if ($sp -ge 40) { $sum = $sum.Substring(0, $sp) }
+    $sum = $sum.TrimEnd(' ', ',', ';', '-', '.')
+}
 if ($sum) { Set-Prop $state 'summary' $sum; $log.summary = $sum }
 Set-Prop $state '_haiku_cursor' $newHCursor
 Set-Prop $state 'updated_at' $now
