@@ -745,7 +745,7 @@ listener as `/point` — the next port, `8124` by default.
 |---|---|
 | `session` | required; the key a registration is remembered and deleted by |
 | `title` | required; the window title to look for, matched as above |
-| `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items` |
+| `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items`, and is the whole card when `items` is empty |
 | `items[]` | `kind` (`pr`, `issue`, `path`, `question`), `repo`, `number`, `url`, `title`, `status` |
 
 `url` is optional for a `pr` or an `issue` with a `repo` and a `number` — the
@@ -760,9 +760,15 @@ a UNC path, and nothing else.
   the wrong trade. `400` is kept for the things that really are wrong: a body
   that is not a JSON object, a missing `session`, a missing `title`, malformed
   `items`.
-- **Empty `items` removes the registration**, so a producer never has to remember
-  to `DELETE` when its last pull request merges. `DELETE /panel?session=<id>`
-  does the same.
+- **Empty `items` *and* an empty `summary` removes the registration**, so a
+  producer never has to remember to `DELETE` when its last pull request merges.
+  `DELETE /panel?session=<id>` does the same.
+- An empty `items` with a `summary` is **not** a goodbye: it renders a
+  header-only card — the summary line and the collapse toggle, no tab strip, no
+  rows, one line tall. "Rebasing the forms PRs on dev" is worth a line in the
+  corner of the terminal doing it, and a session that has not found anything to
+  link yet should not have its panel taken away. Collapsed, such a card's pill
+  carries the summary itself rather than `0 items`.
 - `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
   `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking` and
   `updated_at` — which is the first

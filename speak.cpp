@@ -3134,6 +3134,26 @@ TextMask PanLine(const std::string& text, bool bold, int max_w) {
 // once the "+N more" row has been clicked.
 void BakePanelLayers(PanelCard* out);   // defined after this, used at the end
 
+// The silhouette, its hairline and its shadow, all out of one rounded-rect
+// distance field — the caption card's trick, and the reason the two objects have
+// the same edge. Every card ends here, including the one that is only a header,
+// which is why this is not simply the tail of the builder.
+void PanelShapeAndBake(PanelCard* out) {
+    const float hw = out->panel_w * 0.5f, hh = out->panel_h * 0.5f;
+    const float ccx = out->w * 0.5f, ccy = out->h * 0.5f;
+    const float radius = std::min(out->radius, std::min(hw, hh));
+    for (int y = 0; y < out->h; ++y) {
+        for (int x = 0; x < out->w; ++x) {
+            const float dx = x + 0.5f - ccx, dy = y + 0.5f - ccy;
+            const float qx = std::max(std::fabs(dx) - (hw - radius), 0.f);
+            const float qy = std::max(std::fabs(dy) - (hh - radius), 0.f);
+            out->dist[static_cast<size_t>(y) * out->w + x] =
+                std::sqrt(qx * qx + qy * qy) - radius;
+        }
+    }
+    BakePanelLayers(out);
+}
+
 // `cap_title`/`cap` take the header line over while the panel is speaking: what
 // the voice is saying about this terminal is more urgent than what it is working
 // on, and it is the same line either way rather than a row that appears and
@@ -3162,7 +3182,9 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // number worth reducing the panel to is the one that needs an answer.
         const size_t pending = PanPendingCount(items);
         const std::string count_text =
-            pending ? std::to_string(pending) + " pending" : PanCountText(items.size());
+            pending      ? std::to_string(pending) + " pending"
+            : items.empty() && !summary.empty() ? summary
+                                                : PanCountText(items.size());
         const TextMask count = PanLine(count_text, false,
                                        PanScale(kPanWidth) - 2 * pad);
         const int panel_w = pad + icon + igap + count.w + tgap + toggle + pad;
@@ -3328,12 +3350,16 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             built.push_back(std::move(r));
         }
 
+        // Header only: no rule to draw a line under nothing, and no gap under
+        // the line that is not there. The card shrinks to its one line.
+        const bool bare = built.empty();
+
         int rows_h = 0;
         for (const RowBuild& r : built) rows_h += r.h;
 
         // A full list must not swallow the terminal it is sitting in, so it is
         // capped and the overflow is wheeled through instead.
-        const int chrome  = pad + head_h + tab_h + PanScale(kPanRuleGap) + pad;
+        const int chrome  = pad + head_h + tab_h + (bare ? 0 : PanScale(kPanRuleGap)) + pad;
         int       view_h  = std::max(rows_h, tallest);
         if (max_h > 0 && chrome + view_h > max_h) {
             view_h = std::max(PanScale(48), max_h - chrome);
@@ -3375,6 +3401,10 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             return SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc) - tw;
         });
         y += head_h;
+        if (bare) {
+            PanelShapeAndBake(out);
+            return;
+        }
 
         // The strip sits on the hairline, GitHub's underlined nav: the active
         // tab's accent replaces that line under itself, which is what makes the
@@ -3453,23 +3483,7 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         }
     }
 
-    // The silhouette, its hairline and its shadow, all out of one rounded-rect
-    // distance field — the caption card's trick, and the reason the two objects
-    // have the same edge.
-    const float hw = out->panel_w * 0.5f, hh = out->panel_h * 0.5f;
-    const float ccx = out->w * 0.5f, ccy = out->h * 0.5f;
-    const float radius = std::min(out->radius, std::min(hw, hh));
-    for (int y = 0; y < out->h; ++y) {
-        for (int x = 0; x < out->w; ++x) {
-            const float dx = x + 0.5f - ccx, dy = y + 0.5f - ccy;
-            const float qx = std::max(std::fabs(dx) - (hw - radius), 0.f);
-            const float qy = std::max(std::fabs(dy) - (hh - radius), 0.f);
-            out->dist[static_cast<size_t>(y) * out->w + x] =
-                std::sqrt(qx * qx + qy * qy) - radius;
-        }
-    }
-
-    BakePanelLayers(out);
+    PanelShapeAndBake(out);
 }
 
 // Almost none of a card changes between frames: the shadow, the fill, the
@@ -4681,9 +4695,13 @@ void HandlePanelPost(SOCKET fd, const std::string& body,
             return;
         }
     }
-    // Nothing to show is how a session says goodbye — no need to make a hook
-    // remember to DELETE when its last pull request merges.
-    if (items.empty()) {
+    const std::string summary = PanTrim(root.GetStr("summary"));
+    // Nothing at all to show is how a session says goodbye — no need to make a
+    // hook remember to DELETE when its last pull request merges. But a summary
+    // with no items is not nothing: "rebasing the forms PRs on dev" is worth a
+    // line in the corner of the terminal doing it, and a session that has not
+    // found anything to link yet should not have its panel taken away.
+    if (items.empty() && summary.empty()) {
         PanelCmd cmd;
         cmd.remove  = true;
         cmd.session = session;
@@ -4713,7 +4731,7 @@ void HandlePanelPost(SOCKET fd, const std::string& body,
     PanelCmd cmd;
     cmd.session = session;
     cmd.title   = title;
-    cmd.summary = PanTrim(root.GetStr("summary"));
+    cmd.summary = summary;
     cmd.items   = std::move(items);
     PanelEnqueue(std::move(cmd));
     EnsurePanelThread();
@@ -4814,6 +4832,7 @@ void PanelPreview(const std::string& prefix) {
     MakeThreadDpiAware();
     const float scale = PanelScaleFor(nullptr);
     const std::vector<PanelItem> items = SamplePanelItems();
+    const std::vector<PanelItem> none;
     struct Shot {
         const char* suffix;
         const char* tab;
@@ -4824,25 +4843,29 @@ void PanelPreview(const std::string& prefix) {
         float       voice;    // the amplitude driving it
         const char* cap_title;
         const char* cap;
+        bool        bare;     // a summary and nothing else
     };
     const Shot shots[] = {
-        {"-expanded.png",  "all", false, false, -3, 0.f, 0.f, "", ""},
-        {"-hover.png",     "all", false, false, 1,  0.f, 0.f, "", ""},
-        {"-collapsed.png", "all", true,  false, -3, 0.f, 0.f, "", ""},
+        {"-expanded.png",  "all", false, false, -3, 0.f, 0.f, "", "", false},
+        {"-hover.png",     "all", false, false, 1,  0.f, 0.f, "", "", false},
+        {"-collapsed.png", "all", true,  false, -3, 0.f, 0.f, "", "", false},
         // Everything, with the way back on the last row — and that row hovered,
         // since being clickable is the whole point of it.
         {"-all.png",       "all", false, true,  static_cast<int>(kPanSampleRows),
-         0.f, 0.f, "", ""},
-        {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", ""},
-        {"-pending.png",   "pending", false, false, -3, 0.f, 0.f, "", ""},
+         0.f, 0.f, "", "", false},
+        {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", "", false},
+        {"-pending.png",   "pending", false, false, -3, 0.f, 0.f, "", "", false},
+        // A session that has said what it is doing but has nothing to link yet.
+        {"-summary-only.png", "all", false, false, -3, 0.f, 0.f, "", "", true},
         // Mid-utterance: lit, and the header carrying what is being said.
         {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
-         "laravel-opticloud #1375", "checks are green, ready to merge"},
+         "laravel-opticloud #1375", "checks are green, ready to merge", false},
     };
     for (const Shot& shot : shots) {
         PanelCard card;
         int       scroll = 0;
-        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, shot.tab,
+        const std::vector<PanelItem>& shown = shot.bare ? none : items;
+        BuildPanelCard(&card, kPanSampleSummary, shown, shot.collapsed, shot.tab,
                        shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
         std::vector<uint32_t> px(static_cast<size_t>(card.w) * card.h);
         const RECT* hover = nullptr;
@@ -4855,7 +4878,7 @@ void PanelPreview(const std::string& prefix) {
         LARGE_INTEGER f{}, a{}, b{}, c{};
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&a);
-        BuildPanelCard(&card, kPanSampleSummary, items, shot.collapsed, shot.tab,
+        BuildPanelCard(&card, kPanSampleSummary, shown, shot.collapsed, shot.tab,
                        shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
         QueryPerformanceCounter(&b);
         ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
