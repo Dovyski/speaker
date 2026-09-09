@@ -493,11 +493,19 @@ if ($event -eq 'Stop') {
     try {
         $worker = Join-Path $PSScriptRoot 'i47-haiku.ps1'
         if (Test-Path -LiteralPath $worker) {
-            $wargs = @('-NoProfile', '-NonInteractive', '-File', $worker, '-Session', $sessionId)
-            if ($transcript) { $wargs += @('-Transcript', $transcript) }
             $ps = 'pwsh'
             try { $p0 = (Get-Process -Id $PID).Path; if ($p0 -and $p0 -match '(?i)pwsh(\.exe)?$') { $ps = $p0 } } catch {}
-            Start-Process -FilePath $ps -ArgumentList $wargs -WindowStyle Hidden | Out-Null
+            # ProcessStartInfo.ArgumentList, not Start-Process -ArgumentList:
+            # the latter joins on spaces and splits "C:\Users\Fernando Bevilacqua\..."
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $ps
+            foreach ($a in @('-NoProfile', '-NonInteractive', '-File', $worker, '-Session', $sessionId)) { [void]$psi.ArgumentList.Add($a) }
+            if ($transcript) { [void]$psi.ArgumentList.Add('-Transcript'); [void]$psi.ArgumentList.Add($transcript) }
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow  = $true
+            $psi.WorkingDirectory = $env:TEMP
+            $child = [System.Diagnostics.Process]::Start($psi)
+            $child.Dispose()   # detach: never wait, the hook has a 5 s budget
             $log.haiku = 'spawned'
         } else { $log.haiku = 'missing' }
     } catch { $log.haiku = 'error'; Add-Err 'haiku-spawn' $_ }

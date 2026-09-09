@@ -43,6 +43,7 @@ of what the speakers are playing right now, and fades out when the audio drains.
 - **Points at a window** — expanding rings that say "over here", by flag or over HTTP
 - **Attention panel** — a clickable list of the PRs, issues and work dirs a terminal is on, parked in its corner
 - **The panel glows** with the voice when speech is aimed at its window, and shows the caption while it talks
+- **Claude Code hooks included** — `hooks/` fills the panel from a live session; `hooks/install-claude-code.ps1` wires it up
 - **Streaming** — audio starts playing while the rest of the sentence is still being generated
 - **Optional WAV output** — `--save out.wav` alongside (or instead of) playback
 - **UTF-8 / accents** — arguments are read as wide chars, so `"Olá, tudo bem?"` works
@@ -471,6 +472,14 @@ $ curl -s -X POST http://127.0.0.1:8124/panel -d '{
 {"ok":true,"hwnd":1968562,"resolved":true}
 ```
 
+Something has to make that call. For Claude Code, `hooks/` is that something — a
+`Stop` and a `PostToolUse` hook that mine the session's transcript, a scheduled
+task that asks `gh` for each item's status, and an optional Haiku pass that
+prunes the noise and collects the questions. `pwsh -NoProfile -File
+hooks\install-claude-code.ps1` installs the lot;
+[docs/references/claude-code-integration.md](docs/references/claude-code-integration.md)
+explains the chain, the file formats and how to debug it.
+
 Each row is an icon, a short handle (`repo#1375`, or a path's last segment) and
 the title, cut with an ellipsis. **Click a row** and it opens: pull requests and
 issues in the browser, paths in Explorer — one `ShellExecute` does both, which is
@@ -736,7 +745,7 @@ listener as `/point` — the next port, `8124` by default.
 |---|---|
 | `session` | required; the key a registration is remembered and deleted by |
 | `title` | required; the window title to look for, matched as above |
-| `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items` |
+| `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items`, and is the whole card when `items` is empty |
 | `items[]` | `kind` (`pr`, `issue`, `path`, `question`), `repo`, `number`, `url`, `title`, `status` |
 
 `url` is optional for a `pr` or an `issue` with a `repo` and a `number` — the
@@ -751,9 +760,15 @@ a UNC path, and nothing else.
   the wrong trade. `400` is kept for the things that really are wrong: a body
   that is not a JSON object, a missing `session`, a missing `title`, malformed
   `items`.
-- **Empty `items` removes the registration**, so a producer never has to remember
-  to `DELETE` when its last pull request merges. `DELETE /panel?session=<id>`
-  does the same.
+- **Empty `items` *and* an empty `summary` removes the registration**, so a
+  producer never has to remember to `DELETE` when its last pull request merges.
+  `DELETE /panel?session=<id>` does the same.
+- An empty `items` with a `summary` is **not** a goodbye: it renders a
+  header-only card — the summary line and the collapse toggle, no tab strip, no
+  rows, one line tall. "Rebasing the forms PRs on dev" is worth a line in the
+  corner of the terminal doing it, and a session that has not found anything to
+  link yet should not have its panel taken away. Collapsed, such a card's pill
+  carries the summary itself rather than `0 items`.
 - `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
   `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking` and
   `updated_at` — which is the first
