@@ -3352,8 +3352,13 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
     const Rgb ink    = PanInk();
     const Rgb dim    = PanDimInk();
     constexpr Rgb kShadowInk{0.01f, 0.02f, 0.04f};
-    const float sigma = std::max(1.f, PanScale(kPanShadow) * 0.52f);
-    const int   drop  = PanScale(5);
+    // Tighter than the caption toast's: that one appears for a sentence over
+    // whatever the desktop is, where a wide shadow lifts it off. This one sits on
+    // a terminal all day, and on a light theme a broad halo read as dirt around
+    // the card — most obviously around the collapsed pill, which is small enough
+    // that the shadow was most of it.
+    const float sigma = std::max(1.f, PanScale(kPanShadow) * 0.31f);
+    const int   drop  = PanScale(4);
     const float hr    = static_cast<float>(PanScale(6));   // the highlight's corners
     // Loud passages reach further out and burn brighter, but the halo never
     // vanishes between syllables — the same asymmetry the ring's own envelope has.
