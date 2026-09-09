@@ -1,0 +1,93 @@
+# Cuts a GitHub Release when a v* tag is pushed.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# version.h is the source of truth: the packaging script refuses to build a zip
+# whose version disagrees with the header, and this workflow passes the tag as
+# that version — so a tag that does not match version.h fails here rather than
+# shipping a binary that lies about its version.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # to create the release and upload its assets
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive the version from the tag
+        id: version
+        shell: pwsh
+        run: |
+          $v = '${{ github.ref_name }}' -replace '^v', ''
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+              throw "tag '${{ github.ref_name }}' is not v<semver>"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "releasing $v"
+
+      # Deliberately NOT caching .build/_deps here, unlike build.yml. A release
+      # happens rarely, a cold build is ~15 min, and CMake's FetchContent stamps
+      # make a restored cache a thing that can quietly skip a re-download — not
+      # a risk worth taking on the one build that becomes an artifact people run.
+
+      # windows-latest ships ffmpeg, which make-voice.ps1 needs to build the
+      # default voice from its tracked source clip (voices\ is not committed).
+      - name: Check ffmpeg
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+              Write-Host "ffmpeg absent on the runner, installing"
+              choco install ffmpeg --no-progress -y
+              "$env:ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
+          } else {
+              ffmpeg -version | Select-Object -First 1
+          }
+
+      # build.bat locates Visual Studio with vswhere, so the runner's Enterprise
+      # install is found without hardcoding a path. It also falls back to the
+      # cmake/ninja on PATH, which the runner has.
+      - name: Build and package
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/package-release.ps1 -Version ${{ steps.version.outputs.version }}
+
+      - name: Show the artifact
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Format-Table Name, Length
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: speak ${{ steps.version.outputs.version }}
+          files: |
+            dist/speak-win-x64.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          body: |
+            Windows x64 build of `speak.exe`.
+
+            **Install:** download `speak-win-x64.zip`, unzip it, run `pwsh -File get-models.ps1`
+            to fetch the models (~200 MB), then `.\speak.exe "Hello world."`.
+            Full instructions: [docs/references/install.md](https://github.com/Dovyski/speaker/blob/main/docs/references/install.md).
+
+            The models are not bundled: they are third-party weights from
+            [KevinAHM/pocket-tts-onnx](https://huggingface.co/KevinAHM/pocket-tts-onnx).
+
+            Verify the download against `SHA256SUMS.txt`:
+
+            ```powershell
+            (Get-FileHash speak-win-x64.zip -Algorithm SHA256).Hash.ToLower()
+            ```
+
+            The binary is unsigned, so Windows SmartScreen will warn on first run.

@@ -1,0 +1,64 @@
+# Smoke test: does it still build, and does the packaging script still work?
+#
+# No release is created and nothing is published — this exists so a broken
+# build is caught on the PR rather than when a tag is pushed.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: .build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Check ffmpeg
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+              choco install ffmpeg --no-progress -y
+              "$env:ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
+          }
+
+      - name: Build
+        shell: pwsh
+        run: ./build.bat
+
+      # Exercises the release path too, so packaging cannot rot unnoticed.
+      # The version comes from version.h, which the script cross-checks against
+      # what the freshly built binary reports.
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path version.h -Pattern '^\s*#define\s+SPEAK_VERSION\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "version.h says $v"
+          pwsh -NoProfile -File scripts/package-release.ps1 -Version $v -NoBuild
+
+      - name: Smoke test the packaged binary
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'unzipped'
+          Expand-Archive dist/speak-win-x64.zip -DestinationPath $out -Force
+          & "$out/speak.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "--version failed" }
+          & "$out/speak.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          Get-ChildItem $out -Recurse -File | Select-Object Length, FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speak-win-x64
+          path: dist/speak-win-x64.zip
+          retention-days: 7
