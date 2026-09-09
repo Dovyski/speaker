@@ -19,6 +19,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include "pocket_tts.cpp"
 
+#include "version.h"
+
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -6368,6 +6370,7 @@ void Usage() {
         "  speak --panel-demo --title T  park a sample attention panel in it\n\n"
         "  Click the orb to pause while speaking, click again to resume.\n"
         "  Click the caption's × to dismiss it.\n\n"
+        "  --version             print the version and exit\n"
         "  --voice <name|path>   voice sample (default: jarvis.wav)\n"
         "  --save <file.wav>     also save the audio\n"
         "  --no-orb              skip the on-screen indicator\n"
@@ -6577,6 +6580,7 @@ int main() {
                 return 2;
             }
         }
+        else if (a == "--version") { std::printf("speak %s\n", SPEAK_VERSION); return 0; }
         else if (a == "-h" || a == "--help") { Usage(); return 0; }
         else if (!a.empty() && a[0] == '-') {
             std::fprintf(stderr, "speak: unknown option %s\n", a.c_str());
