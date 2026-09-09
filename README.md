@@ -483,10 +483,21 @@ not a verdict.
 A full list is capped at 70% of the target window's client height, so it can
 never bury the terminal it is meant to annotate; past that it scrolls under the
 mouse wheel, with a thin `#3d444d` mark at the right edge and no other scrollbar
-chrome. The wheel needs a low-level mouse hook rather than `WM_MOUSEWHEEL`: a
-`WS_EX_NOACTIVATE` window never has focus, and the wheel goes to the focused
-window, not the one under the pointer. Swallowing the notch is half the reason to
-do it that way — scrolling the list must not also scroll the terminal behind it.
+chrome.
+
+The wheel is fussier than it looks. A `WS_EX_NOACTIVATE` window never has focus,
+and historically `WM_MOUSEWHEEL` went to the focused window rather than the one
+under the pointer. Windows 10 added *scroll inactive windows when I hover over
+them* and turned it on by default, which delivers the notch to the window under
+the pointer — so for almost everyone the panel just gets the message. Only when
+that setting is off is a `WH_MOUSE_LL` hook the alternative, and a `WH_MOUSE_LL`
+hook is **global**: every mouse event on the machine round-trips through the
+installing thread's message queue, and a thread that is busy drawing makes the
+whole system's pointer feel late. It did, measurably, for a day. So the hook is
+installed only while the pointer is over a card that can actually scroll, removed
+the moment it is not, and its callback does nothing but `PostMessage` — no state,
+no locks, no drawing. Swallowing the notch is still the point: scrolling the list
+must not also scroll the terminal behind it.
 
 ### Tabs
 
@@ -495,6 +506,13 @@ do it that way — scrolling the list must not also scroll the terminal behind i
 the others in `#9198a1`. Clicking one filters the rows — the six-row cap, the
 `+N more` row, `show less` and the scrolling all apply to the filtered list.
 `All` is everything, work directories included.
+
+The card keeps the height of the **tallest** tab's list, so switching tabs never
+moves the strip out from under the cursor — a shorter list just leaves card
+underneath it. No text has to be measured to know that height: every row is one
+line, so a list's height is arithmetic once the line height is known. (Adding or
+removing items with a `POST` still changes it, which is fine — that is the
+content changing, not the pointer's target moving.)
 
 A tab with nothing in it is not offered, and if that leaves only `All` there is
 no strip at all: the panel is six rows in the corner of a terminal, and furniture
@@ -567,8 +585,9 @@ When an utterance is aimed at a window — `speak.exe --title "…" "text"`, or
 ember halo off its own outline, its hairline lit, intensity riding the same
 amplitude envelope the orb is drawn from, so the ring in the corner of the screen
 and the card in the corner of the terminal move together rather than merely
-coinciding. It lights with the first sample and lets go over about a second and a
-half. The collapsed pill glows the same way, and a card that is hidden (its
+coinciding. It lights with the first sample and lets go over a second and a half
+— linearly, so the halo actually reaches zero rather than merely approaching it,
+with one last frame drawn when it does. The collapsed pill glows the same way, and a card that is hidden (its
 terminal tab in the background) does not glow at all — there is nothing there to
 light.
 
@@ -590,9 +609,9 @@ belong to the one-shot client process doing the playing — and upstream's
 so a field on `POST /tts` was never available. So the client **broadcasts**: one
 fixed-size UDP datagram per frame to loopback on the port after the pointing one
 (`8125` by default), each carrying the whole state — target window, level,
-caption. No setup, no teardown, no session; a gap in the datagrams *is* the end
-of the utterance, which also means a client killed mid-sentence cannot leave a
-card glowing forever. A 60 Hz stream of tiny HTTP requests would have queued
+caption. No setup, no teardown, no session; the client sends a last few with
+`active` clear when the voice is done, and a *gap* in the datagrams ends it too —
+so a client killed mid-sentence cannot leave a card glowing forever. A 60 Hz stream of tiny HTTP requests would have queued
 `/panel` behind it.
 
 `GET /panels` reports it as `speaking`.
@@ -621,7 +640,10 @@ and goes:
 That pass runs every ~500 ms (and immediately after a `POST`, so a card appears
 at once rather than up to half a second later), enumerating the desktop once and
 matching every registration against it. With nothing registered it does not run
-at all, so an idle daemon does not enumerate windows for a living.
+at all, so an idle daemon does not enumerate windows for a living — and the pid
+of every window it finds is turned into an image name through a cache, rather
+than by taking a `TH32CS_SNAPPROCESS` snapshot of the whole machine twice a
+second, which is what it used to do.
 
 Matching is: trim, lowercase, drop a leading non-ASCII glyph *and the space
 behind it* — from **both** sides, because the registered title was captured at
@@ -645,6 +667,18 @@ that a machine left running for a week is not carrying last week's windows.
 `DELETE /panel?session=<id>`, and a `POST` with empty `items`, remove one at once.
 
 ### Following the window
+
+Almost none of a card changes between frames — the shadow, the fill, the
+hairline, the header rule, the icons and every glyph of text are fixed until the
+content is. So they are composed once, when the card is built, into two
+premultiplied layers (everything under the interactive parts and everything over
+them) plus the halo's shape; and a frame is a copy, a hovered band, a glow whose
+*brightness* is all that follows the voice, and the top layer. That is 0.3 ms a
+frame instead of 5.5, which matters because a glowing card redraws twenty-five
+times a second on the same thread that answers every panel `POST`. Nothing is
+pushed to the screen at all unless the geometry, the hover, the content or the
+glow actually changed: an idle daemon with a card on screen measures 0.0% of a
+core.
 
 One thread owns every panel window — they are created, drawn, bound and clicked
 there, so no panel state needs a lock, and the endpoint only leaves a command
