@@ -618,10 +618,11 @@ function Reconcile-Items($obj) {
                 $changed = $true
             }
         }
-        # `question` rows (P4) carry no repo/number: key them by text or they
-        # would all collapse onto one row here
+        # `question` and `link` rows carry no repo/number: key them by their
+        # text / url or they would all collapse onto one row here
         $mk = switch ($kind) {
             'path'     { 'path|' + ([string]$it.url).ToLower() }
+            'link'     { 'link|' + ([string]$it.url).ToLower() }
             'question' { 'question|' + (([string]$it.title).ToLower() -replace '[^a-z0-9]+', ' ').Trim() }
             default    { '{0}|{1}|{2}' -f $kind, [string]$it.repo, $num }
         }
@@ -655,6 +656,8 @@ function Apply-ToObject($obj) {
     foreach ($it in @($obj.items)) {
         if (-not $it) { continue }
         $kind = [string]$it.kind
+        # `path`, `question` and `link` rows have nothing on GitHub to ask about:
+        # they pass through this whole pass untouched.
         if ($kind -ne 'pr' -and $kind -ne 'issue') { continue }
         $num = 0; try { $num = [int]$it.number } catch {}
         if ((-not $it.repo) -or $num -le 0) { continue }

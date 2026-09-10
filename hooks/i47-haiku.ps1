@@ -4,7 +4,8 @@ i47 P4 Haiku layer: async worker spawned by the Stop hook (i47-attention.ps1).
 Takes the transcript delta since `_haiku_cursor`, the current item list and the
 currently open questions, asks a small Claude model for
   - a one line summary of what this terminal is doing,
-  - a worked/mentioned relevance verdict per tracked item,
+  - a worked/mentioned relevance verdict per tracked item (`link` rows are
+    exempt: they carry the producer's verdict through untouched),
   - the questions the assistant asked Fernando and is still waiting on,
 applies the verdict to ~/.claude/attention/<session>.json and re-POSTs only the
 `worked` items plus the question rows to the speak.exe daemon (POST /panel).
@@ -257,6 +258,11 @@ foreach ($it in @($state.items)) {
         if (([string]$it.status) -ne 'resolved') { [void]$openQ.Add([string]$it.title) }
         continue
     }
+    # A `link` row is exempt: it has no repo#N key to name in a verdict, and the
+    # producer already decided whether the assistant wrote it (worked) or merely
+    # saw it go past (mentioned). Listing it would only give the model a key it
+    # cannot answer for, and dropping it from the verdict must not drop the row.
+    if ($kind -eq 'link') { continue }
     $key = if ($kind -eq 'path') { [string]$it.url } else { ('{0}#{1}' -f (([string]$it.repo) -replace '^[^/]+/', ''), [int]$it.number) }
     $rel = if ($it.PSObject.Properties['relevance'] -and $it.relevance) { [string]$it.relevance } else { 'worked' }
     [void]$itemLines.Add(('- key: {0} | kind: {1} | current: {2} | title: {3}' -f $key, $kind, $rel, (Head ([string]$it.title) 80)))
@@ -448,6 +454,14 @@ foreach ($it in @($state.items)) {
     if (-not $it) { continue }
     if (([string]$it.kind) -eq 'question') { continue }   # rebuilt below
     $kind = [string]$it.kind
+    # exempt (see above): carried through with the producer's own relevance
+    if ($kind -eq 'link') {
+        $lrel = if ($it.PSObject.Properties['relevance'] -and $it.relevance) { [string]$it.relevance } else { 'worked' }
+        Set-Prop $it 'relevance' $lrel
+        if ($lrel -eq 'worked') { $log.worked++ } else { $log.mentioned++ }
+        [void]$keep.Add($it)
+        continue
+    }
     $key = if ($kind -eq 'path') { [string]$it.url } else { ('{0}#{1}' -f (([string]$it.repo) -replace '^[^/]+/', ''), [int]$it.number) }
     $new = if ($it.PSObject.Properties['relevance'] -and $it.relevance) { [string]$it.relevance } else { 'worked' }
     $nk = Norm $key
