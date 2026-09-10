@@ -164,7 +164,7 @@ Claude Code hooks in hooks\ and the agent skill in skill\ — are here:
     $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     $sums = Join-Path $OutDir 'SHA256SUMS.txt'
     # LF, no trailing newline noise: Set-Content emits CRLF on Windows, which makes
-    # `sha256sum -c` on Linux/Git Bash look for "speak-win-x64.zip".
+    # `sha256sum -c` on Linux/Git Bash look for a file whose name ends in a carriage return.
     $zipName = Split-Path $zip -Leaf
     $sumsLine = $hash + '  ' + $zipName + "`n"
     [IO.File]::WriteAllText($sums, $sumsLine, [Text.UTF8Encoding]::new($false))
