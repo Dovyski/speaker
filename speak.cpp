@@ -2615,6 +2615,10 @@ struct PanelItem {
     // "repo#1375", or the last segment of a path: the short handle a human uses
     // for the thing, which is what a row leads with.
     std::string Label() const {
+        // A link's handle is the host plus a trimmed path the producer already
+        // shortened; the last URL segment on its own ("dev-login") loses the
+        // host, which is the half that says *which* thing this is.
+        if (kind == "link") return title.empty() ? url : title;
         if (number > 0) {
             std::string name = repo;
             const size_t slash = name.rfind('/');
@@ -2953,6 +2957,9 @@ constexpr const char* kOctCircle =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z";
 constexpr const char* kOctInfo =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z";
+constexpr const char* kOctLink =
+    "M7.775 3.275a.75.75 0 0 0 1.06 1.06l1.25-1.25a2 2 0 1 1 2.83 2.83l-2.5 2.5a2 2 0 0 1-2.83 0 .75.75 0 0 0-1.06 1.06 3.5 3.5 0 0 0 4.95 0l2.5-2.5a3.5 3.5 0 0 0-4.95-4.95l-1.25 1.25Z"
+    "m-4.69 9.64a2 2 0 0 1 0-2.83l2.5-2.5a2 2 0 0 1 2.83 0 .75.75 0 0 0 1.06-1.06 3.5 3.5 0 0 0-4.95 0l-2.5 2.5a3.5 3.5 0 0 0 4.95 4.95l1.25-1.25a.75.75 0 0 0-1.06-1.06l-1.25 1.25a2 2 0 0 1-2.83 0Z";
 constexpr const char* kOctFileDirectory =
     "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
     "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
@@ -2972,6 +2979,9 @@ PanGlyph PanelGlyphFor(const PanelItem& item) {
         return {kOctQuestion,
                 item.status == PanStatus::Closed ? kOctGrey : kOctAmber};
     }
+    // A link has no state to report — it is a URL somebody named — so it takes
+    // the neutral row colour the numberless rows already use.
+    if (item.kind == "link") return {kOctLink, kOctGrey};
     const bool pr = item.kind == "pr";
     // A path, or anything numberless, is a folder. Any *other* kind with a
     // number — `question` from the agent-questions flow, whatever comes next — is
@@ -3088,6 +3098,7 @@ Rgb PanBorder() { return kPanLine; }
 bool PanTabAll(const PanelItem&)  { return true; }
 bool PanTabIssue(const PanelItem& i) { return i.kind == "issue"; }
 bool PanTabPr(const PanelItem& i)    { return i.kind == "pr"; }
+bool PanTabLink(const PanelItem& i)     { return i.kind == "link"; }
 bool PanTabQuestion(const PanelItem& i) { return i.kind == "question"; }
 
 struct PanTab {
@@ -3101,6 +3112,7 @@ constexpr PanTab kPanTabs[] = {
     {"all",    "All",    PanTabAll,   false},
     {"issues", "Issues", PanTabIssue, true},
     {"prs",    "PRs",    PanTabPr,    true},
+    {"links",  "Links",  PanTabLink,  true},
     {"pending", "Pending", PanTabQuestion, true},
 };
 constexpr int kPanTabCount = static_cast<int>(sizeof(kPanTabs) / sizeof(kPanTabs[0]));
@@ -4188,6 +4200,7 @@ constexpr int   kPopLinePx  = 13;
 constexpr int   kPopSmallPx = 11;    // label pills
 constexpr int   kPopTitleLines = 3;
 constexpr int   kPopQuestionLines = 12;   // a question is the text, not a handle
+constexpr int   kPopUrlLines = 4;         // a link's whole URL, broken by hand
 // A copy is invisible: the clipboard says nothing, and the row it came from
 // looks exactly as it did. Long enough to be read, short enough that the row
 // is a question again before you look for it.
@@ -4394,6 +4407,42 @@ TextMask PopLine(const std::string& text, bool bold, int max_w, int px = kPopLin
     return RenderText(Wide(text), PanScale(px), bold, max_w, lines, extra);
 }
 
+// A URL is one unbreakable word, so DT_WORDBREAK leaves it on a single line and
+// DT_END_ELLIPSIS then eats the half that matters. The popover for a link exists
+// to show the *whole* URL, so it is broken here instead: measure the string once,
+// derive how many characters fit, and cut each line back to the last separator so
+// a break lands between path segments rather than mid-word.
+std::vector<std::string> PopUrlLines(const std::string& url, int inner, int max_lines) {
+    std::vector<std::string> out;
+    if (url.empty() || inner <= 0) return out;
+    const TextMask whole = PopLine(url, false, 1 << 20);
+    if (!whole.w) return out;
+    if (whole.w <= inner) { out.push_back(url); return out; }
+    const size_t per =
+        std::max<size_t>(8, static_cast<size_t>(url.size() * inner / whole.w));
+    size_t i = 0;
+    while (i < url.size() && static_cast<int>(out.size()) < max_lines) {
+        size_t take = std::min(per, url.size() - i);
+        if (i + take < url.size() && static_cast<int>(out.size()) + 1 < max_lines) {
+            // look back a little for a separator; give up rather than make a
+            // line so short that the break costs more than it buys
+            const size_t floor_at = take > 14 ? take - 14 : 0;
+            for (size_t k = take; k > floor_at; --k) {
+                const char c = url[i + k - 1];
+                if (c == '/' || c == '?' || c == '&' || c == '=' || c == '-' ||
+                    c == '_' || c == '.') {
+                    take = k;
+                    break;
+                }
+            }
+        }
+        out.push_back(url.substr(i, take));
+        i += take;
+    }
+    if (i < url.size() && !out.empty()) out.back() += "...";
+    return out;
+}
+
 void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                       bool copied = false) {
     *out = PanelCard{};
@@ -4437,11 +4486,14 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
     // 1. the handle line: glyph, repo#N, the status in words. A question has
     // neither — its handle *is* its text — so it says what it is instead.
     const bool question = PanelIsQuestion(item);
+    const bool link     = item.kind == "link";
     {
         const PanGlyph  g     = PanelGlyphFor(item);
-        const TextMask  label = PopLine(question ? "Pending question" : item.Label(), true,
+        const TextMask  label = PopLine(question ? "Pending question"
+                                                 : (link ? "Link" : item.Label()), true,
                                         inner - icon - PanScale(8));
-        const std::string word = question ? std::string() : PanStatusWord(item.status);
+        const std::string word = (question || link) ? std::string()
+                                                    : PanStatusWord(item.status);
         const int       used  = icon + PanScale(8) + label.w + PanScale(10);
         const TextMask  state = word.empty() ? TextMask{}
                                              : PopLine(word, false, std::max(0, inner - used));
@@ -4461,14 +4513,25 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
 
     // 2. the full title, which is the whole point of hovering
     {
-        const std::string t = d.have && !d.title.empty() ? d.title : item.title;
-        if (!t.empty()) {
-            const TextMask m =
-                PopLine(t, false, inner, kPopLinePx,
-                        question ? kPopQuestionLines : kPopTitleLines,
-                        DT_WORDBREAK | DT_END_ELLIPSIS);
-            text(m, 0, m.h, false);
-            y += m.h + gap;
+        if (link) {
+            const std::vector<std::string> lines =
+                PopUrlLines(item.url, inner, kPopUrlLines);
+            for (const std::string& l : lines) {
+                const TextMask m = PopLine(l, false, inner);
+                text(m, 0, m.h, false);
+                y += m.h;
+            }
+            if (!lines.empty()) y += gap;
+        } else {
+            const std::string t = d.have && !d.title.empty() ? d.title : item.title;
+            if (!t.empty()) {
+                const TextMask m =
+                    PopLine(t, false, inner, kPopLinePx,
+                            question ? kPopQuestionLines : kPopTitleLines,
+                            DT_WORDBREAK | DT_END_ELLIPSIS);
+                text(m, 0, m.h, false);
+                y += m.h + gap;
+            }
         }
     }
 
@@ -4482,7 +4545,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
         y += m.h + gap;
     }
 
-    if (d.have && !question) {
+    if (d.have && !question && !link) {
         // 3. the author
         if (!d.author.login.empty()) {
             const TextMask m = PopLine(d.author.login, false, inner - av - PanScale(8));
@@ -5376,6 +5439,7 @@ void PanelThread(float seconds) {
                 const int idx = p->card.rows[hover.index].item;
                 if (idx >= 0 && idx < static_cast<int>(p->items.size()) &&
                     (p->items[idx].kind == "pr" || p->items[idx].kind == "issue" ||
+                     p->items[idx].kind == "link" ||
                      PanelIsQuestion(p->items[idx]))) {
                     hover_panel  = p;
                     hover_item   = &p->items[idx];
@@ -5384,7 +5448,8 @@ void PanelThread(float seconds) {
                     hover_key    = p->session + "|" + p->tab + "|" +
                                    std::to_string(p->scroll) + "|" + hover_item->kind +
                                    "|" + hover_item->repo + "|" +
-                                   std::to_string(hover_item->number);
+                                   std::to_string(hover_item->number) + "|" +
+                                   hover_item->url;
                 }
             }
             // The glow moves every frame, which is a recompose and never a
@@ -5887,7 +5952,7 @@ void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& bo
 // more" row appears.
 
 const char* kPanSampleSummary = "i47 - wiring the attention panel into the daemon";
-constexpr size_t kPanSampleRows = 10;   // the sample list, so a preview can point
+constexpr size_t kPanSampleRows = 12;   // the sample list, so a preview can point
                                         // at its last row
 
 std::vector<PanelItem> SamplePanelItems() {
@@ -5922,7 +5987,11 @@ std::vector<PanelItem> SamplePanelItems() {
              PanStatus::Merged),
         make("path", "", 0, "1372-toast", PanStatus::Unknown,
              "C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast"),
-        // Past the sixth: these two are what the "+N more" row stands for.
+        // A plain URL somebody named: no status, no number, and a handle short
+        // enough to read at a glance with the whole thing in the popover.
+        make("link", "", 0, "optibotinho-594.test/dev-login", PanStatus::Unknown,
+             "https://optibotinho-594.test/dev-login"),
+        // Past the sixth: these are what the "+N more" row stands for.
         make("pr", "dovyski/claude-speak", 12, "feat: the attention panel",
              PanStatus::Draft),
         make("issue", "optidatacloud/optiwork-infra", 27,
@@ -5930,6 +5999,9 @@ std::vector<PanelItem> SamplePanelItems() {
         make("question", "", 0,
              "Merge the partners PR before or after the gateway one?",
              PanStatus::Open),
+        make("link", "", 0, "work.stage.optidata.cloud/calendar/settings",
+             PanStatus::Unknown,
+             "https://work.stage.optidata.cloud/calendar/settings?tab=reminders"),
     };
 }
 
@@ -6007,13 +6079,26 @@ PanelItem SampleQuestionItem() {
     return it;
 }
 
+// The link popover has one job: show the URL the row had to truncate, so the
+// sample carries a query string and a path long enough to prove it wraps.
+PanelItem SampleLinkItem() {
+    PanelItem it;
+    it.kind  = "link";
+    it.title = "work.stage.optidata.cloud/calendar/settings";
+    it.url   = "https://work.stage.optidata.cloud/calendar/settings"
+               "?tab=reminders&highlight=quiet-hours";
+    return it;
+}
+
 void PanelPopoverPreview(const std::string& prefix, float scale) {
     const std::string a = WriteFakeAvatar(prefix + "-avatar-a.png",
                                           Rgb{0.16f, 0.38f, 0.72f}, Rgb{0.42f, 0.20f, 0.62f});
     const std::string b = WriteFakeAvatar(prefix + "-avatar-b.png",
                                           Rgb{0.10f, 0.47f, 0.33f}, Rgb{0.70f, 0.62f, 0.14f});
-    for (int i = 0; i < 3; ++i) {
-        const PanelItem item = i < 2 ? SamplePopoverItem(i == 0, a, b) : SampleQuestionItem();
+    for (int i = 0; i < 4; ++i) {
+        const PanelItem item = i < 2 ? SamplePopoverItem(i == 0, a, b)
+                             : i == 2 ? SampleQuestionItem()
+                                      : SampleLinkItem();
         PanelCard card;
         BuildPopoverCard(&card, item, scale);
         if (!card.w) continue;
@@ -6025,7 +6110,8 @@ void PanelPopoverPreview(const std::string& prefix, float scale) {
         QueryPerformanceCounter(&t1);
         const char* suffix = i == 0 ? "-popover-pr.png"
                            : i == 1 ? "-popover-issue.png"
-                                    : "-popover-question.png";
+                           : i == 2 ? "-popover-question.png"
+                                    : "-popover-link.png";
         const std::string path = prefix + suffix;
         WritePng(path, px, card.w, card.h);
         std::printf("%s (%dx%d)  compose %.2f ms\n", path.c_str(), card.w, card.h,
@@ -6062,6 +6148,7 @@ void PanelPreview(const std::string& prefix) {
         {"-all.png",       "all", false, true,  static_cast<int>(kPanSampleRows),
          0.f, 0.f, "", "", false},
         {"-tabs.png",      "prs", false, false, -3, 0.f, 0.f, "", "", false},
+        {"-links.png",     "links", false, false, -3, 0.f, 0.f, "", "", false},
         {"-pending.png",   "pending", false, false, -3, 0.f, 0.f, "", "", false},
         // A session that has said what it is doing but has nothing to link yet.
         {"-summary-only.png", "all", false, false, -3, 0.f, 0.f, "", "", true},
