@@ -9,4 +9,4 @@
 
 #pragma once
 
-#define SPEAK_VERSION "1.0.0"
+#define SPEAK_VERSION "1.1.0"

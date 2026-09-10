@@ -9,6 +9,8 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-10
+
 ### Added
 
 - **`Links (N)` tab on the attention panel.** A new `kind: "link"` row for the
@@ -131,5 +133,6 @@ repo; this is the point at which it stopped requiring Visual Studio to use.
   `get-models.ps1`. See [docs/references/install.md](docs/references/install.md).
 - `speak.exe --version`.
 
-[Unreleased]: https://github.com/Dovyski/speaker/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Dovyski/speaker/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Dovyski/speaker/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Dovyski/speaker/releases/tag/v1.0.0
