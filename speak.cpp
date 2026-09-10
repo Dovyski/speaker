@@ -166,6 +166,13 @@ struct OrbGeometry {
     static constexpr int kAngles   = 512;
     static constexpr int kGaussLut = 512;
 
+    // Per-frame scratch: the outline's radius and colour at each of kAngles.
+    // Members rather than statics inside the composer, so two orbs of different
+    // sizes (the ring on screen and the mini one on a card) can be drawn from
+    // their own geometry without sharing a buffer.
+    std::vector<float> radius;
+    std::vector<Rgb>   colour;
+
     void Ensure(int s) {
         if (gauss.empty()) {
             gauss.resize(kGaussLut);
@@ -271,9 +278,16 @@ inline uint32_t Pack(const Rgb& c, float a) {
 // `pause` (0..1) is the third drive, and it reads as the orb holding its breath:
 // the ring contracts a little, cools from ember to a dim steel blue, and — since
 // the caller stops advancing `time` — comes to a near standstill.
+// `geom` is which cached polar tables to draw from. `rim_px`/`glow_px` override
+// the two widths that are the ring's only absolute dimensions — everything else
+// here is a fraction of S — and are what a mini orb needs: scaled with the size
+// they would be a fraction of a pixel each, which composes as a smear of glow
+// with no ring in it. Zero keeps the widths this ring was drawn with from the
+// start, so every existing caller is unchanged.
 void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade,
-                   float time, float pause) {
-    g_geom.Ensure(S);
+                   float time, float pause, OrbGeometry& geom = g_geom,
+                   float rim_px = 0.f, float glow_px = 0.f) {
+    geom.Ensure(S);
 
     const float R0         = S * 0.29f * (1.f + 0.09f * level) * (1.f - 0.055f * pause);
     // Grows superlinearly with the voice: barely rippling when quiet, properly
@@ -282,8 +296,10 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade
     const float churn      = time * (1.f + 1.1f * voice);   // faster when loud
     const float spin       = time * 0.55f;           // the outline orbits
     const float rotation   = time * 0.33f;           // the colours drift round
-    const float rim_sigma  = (1.7f + 1.0f * level) * (1.f - 0.20f * pause);
-    const float glow_sigma = (8.5f + 7.0f * level) * (1.f - 0.28f * pause);
+    const float rim_sigma  = (rim_px  > 0.f ? rim_px  : 1.7f + 1.0f * level) *
+                             (1.f - 0.20f * pause);
+    const float glow_sigma = (glow_px > 0.f ? glow_px : 8.5f + 7.0f * level) *
+                             (1.f - 0.28f * pause);
     const float gain       = (0.72f + 0.45f * level) * (1.f - 0.24f * pause);
 
     // Out-of-phase harmonics: circular enough to read as a ring, irregular enough
@@ -295,8 +311,8 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade
     const float h4 = 0.60f * voice, h5 = 0.f;   // 11θ dropped: reads as a starfish
     const float norm = 1.f / (h1 + h2 + h3 + h4 + h5);
 
-    static std::vector<float> radius;
-    static std::vector<Rgb>   colour;
+    std::vector<float>& radius = geom.radius;
+    std::vector<Rgb>&   colour = geom.colour;
     radius.resize(OrbGeometry::kAngles);
     colour.resize(OrbGeometry::kAngles);
     for (int a = 0; a < OrbGeometry::kAngles; ++a) {
@@ -314,18 +330,18 @@ void ComposeAurora(uint32_t* pixels, int S, float level, float voice, float fade
 
     const size_t n = static_cast<size_t>(S) * S;
     for (size_t i = 0; i < n; ++i) {
-        const float d  = g_geom.dist[i];
-        const float R  = radius[g_geom.angle[i]];
+        const float d  = geom.dist[i];
+        const float R  = radius[geom.angle[i]];
         const float dr = d - R;
 
-        const float rim  = g_geom.Gauss(std::fabs(dr) / rim_sigma);
-        const float glow = 0.62f * g_geom.Gauss(std::fabs(dr) / glow_sigma);
+        const float rim  = geom.Gauss(std::fabs(dr) / rim_sigma);
+        const float glow = 0.62f * geom.Gauss(std::fabs(dr) / glow_sigma);
         // Light bleeding inward, so the inside is tinted rather than empty.
-        const float bleed = dr < 0.f ? 0.20f * g_geom.Gauss(-dr / (0.5f * R)) : 0.f;
+        const float bleed = dr < 0.f ? 0.20f * geom.Gauss(-dr / (0.5f * R)) : 0.f;
 
         float alpha = Clamp01((rim + glow + bleed) * gain);
         if (alpha <= 0.004f) { pixels[i] = 0; continue; }
-        pixels[i] = Pack(Mix(colour[g_geom.angle[i]], kHot, 0.85f * rim), alpha * fade);
+        pixels[i] = Pack(Mix(colour[geom.angle[i]], kHot, 0.85f * rim), alpha * fade);
     }
 }
 
@@ -410,6 +426,67 @@ void ComposeOrb(uint32_t* pixels, float level, float voice, float fade, float ti
         ComposeDot(pixels, g_orb_size, level * (1.f - 0.4f * pause), fade);
     }
     OverlayPauseGlyph(pixels, g_orb_size, pause, fade);
+}
+
+// ── the mini orb ────────────────────────────────────────────────────────────
+// The same object as the ring on screen, drawn a dozen pixels wide in the icon
+// slot of an attention card: same outline modulated by the same amplitude, same
+// hue ramp travelling round it, same idle breath between words. Not a second
+// animation that happens to pulse — the card and the ring have to read as one
+// thing, and the way to guarantee that is to run one piece of math.
+//
+// Two adaptations, both about size. It is composed at `ss`× and box-filtered
+// down, because the wobble of the outline is what the object *is* and at 14 px a
+// hard-edged ring loses it to aliasing. And the rim and its glow are given in
+// output pixels rather than scaled with the orb: a hairline of ring and a bloom
+// wider *relative to the radius* than the big one carries, which is what it takes
+// for a dozen pixels to still read as a luminous ring rather than as a dot.
+// `level` is derived here exactly as the overlay loop derives it, so the mini orb
+// keeps breathing while the voice is between words.
+//
+// Blended over whatever is already in the frame, so it belongs on a card's
+// dynamic layer and never touches the baked ones. Its scratch buffer and polar
+// tables are function-local statics: the panel thread is the only caller in the
+// daemon, and --panel-preview runs before that thread exists.
+void ComposeMiniOrb(uint32_t* frame, int fw, int fh, int x0, int y0, int size,
+                    float voice, float fade, float time) {
+    if (size < 4 || fade <= 0.004f) return;
+    const int ss = std::max(2, (64 + size - 1) / size);   // ≥ 64 px to compose at
+    const int S  = size * ss;
+
+    const float breath = 0.10f + 0.06f * std::sin(time * 5.4f);
+    const float level  = std::max(Clamp01(voice), breath);
+
+    static OrbGeometry           geom;
+    static std::vector<uint32_t> buf;
+    buf.resize(static_cast<size_t>(S) * S);
+    // `fade` goes to the composer rather than being applied on the way out: it is
+    // the ring's own fade parameter, and it saves a second pass over the pixels.
+    ComposeAurora(buf.data(), S, level, Clamp01(voice), fade, time, 0.f, geom,
+                  0.9f * ss, (1.5f + 1.3f * level) * ss);
+
+    const uint32_t inv = static_cast<uint32_t>(ss * ss);
+    for (int y = 0; y < size; ++y) {
+        const int fy = y0 + y;
+        if (fy < 0 || fy >= fh) continue;
+        for (int x = 0; x < size; ++x) {
+            const int fx = x0 + x;
+            if (fx < 0 || fx >= fw) continue;
+            uint32_t a = 0, r = 0, g = 0, b = 0;
+            for (int sy = 0; sy < ss; ++sy) {
+                const uint32_t* row = buf.data() + static_cast<size_t>(y * ss + sy) * S +
+                                      static_cast<size_t>(x) * ss;
+                for (int sx = 0; sx < ss; ++sx) {
+                    const uint32_t p = row[sx];
+                    a += p >> 24; r += (p >> 16) & 0xFF; g += (p >> 8) & 0xFF; b += p & 0xFF;
+                }
+            }
+            a /= inv; r /= inv; g /= inv; b /= inv;
+            if (a <= 1) continue;
+            const size_t i = static_cast<size_t>(fy) * fw + fx;
+            frame[i] = BlendOver((a << 24) | (r << 16) | (g << 8) | b, frame[i]);
+        }
+    }
 }
 
 // ── Caption ─────────────────────────────────────────────────────────────────
@@ -3056,11 +3133,6 @@ constexpr Rgb kPanTextA {0xd1 / 255.f, 0xd7 / 255.f, 0xe0 / 255.f};   // #d1d7e0
 constexpr Rgb kPanTextB {0x91 / 255.f, 0x98 / 255.f, 0xa1 / 255.f};   // #9198a1
 constexpr Rgb kPanHover {0x2a / 255.f, 0x31 / 255.f, 0x3c / 255.f};   // #2a313c
 constexpr Rgb kPanAccent{0xf7 / 255.f, 0x81 / 255.f, 0x66 / 255.f};   // #f78166
-// The speaking halo. Not the ring's ember: on the card that read as a warning
-// rather than as a voice, and the panel already spends red, amber and green on
-// what the rows mean. White says "this one is talking" and nothing else. A hair
-// off pure white, which blooms harder than it looks against a pale terminal.
-constexpr Rgb kPanGlow  {0xf0 / 255.f, 0xf3 / 255.f, 0xf6 / 255.f};   // #f0f3f6
 
 // The scale the card currently being built is drawn at. Panels are only ever
 // built on the panel thread (or on the main thread by --panel-preview), so a
@@ -3161,9 +3233,10 @@ struct PanelCard {
     // and everything above them. A frame is a copy of the first, two small
     // overlays, and the second.
     std::vector<uint32_t> base, marks;
-    // The speaking halo's shape, baked at the same time. Only its *brightness*
-    // follows the voice, so the falloff is geometry like everything else here.
-    std::vector<uint8_t>  halo;
+    // Where the mini orb goes while this card is being spoken at: the pill's icon
+    // slot, or a slot reserved at the head of the header line. Empty when the
+    // card has no orb on it, which is every card that is not speaking.
+    RECT                  orb{};
     std::vector<uint8_t>  ink, dim;          // text coverage, full and muted
     std::vector<uint32_t> deco;              // premultiplied: the icons carry colour
     RECT                  header{};          // the collapse toggle's click target
@@ -3250,11 +3323,17 @@ void PanelShapeAndBake(PanelCard* out) {
 // the voice is saying about this terminal is more urgent than what it is working
 // on, and it is the same line either way rather than a row that appears and
 // shoves the list down.
+//
+// `orb_slot` reserves the head of that line for the mini orb. It outlives the
+// captions on purpose: the slot has to stay while the orb fades out, so it
+// follows the fade rather than the voice, and collapses in one rebuild at the
+// end. A pill needs no flag — its icon slot is already orb-sized.
 void BuildPanelCard(PanelCard* out, const std::string& summary,
                     const std::vector<PanelItem>& items, bool collapsed,
                     const std::string& tab, bool expanded_all, float scale, int max_h,
                     int* scroll, const std::string& cap_title = std::string(),
-                    const std::string& cap = std::string(), int copied_item = -1) {
+                    const std::string& cap = std::string(), int copied_item = -1,
+                    bool orb_slot = false) {
     *out = PanelCard{};
     g_pan_scale = scale;
 
@@ -3299,6 +3378,11 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         out->dim.assign(n, 0);
         out->deco.assign(n, 0);
         out->header = RECT{margin, margin, margin + panel_w, margin + panel_h};
+        // The pill already has a slot the size of an orb: the icon's. Speaking
+        // puts the orb *there* rather than growing the pill by one glyph, so a
+        // pill that starts talking does not change shape.
+        out->orb = RECT{margin + pad, margin + (panel_h - icon) / 2,
+                        margin + pad + icon, margin + (panel_h - icon) / 2 + icon};
         StampMask(&out->dim, out->w, out->h, count,
                   margin + pad + icon + igap, margin + (panel_h - count.h) / 2);
         if (info) {
@@ -3327,7 +3411,11 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // this terminal doing", and giving the toggle its own row would spend a
         // line of the terminal on furniture.
         const bool  spoken   = !cap_title.empty() || !cap.empty();
-        const int   head_w   = inner - toggle - tgap;
+        // Speaking, the header line opens with the mini orb and everything on it
+        // moves over by a glyph — the title is measured against what is left, so
+        // it is cut to fit rather than sliding under the toggle.
+        const int   oslot    = orb_slot ? icon + igap : 0;
+        const int   head_w   = inner - toggle - tgap - oslot;
         const std::string head_text =
             spoken ? cap_title
                    : (summary.empty() ? PanCountText(items.size()) : summary);
@@ -3339,7 +3427,8 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             if (rest >= PanScale(56)) head_rest = PanLine(cap, false, rest);
         }
         const int head_h =
-            std::max({head.h, head_rest.h, toggle}) + PanScale(kPanHeadGap);
+            std::max({head.h, head_rest.h, toggle, oslot ? icon : 0}) +
+            PanScale(kPanHeadGap);
 
         // Which tabs exist for this list, and which of them is showing. An empty
         // tab is not offered, and a selection whose tab has emptied falls back to
@@ -3489,11 +3578,15 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         // The whole top band, padding included: the header is meant to be an easy
         // thing to hit, since it is the one control on the card.
         out->header = RECT{margin, margin, margin + panel_w, y + head_h};
-        StampMask(spoken ? &out->ink : &out->dim, out->w, out->h, head, margin + pad,
-                  y + (head_h - head.h) / 2);
+        if (oslot) {
+            out->orb = RECT{margin + pad, y + (head_h - icon) / 2,
+                            margin + pad + icon, y + (head_h - icon) / 2 + icon};
+        }
+        StampMask(spoken ? &out->ink : &out->dim, out->w, out->h, head,
+                  margin + pad + oslot, y + (head_h - head.h) / 2);
         if (head_rest.w) {
             StampMask(&out->dim, out->w, out->h, head_rest,
-                      margin + pad + head.w + PanScale(kPanLabelGap),
+                      margin + pad + oslot + head.w + PanScale(kPanLabelGap),
                       y + (head_h - head_rest.h) / 2);
         }
         const int tx = margin + panel_w - pad - toggle;
@@ -3659,27 +3752,15 @@ void BakePanelLayers(PanelCard* out) {
             out->marks[ci] = m;
         }
     }
-
-    // The halo: a Gaussian band on the card's own outline, reaching a little way
-    // inside so the hairline is lit too and the edge reads as glowing rather
-    // than as a card with something behind it.
-    out->halo.assign(n, 0);
-    const float gsig  = std::max(1.f, static_cast<float>(PanScale(7)));
-    const float reach = 3.f * gsig;
-    for (size_t ci = 0; ci < n; ++ci) {
-        const float d = out->dist[ci];
-        if (d < -2.5f || d > reach) continue;
-        const float t = std::max(d, 0.f) / gsig;
-        const float a = std::exp(-t * t) * 0.62f;
-        if (a > 0.004f) out->halo[ci] = static_cast<uint8_t>(a * 255.f + 0.5f);
-    }
 }
 
-// A frame: the baked card, the hovered band under the text, the speaking halo
-// around the outline, the baked marks on top. `hover` is the row rectangle to
-// light up (the header and the tabs count as rows), or null.
+// A frame: the baked card, the hovered band under the text, the baked marks on
+// top, and the mini orb in its slot while the card is being spoken at. `hover`
+// is the row rectangle to light up (the header and the tabs count as rows), or
+// null. `orb` is the speaking presence, 0..1 — the orb's fade, and the amount by
+// which whatever the slot normally holds gets out of its way.
 void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, float fade,
-                  float glow, float voice) {
+                  float orb, float voice, float orb_time = 0.f) {
     const size_t n = static_cast<size_t>(card.w) * card.h;
     if (card.base.size() != n) return;
     std::memcpy(frame, card.base.data(), n * 4);
@@ -3708,28 +3789,30 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
         }
     }
 
-    // Brightness follows the voice; the shape is baked. A table for the colour
-    // as well, because this runs over every pixel of the ring twenty-five times
-    // a second for as long as the utterance lasts, and Pack's float work is most
-    // of what that used to cost.
-    const float gi = glow * (0.30f + 0.55f * Clamp01(voice));
-    if (gi > 0.004f && card.halo.size() == n) {
-        static uint32_t glow_ink[256];
-        static bool     ready = false;
-        if (!ready) {
-            for (int i = 0; i < 256; ++i) glow_ink[i] = Pack(kPanGlow, i / 255.f);
-            ready = true;
-        }
-        for (size_t ci = 0; ci < n; ++ci) {
-            const uint8_t hm = card.halo[ci];
-            if (!hm) continue;
-            const int q = static_cast<int>(gi * hm);
-            if (q > 3) frame[ci] = BlendOver(glow_ink[q > 255 ? 255 : q], frame[ci]);
+    // The marks, with one exception: the orb's slot dims as the orb comes up, so
+    // a pill's icon hands the space over instead of being drawn under a ring.
+    // (In the header the slot is reserved and empty, so this costs nothing
+    // there.) The band test is per row, not per pixel: while nothing is speaking
+    // — which is every card almost all of the time — this is the same loop it
+    // has always been.
+    const float ol      = Clamp01(orb);
+    const bool  orb_on  = ol > 0.004f && card.orb.right > card.orb.left;
+    const float slot_a  = 1.f - ol;
+    for (int y = 0; y < card.h; ++y) {
+        const bool band = orb_on && y >= card.orb.top && y < card.orb.bottom;
+        const size_t row = static_cast<size_t>(y) * card.w;
+        for (int x = 0; x < card.w; ++x) {
+            uint32_t m = card.marks[row + x];
+            if (!m) continue;
+            if (band && x >= card.orb.left && x < card.orb.right) {
+                m = ScaleAlpha(m, slot_a);
+            }
+            frame[row + x] = BlendOver(m, frame[row + x]);
         }
     }
-
-    for (size_t ci = 0; ci < n; ++ci) {
-        if (const uint32_t m = card.marks[ci]) frame[ci] = BlendOver(m, frame[ci]);
+    if (orb_on) {
+        ComposeMiniOrb(frame, card.w, card.h, card.orb.left, card.orb.top,
+                       card.orb.right - card.orb.left, voice, ol, orb_time);
     }
     if (fade < 0.999f) {
         for (size_t ci = 0; ci < n; ++ci) frame[ci] = ScaleAlpha(frame[ci], fade);
@@ -3774,12 +3857,14 @@ struct Panel {
     int       max_h    = 0;          // ceiling from the target's client height
     bool      dirty     = true;      // content changed: the card needs rebuilding
     PanHit    hover{};
-    // The speaking glow: `glow` eases in and out so the card arrives and leaves
-    // with the voice rather than snapping, `voice` is the live envelope, and the
-    // captions replace the summary line while it lasts.
-    float       glow = 0.f, voice = 0.f;
+    // Speaking: `orb` eases in and out so the mini orb arrives and leaves with
+    // the voice rather than snapping, `voice` is the live envelope that churns
+    // its outline, `orb_time` is its animation clock, and the captions replace
+    // the summary line while it lasts.
+    float       orb = 0.f, voice = 0.f, orb_time = 0.f;
     bool        speaking = false;
-    bool        glow_drawn = false;   // the last frame pushed had a halo on it
+    bool        orb_slot = false;     // the card was built with a slot for it
+    bool        orb_drawn = false;    // the last frame pushed had an orb on it
     std::string cap_title, cap;
     float     scale     = 1.f;
     PanelCard card;
@@ -3990,14 +4075,14 @@ void PanelCompose(Panel* p) {
         default:
             break;
     }
-    ComposePanel(static_cast<uint32_t*>(p->bits), p->card, hover, 1.f, p->glow,
-                 p->voice);
+    ComposePanel(static_cast<uint32_t*>(p->bits), p->card, hover, 1.f, p->orb,
+                 p->voice, p->orb_time);
 }
 
 void PanelRender(Panel* p) {
     BuildPanelCard(&p->card, p->summary, p->items, p->collapsed, p->tab,
                    p->expanded_all, p->scale, p->max_h, &p->scroll, p->cap_title,
-                   p->cap, p->copied_item);
+                   p->cap, p->copied_item, p->orb_slot);
     if (p->card.w != p->dib_w || p->card.h != p->dib_h) {
         p->ReleaseDib();
         HDC screen = GetDC(nullptr);
@@ -5298,19 +5383,33 @@ void PanelThread(float seconds) {
             // A few frames to rise, and a *linear* 1.5 s to fall — an
             // exponential ease never reaches zero, which is how a card was left
             // faintly lit for the better part of ten seconds after the voice had
-            // stopped.
-            if (live) p->glow += (1.f - p->glow) * 0.25f;
-            else      p->glow = std::max(0.f, p->glow - kPanTick / 1500.f);
+            // stopped. The orb goes with it, so a stream that ends (or a client
+            // that dies mid-sentence) always takes the orb off the card.
+            if (live) p->orb += (1.f - p->orb) * 0.25f;
+            else      p->orb = std::max(0.f, p->orb - kPanTick / 1500.f);
             p->voice += (voice * (live ? 1.f : 0.f) - p->voice) * 0.35f;
-            if (p->speaking != live) {
-                p->speaking = live;
-                // Coming back: the summary returns to the header line.
-                if (!live) {
+            // The orb's clock, at the same ~1 unit per second the overlay loop
+            // advances the ring's. Reset once it is gone rather than left to
+            // grow: a float this is added to forty times a second all day loses
+            // the resolution the churn is made of.
+            if (p->orb > 0.f) p->orb_time += kPanTick / 1000.f;
+            else              p->orb_time = 0.f;
+            // The slot follows the *fade*, not the voice: it has to still be
+            // there while the orb fades out, and collapses in one rebuild once
+            // it is — which is also the rebuild that puts the summary back on
+            // the header line. Holding the caption for the length of the fade is
+            // deliberate: the line snapping back while the orb is still on it
+            // read as two separate things ending at two different times.
+            const bool want_slot = p->orb > 0.f;
+            if (want_slot != p->orb_slot) {
+                p->orb_slot = want_slot;
+                if (!want_slot) {
                     p->cap_title.clear();
                     p->cap.clear();
-                    p->dirty = true;
                 }
+                p->dirty = true;
             }
+            p->speaking = live;
 
             // Back to being a question, on its own, without anything having to
             // remember to put it back.
@@ -5387,17 +5486,17 @@ void PanelThread(float seconds) {
                                    std::to_string(hover_item->number);
                 }
             }
-            // The glow moves every frame, which is a recompose and never a
+            // The orb churns every frame, which is a recompose and never a
             // rebuild: no text is re-measured to make a card breathe. The
-            // `glow_drawn` half matters as much — without one last frame after it
-            // reaches zero, the card keeps whatever halo was on the last one
+            // `orb_drawn` half matters as much — without one last frame after it
+            // reaches zero, the card keeps whatever orb was on the last one
             // pushed, forever.
-            const bool lit = p->glow > 0.f;
-            if ((lit || p->glow_drawn) && !redrawn) {
+            const bool lit = p->orb > 0.f;
+            if ((lit || p->orb_drawn) && !redrawn) {
                 PanelCompose(p);
                 redrawn = true;
             }
-            p->glow_drawn = lit;
+            p->orb_drawn = lit;
 
             const bool first = !p->shown;
             if (moved || redrawn || first) PanelPush(p);
@@ -6047,8 +6146,8 @@ void PanelPreview(const std::string& prefix) {
         bool        collapsed;
         bool        all;
         int         hover;    // row to light up, -3 for none
-        float       glow;     // the speaking halo, 0..1
-        float       voice;    // the amplitude driving it
+        float       orb;      // the mini orb's presence, 0..1
+        float       voice;    // the amplitude churning its outline
         const char* cap_title;
         const char* cap;
         bool        bare;     // a summary and nothing else
@@ -6066,31 +6165,40 @@ void PanelPreview(const std::string& prefix) {
         // A session that has said what it is doing but has nothing to link yet.
         {"-summary-only.png", "all", false, false, -3, 0.f, 0.f, "", "", true},
         {"-summary-only-pill.png", "all", true, false, -3, 0.f, 0.f, "", "", true},
-        // Mid-utterance: lit, and the header carrying what is being said.
+        // Mid-utterance: the orb on the header line, carrying what is being said.
         {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
          "laravel-opticloud #1375", "checks are green, ready to merge", false},
+        // And what a pill does with it: the orb stands in for the worst item's
+        // icon, in the slot that icon was already in.
+        {"-speaking-pill.png", "all", true, false, -3, 1.f, 0.85f,
+         "laravel-opticloud #1375", "checks are green, ready to merge", false},
     };
+    // Fixed rather than wall-clock, so two runs of the preview produce the same
+    // outline and a diff of the PNGs means something.
+    constexpr float kShotOrbTime = 1.7f;
     for (const Shot& shot : shots) {
         PanelCard card;
         int       scroll = 0;
         const std::vector<PanelItem>& shown = shot.bare ? none : items;
         BuildPanelCard(&card, kPanSampleSummary, shown, shot.collapsed, shot.tab,
-                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
+                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap, -1,
+                       shot.orb > 0.f);
         std::vector<uint32_t> px(static_cast<size_t>(card.w) * card.h);
         const RECT* hover = nullptr;
         if (shot.hover >= 0 && shot.hover < static_cast<int>(card.rows.size())) {
             hover = &card.rows[shot.hover].hit;
         }
-        ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
+        ComposePanel(px.data(), card, hover, 1.f, shot.orb, shot.voice, kShotOrbTime);
         // Timed with the geometry warm: the first number is what a content change
-        // costs, the second what a hover or a glow frame costs.
+        // costs, the second what a hover or an orb frame costs.
         LARGE_INTEGER f{}, a{}, b{}, c{};
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&a);
         BuildPanelCard(&card, kPanSampleSummary, shown, shot.collapsed, shot.tab,
-                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap);
+                       shot.all, scale, 0, &scroll, shot.cap_title, shot.cap, -1,
+                       shot.orb > 0.f);
         QueryPerformanceCounter(&b);
-        ComposePanel(px.data(), card, hover, 1.f, shot.glow, shot.voice);
+        ComposePanel(px.data(), card, hover, 1.f, shot.orb, shot.voice, kShotOrbTime);
         QueryPerformanceCounter(&c);
         const std::string path = prefix + shot.suffix;
         WritePng(path, px, card.w, card.h);
