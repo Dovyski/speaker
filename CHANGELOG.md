@@ -9,6 +9,28 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ## [Unreleased]
 
+### Added
+
+- **`Links (N)` tab on the attention panel.** A new `kind: "link"` row for the
+  plain URLs a session names — a local dev-login route, a staging page with the
+  query string that reproduces the bug — with GitHub's `link` Octicon in the
+  neutral row grey, the host and path as its handle, and the whole URL in the
+  hover popover, broken at its own separators rather than ellipsized. Clicking
+  one opens it in the browser like a pull request row.
+- The producer (`hooks/i47-attention.ps1`) extracts http(s) URLs from both
+  assistant and user text, keeps the 8 most recent per session, and skips
+  anything the other tabs already own: `github.com/<owner>/<repo>/(issues|pull)/<n>`
+  URLs, commit pages, avatars and images. A URL the assistant wrote or ran
+  counts as `worked`; one that only went past in someone else's text is
+  `mentioned` and stays off the card. `link` rows are exempt from the Haiku
+  relevance verdict and from the enricher's `gh` calls.
+
+### Fixed
+
+- The enricher's dedupe pass keyed every numberless row by `kind|repo|number`,
+  which would have collapsed all `link` rows onto one. It now keys them by URL,
+  as it already did for `path` and `question`.
+
 ## [1.0.0] — 2026-09-09
 
 First release with a prebuilt binary. Everything below already existed in the
