@@ -2951,6 +2951,8 @@ constexpr const char* kOctComment =
     "M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z";
 constexpr const char* kOctCircle =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z";
+constexpr const char* kOctInfo =
+    "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z";
 constexpr const char* kOctFileDirectory =
     "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
     "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
@@ -3268,15 +3270,21 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
     // fits its text rather than keeping the expanded width, so a collapsed panel
     // gives the terminal underneath almost all of its corner back.
     if (collapsed) {
-        // "2 pending" rather than "10 items" when any of them is a question: the
-        // number worth reducing the panel to is the one that needs an answer.
-        const size_t pending = PanPendingCount(items);
+        // A pill is a glyph, two or three words and the toggle — never anything
+        // that grows with the payload. It exists to give the terminal its corner
+        // back, so a pill carrying a whole summary was the one thing it could not
+        // be. "2 pending" beats "10 items" when any of them is a question (the
+        // number worth reducing the panel to is the one that needs an answer),
+        // and a card that is only a summary collapses to the word `Info`: the
+        // summary itself is one click away, on the card it belongs to.
+        const size_t      pending = PanPendingCount(items);
+        const bool        info    = items.empty();
         const std::string count_text =
-            pending      ? std::to_string(pending) + " pending"
-            : items.empty() && !summary.empty() ? summary
-                                                : PanCountText(items.size());
-        const TextMask count = PanLine(count_text, false,
-                                       PanScale(kPanWidth) - 2 * pad);
+            pending ? std::to_string(pending) + " pending"
+                    : (info ? std::string("Info") : PanCountText(items.size()));
+        // Wide enough for the longest of those and not a pixel more, so no
+        // future caller can widen a pill by widening its text.
+        const TextMask count = PanLine(count_text, false, PanScale(120));
         const int panel_w = pad + icon + igap + count.w + tgap + toggle + pad;
         const int panel_h = std::max({count.h, toggle, icon}) + 2 * PanScale(7);
         out->margin  = margin;
@@ -3293,7 +3301,10 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         out->header = RECT{margin, margin, margin + panel_w, margin + panel_h};
         StampMask(&out->dim, out->w, out->h, count,
                   margin + pad + icon + igap, margin + (panel_h - count.h) / 2);
-        if (const PanelItem* worst = PanWorstItem(items)) {
+        if (info) {
+            StampOcticon(&out->deco, out->w, out->h, margin + pad,
+                         margin + (panel_h - icon) / 2, icon, kOctInfo, kPanTextB);
+        } else if (const PanelItem* worst = PanWorstItem(items)) {
             const PanGlyph g = PanelGlyphFor(*worst);
             StampOcticon(&out->deco, out->w, out->h, margin + pad,
                          margin + (panel_h - icon) / 2, icon, g.path, g.colour);
@@ -5971,6 +5982,7 @@ void PanelPreview(const std::string& prefix) {
         {"-pending.png",   "pending", false, false, -3, 0.f, 0.f, "", "", false},
         // A session that has said what it is doing but has nothing to link yet.
         {"-summary-only.png", "all", false, false, -3, 0.f, 0.f, "", "", true},
+        {"-summary-only-pill.png", "all", true, false, -3, 0.f, 0.f, "", "", true},
         // Mid-utterance: lit, and the header carrying what is being said.
         {"-speaking.png",  "all", false, false, -3, 1.f, 0.85f,
          "laravel-opticloud #1375", "checks are green, ready to merge", false},
@@ -6476,7 +6488,8 @@ void Usage() {
         "  --point-preview <pfx> render a strip of pointer frames and exit\n"
         "  --panel-preview <pfx> render the attention panel and exit: <pfx>- plus\n"
         "                        expanded, hover, collapsed, all, tabs, pending,\n"
-        "                        summary-only, speaking, popover-pr,\n"
+        "                        summary-only, summary-only-pill, speaking,\n"
+        "                        popover-pr,\n"
         "                        popover-issue, popover-question (and two\n"
         "                        avatar PNGs the popovers use)\n"
         "  --panel-demo          park a sample panel in the bottom-right of the\n"
