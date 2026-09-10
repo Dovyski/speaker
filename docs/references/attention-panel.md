@@ -225,6 +225,14 @@ and with the card itself — all of which fall out of one rule rather than five,
 since the thing being watched is a *key* built from the session, the tab, the
 scroll offset and the row, and any change to it restarts the dwell.
 
+There is **one** pointer, so there is one dwell timer, and it is decided once
+per pass after every card has been looked at. Deciding it inside the per-card
+loop is a bug worth naming: every card the pointer was *not* over computed an
+empty key, found it different from the hovered card's, and reset the shared
+timer — so with two cards on screen the dwell could never reach 350 ms on
+either of them, and the popover appeared only when exactly one card happened to
+be visible.
+
 It is clamped to the monitor's work area, and if there is no room to the left of
 the card (a terminal against the left edge of a narrow screen) it goes to the
 right instead rather than covering the rows it is describing.
@@ -463,6 +471,12 @@ a UNC path, and nothing else.
   <p align="center">
     <img src="../panel-summary-only.png" width="440" alt="a header-only card: just the summary line and the collapse toggle">
   </p>
+- `GET /panels?debug=1` answers with the same registrations as the panel thread
+  sees them: each card's rectangle, its monitor, the DPI it was drawn at, and the
+  last cursor position and hit the thread acted on. It is built in the same
+  resolver pass as the plain view, so it costs a query parameter and nothing
+  else — and it is the difference between guessing at a hover bug and reading
+  one.
 - `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
   `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking` and
   `updated_at` — which is the first

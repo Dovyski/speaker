@@ -76,6 +76,7 @@ $ curl -s -X POST http://127.0.0.1:8124/panel -d '{
 | `POST /panel` | Register or update a session's panel. Always succeeds unless the body is wrong: `{"ok":true,"hwnd":N,"resolved":true}`, or `{"ok":true,"hwnd":null,"resolved":false,"error":"…","candidates":[…]}` when the title matches nothing (or several) at that moment. `400` for a body that is not a JSON object, a missing `session`, a missing `title` or malformed `items`. Empty `items` **and** an empty `summary` removes the registration |
 | `DELETE /panel?session=<id>` | Remove one registration at once |
 | `GET /panels` | What is registered: `session`, `title`, `hwnd` or `null`, `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking`, `updated_at`. A snapshot published by the resolver, so at most half a second stale. This is also the table `--session` resolves a window against |
+| `GET /panels?debug=1` | The same registrations seen from the panel thread: each card's rectangle, the monitor it is on, the DPI it was drawn at, the row count, and the **last cursor position and hit** the thread acted on. What to reach for when a card is in the wrong place or a hover does nothing |
 
 Item fields, the `details` object the popover reads, and every rule behind
 `resolved` are in [attention-panel.md](attention-panel.md).
