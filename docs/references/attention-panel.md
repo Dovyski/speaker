@@ -272,9 +272,13 @@ wrong. `checks.total` counts everything, so *passing* is
 
 The header is the summary line, with a `−` at the right. Click either and the
 card becomes a one-line pill: how many items, and the **worst** item's icon and
-colour among them.
-That is enough to know whether the window wants attention, while giving the
-terminal underneath its corner back.
+colour among them. That is enough to know whether the window wants attention,
+while giving the terminal underneath its corner back.
+
+A pill is always a glyph, two or three words and the toggle — `2 pending`,
+`8 items`, `Info` — and never anything that grows with the payload. Its whole
+job is to get out of the way, so its width is capped at the longest of those
+forms rather than at whatever text it was handed.
 
 What the card is *showing* — collapsed or not, which tab, whether the list is
 fully expanded — belongs to the **session**, not to the payload: a new `POST` on
@@ -450,8 +454,11 @@ a UNC path, and nothing else.
   header-only card — the summary line and the collapse toggle, no tab strip, no
   rows, one line tall. "Rebasing the forms PRs on dev" is worth a line in the
   corner of the terminal doing it, and a session that has not found anything to
-  link yet should not have its panel taken away. Collapsed, such a card's pill
-  carries the summary itself rather than `0 items`.
+  link yet should not have its panel taken away. Collapsed, it becomes the
+  smallest pill of all: the `info` glyph in grey and the word `Info`. The
+  summary is one click away, on the card it belongs to — a pill exists to give
+  the terminal its corner back, so a pill carrying a whole sentence is the one
+  thing it cannot be.
 
   <p align="center">
     <img src="../panel-summary-only.png" width="440" alt="a header-only card: just the summary line and the collapse toggle">
@@ -505,6 +512,7 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-tabs.png` | the `PRs` tab active |
 | `<prefix>-pending.png` | the `Pending` tab, two questions |
 | `<prefix>-summary-only.png` | a summary and nothing else |
+| `<prefix>-summary-only-pill.png` | what that card collapses to: the `info` glyph and `Info` |
 | `<prefix>-speaking.png` | mid-utterance: lit, the header carrying the caption |
 | `<prefix>-popover-pr.png` | a fully populated pull request popover |
 | `<prefix>-popover-issue.png` | the same for an issue |
