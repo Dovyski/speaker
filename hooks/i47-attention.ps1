@@ -1,5 +1,5 @@
 # i47 P1 producer: Claude Code hook (Stop + PostToolUse/Bash) that mines the
-# session transcript delta for PRs, issues and work paths, keeps
+# session transcript delta for PRs, issues, work paths and plain links, keeps
 # ~/.claude/attention/<session_id>.json in the POST /panel contract shape,
 # resolves the hosting Windows Terminal title (P0 resolver) and POSTs the file
 # to the speak.exe daemon.
@@ -19,6 +19,7 @@ $RepoCache = Join-Path $Dir 'known-repos.txt'
 $Endpoint = 'http://127.0.0.1:8124/panel'
 $DefaultOwner = 'optidatacloud'
 $MaxItems = 30
+$MaxLinks = 8
 $MaxAgeHours = 48
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -89,6 +90,7 @@ if ($state) {
             foreach ($p in $it.PSObject.Properties) { $h[$p.Name] = $p.Value }
             $k = switch ([string]$h.kind) {
                 'path'     { 'path|' + ([string]$h.url).ToLower() }
+                'link'     { 'link|' + ([string]$h.url).ToLower() }
                 'question' { 'question|' + (([string]$h.title).ToLower() -replace '[^a-z0-9]+', ' ').Trim() }
                 default    { "{0}|{1}|{2}" -f $h.kind, $h.repo, $h.number }
             }
@@ -159,6 +161,75 @@ $rxPath      = [regex]'(?i)([A-Za-z]:[\\/]Dev[\\/]field[\\/]work[\\/][A-Za-z0-9.
 $rxMdLink    = [regex]'\[([^\]\r\n]{2,140})\]\((https?://github\.com/[^\s)]+)\)'
 $rxJsonTitle = [regex]'"title"\s*:\s*"((?:[^"\\]|\\.){2,200})"'
 $rxGhTitle   = [regex]'(?m)^\s*title:\s*(\S.{1,200}?)\s*$'
+# Any http(s) URL. The excluded set is the punctuation that ends a URL rather
+# than belonging to it, which is also what makes `[text](url)` and `<url>` work.
+$rxAnyUrl    = [regex]'https?://[^\s<>"''`\|\\[\]\{\}\(\)]+'
+
+# A URL as it should be stored: no trailing sentence punctuation.
+function Get-CleanUrl([string]$u) {
+    if (-not $u) { return $null }
+    $u = $u.Trim().TrimEnd('.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', "'")
+    if ($u -notmatch '(?i)^https?://[^/\s]+') { return $null }
+    return $u
+}
+
+# What must never become a `link` row: anything the Issues / PRs tabs already
+# own, a commit page (a point in history, not a place to go back to) and
+# pictures, which a one-line row cannot show and a click should not open.
+function Test-LinkSkip([string]$u) {
+    if (-not $u) { return $true }
+    if ($u.Length -lt 12 -or $u.Length -gt 300) { return $true }
+    if ($u -match '(?i)^https?://(?:www\.)?github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+') { return $true }
+    if ($u -match '(?i)^https?://(?:www\.)?github\.com/[^/\s]+/[^/\s]+/commit/') { return $true }
+    if ($u -match '(?i)^https?://avatars[0-9]*\.githubusercontent\.com/') { return $true }
+    if ($u -match '(?i)/avatars?/') { return $true }
+    $bare = $u -replace '[?#].*$', ''
+    if ($bare -match '(?i)\.(png|jpe?g|gif|svg|webp|bmp|ico|avif|tiff?)$') { return $true }
+    return $false
+}
+
+# The row's handle: host plus path, with the middle of a long path dropped
+# rather than its tail — the last segment is the half that names the thing.
+function Get-LinkTitle([string]$u) {
+    $uri = $null
+    try { $uri = [uri]$u } catch { return $u }
+    $h = $uri.Host
+    $path = $uri.AbsolutePath
+    if ($path -eq '/') { $path = '' }
+    $t = $h + $path
+    if ($t.Length -le 46) { return $t }
+    $segs = @(($path.Trim('/')) -split '/' | Where-Object { $_ })
+    if ($segs.Count -gt 1) { $t = $h + '/.../' + $segs[-1] }
+    if ($t.Length -gt 46) { $t = $t.Substring(0, 45) + '...' }
+    return $t
+}
+
+# The part of an assistant message that counts as *work*: what it said, and the
+# shell commands it ran. A tool_use payload is skipped on purpose — a Write of
+# an HTML file would otherwise put every href in it on the card.
+function Get-StrongLinkText($j) {
+    if (([string]$j.type) -ne 'assistant') { return '' }
+    $parts = New-Object System.Collections.ArrayList
+    $m = $j.message
+    if (-not $m) { return '' }
+    $c = $m.content
+    if ($c -is [string]) { [void]$parts.Add($c) }
+    elseif ($c) {
+        foreach ($b in @($c)) {
+            if ($null -eq $b -or ($b -is [string])) { continue }
+            switch ([string]$b.type) {
+                'text'     { if ($b.text) { [void]$parts.Add([string]$b.text) } }
+                'tool_use' {
+                    if (([string]$b.name) -match '(?i)^bash') {
+                        try { if ($b.input -and $b.input.command) { [void]$parts.Add([string]$b.input.command) } } catch {}
+                    }
+                }
+                default    { }
+            }
+        }
+    }
+    return ($parts -join "`n")
+}
 
 function Flatten-Strings($o, [int]$depth = 0) {
     if ($null -eq $o -or $depth -gt 6) { return @() }
@@ -211,10 +282,12 @@ try {
 } catch {}
 
 # $relevance: 'worked' for the strong rules (a real URL, an explicit owner/repo#N,
-# a work path), 'mentioned' for the weak bare-`#N` rule. Haiku (P4) may revise it;
+# a work path, a link the assistant wrote or ran), 'mentioned' for the weak
+# bare-`#N` rule and for a link only somebody else's text mentioned. Haiku (P4) may revise it;
 # an item without the property is treated as 'worked' everywhere downstream.
 function Add-Item($kind, $repo, $number, $url, $title, $ts, $relevance = 'worked') {
-    $key = if ($kind -eq 'path') { 'path|' + ([string]$url).ToLower() } else { "{0}|{1}|{2}" -f $kind, $repo, $number }
+    $key = if ($kind -eq 'path' -or $kind -eq 'link') { "{0}|{1}" -f $kind, ([string]$url).ToLower() }
+           else { "{0}|{1}|{2}" -f $kind, $repo, $number }
     if ($items.Contains($key)) {
         $h = $items[$key]
         $h['last_seen'] = $ts
@@ -222,9 +295,12 @@ function Add-Item($kind, $repo, $number, $url, $title, $ts, $relevance = 'worked
         if ((-not $h['url']) -and $url) { $h['url'] = $url }
         # a strong sighting promotes a row the weak rule created; never demote
         if ($relevance -eq 'worked' -and -not $h['relevance']) { $h['relevance'] = 'worked' }
+        # a link carries no Haiku verdict, so its own later strong sighting is
+        # the only thing that can promote it
+        if ($kind -eq 'link' -and $relevance -eq 'worked') { $h['relevance'] = 'worked' }
     } else {
         $h = [ordered]@{ kind = $kind }
-        if ($kind -ne 'path') { $h['repo'] = $repo; $h['number'] = [int]$number }
+        if ($kind -ne 'path' -and $kind -ne 'link') { $h['repo'] = $repo; $h['number'] = [int]$number }
         $h['url'] = $url
         $h['title'] = if ($title) { [string]$title } else { '' }
         $h['status'] = 'unknown'
@@ -338,6 +414,22 @@ foreach ($line in $deltaLines) {
         [void]$touched.Add((Add-Item 'path' $null $null $p $leaf $ts))
     }
 
+    # 4f. plain http(s) links. Worked when the assistant wrote or ran the URL,
+    # merely mentioned when it only turned up in the user's text or in output.
+    $strongUrls = @{}
+    try {
+        foreach ($m in $rxAnyUrl.Matches((Get-StrongLinkText $j))) {
+            $u = Get-CleanUrl $m.Value
+            if ($u) { $strongUrls[$u.ToLower()] = $true }
+        }
+    } catch {}
+    foreach ($m in $rxAnyUrl.Matches($text)) {
+        $u = Get-CleanUrl $m.Value
+        if (Test-LinkSkip $u) { continue }
+        $rel = if ($strongUrls.ContainsKey($u.ToLower())) { 'worked' } else { 'mentioned' }
+        [void]$touched.Add((Add-Item 'link' $null $null $u (Get-LinkTitle $u) $ts $rel))
+    }
+
     # a single item in a message claims that message's lone title
     if ($loneTitle) {
         $prIssue = @($touched | Select-Object -Unique | Where-Object { $_ -and -not $_.StartsWith('path|') })
@@ -349,6 +441,24 @@ foreach ($line in $deltaLines) {
 }
 
 # --- 5. prune + cap ---------------------------------------------------------
+# Links are the cheapest thing in here to produce, so they are capped on their
+# own before the global cap sees them: a chatty turn full of URLs must not push
+# the pull requests off the card.
+try {
+    $linkKeys = @()
+    foreach ($k in @($items.Keys)) {
+        if (-not $k.StartsWith('link|')) { continue }
+        $ls = (Get-Date).ToUniversalTime()
+        try { $ls = ([datetime]$items[$k]['last_seen']).ToUniversalTime() } catch {}
+        $linkKeys += [pscustomobject]@{ key = $k; when = $ls }
+    }
+    if ($linkKeys.Count -gt $MaxLinks) {
+        foreach ($e in @($linkKeys | Sort-Object when -Descending | Select-Object -Skip $MaxLinks)) {
+            $items.Remove($e.key)
+        }
+    }
+} catch { Add-Err 'link-cap' $_ }
+
 try {
     $cut = (Get-Date).ToUniversalTime().AddHours(-$MaxAgeHours)
     $kept = @()
