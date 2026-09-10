@@ -6,12 +6,13 @@ the bottom-right corner of one terminal window, listing what the session running
 in it is working on.
 
 <p align="center">
-  <img src="../panel-expanded.png" width="520" alt="the panel: a summary header, the All/Issues/PRs/Pending tabs, two question rows and four PR and issue rows">
+  <img src="../panel-expanded.png" width="520" alt="the panel: a summary header, the All/Issues/PRs/Links/Pending tabs, two question rows and four PR and issue rows">
 </p>
 
 - [Posting one](#posting-one)
 - [Rows](#rows)
 - [Tabs](#tabs)
+- [Links](#links)
 - [Pending: questions waiting on you](#pending-questions-waiting-on-you)
 - [Icons and colours](#icons-and-colours)
 - [Hover: the popover](#hover-the-popover)
@@ -36,7 +37,9 @@ $ curl -s -X POST http://127.0.0.1:8124/panel -d '{
        "url":"https://github.com/optidatacloud/laravel-opticloud/pull/1375",
        "title":"feat: calendar event reminder as a toast","status":"checks_failing"},
       {"kind":"path","url":"C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast",
-       "title":"1372-toast"}
+       "title":"1372-toast"},
+      {"kind":"link","url":"https://optibotinho-594.test/dev-login",
+       "title":"optibotinho-594.test/dev-login"}
     ]}'
 {"ok":true,"hwnd":1968562,"resolved":true}
 ```
@@ -53,8 +56,8 @@ file formats and how to debug it.
 
 Each row is an icon, a short handle (`repo#1375`, or a path's last segment) and
 the title, cut with an ellipsis. **Click a row** and it opens: pull requests and
-issues in the browser, paths in Explorer — one `ShellExecute` does both, which is
-why the two can sit in the same list. Six rows are shown; anything past that
+issues and links in the browser, paths in Explorer — one `ShellExecute` does all
+three, which is why they can sit in the same list. Six rows are shown; anything past that
 becomes a **`+N more` row, which is itself clickable** — click it and the panel
 shows everything, with `show less` on the last row to get back to six. Six is the
 right default (the point is the top of a ranked list, not the whole backlog) but
@@ -85,7 +88,7 @@ must not also scroll the terminal behind it.
 
 ## Tabs
 
-`All` | `Issues (N)` | `PRs (N)` | `Pending (N)`, GitHub's underlined nav: the active tab in
+`All` | `Issues (N)` | `PRs (N)` | `Links (N)` | `Pending (N)`, GitHub's underlined nav: the active tab in
 `#d1d7e0` over a 2 px `#f78166` accent that replaces the hairline under itself,
 the others in `#9198a1`. Clicking one filters the rows — the six-row cap, the
 `+N more` row, `show less` and the scrolling all apply to the filtered list.
@@ -107,11 +110,35 @@ no strip at all: the panel is six rows in the corner of a terminal, and furnitur
 has to earn its line. A selection whose tab has emptied falls back to showing
 `All` without being forgotten, since the items may well come back.
 
-The tab set is a table of `{id, label, predicate}`, which is how `Pending`
-arrived: one row added. It is also why an item of an **unknown `kind`** is drawn
+The tab set is a table of `{id, label, predicate}`, which is how `Pending` and
+`Links` arrived: one row added each. It is also why an item of an **unknown `kind`** is drawn
 rather than refused — with a number it gets the issue glyph, without one the
 folder, and it lands in `All`. A producer running ahead of this binary degrades
 to a plausible row instead of a 400.
+
+## Links
+
+<p align="center">
+  <img src="../panel-links.png" width="520" alt="the Links tab: two link rows with the chain icon, host and path">
+</p>
+
+`kind: "link"` is a plain URL somebody named: no repo, no number, no status —
+just `url` and a `title` short enough to read at a glance, which the producer
+builds as the host plus the path (`optibotinho-594.test/dev-login`), dropping the
+middle of a long path rather than its tail. It gets the `link` Octicon in the
+neutral grey the numberless rows already use, and clicking it opens the URL in
+the browser like a pull request row.
+
+The point is the URL you would otherwise scroll the transcript for: a local
+dev-login route, a staging page with the query string that reproduces the bug, a
+dashboard. So the producer keeps the **8 most recent** per session and never
+makes a link out of something another tab already owns — a
+`github.com/<owner>/<repo>/(issues|pull)/<n>` URL is an issue or a pull request
+row, not a link — nor out of a commit page, an avatar or an image.
+
+Hovering a link shows the **whole** URL, broken over as many as four lines at its
+own separators. That is the one thing the row cannot show, and the only reason
+the popover exists for this kind.
 
 ## Pending: questions waiting on you
 
@@ -150,6 +177,7 @@ took, and the same glyph the row's page shows:
 | closed pull request | `git-pull-request-closed` | red `#c93c37` |
 | `unknown` state | its type's icon | grey `#768390` |
 | `kind: question` | `question` | amber `#c69026` (grey once closed) |
+| `kind: link` | `link` | grey `#768390` |
 | a path, or any other numberless item | `file-directory` | grey `#768390` |
 | any other `kind`, with a number | `issue-opened` | by state, as above |
 
@@ -189,6 +217,7 @@ have no popover — a directory has nothing else to say.
   <img src="../panel-popover-pr.png" width="440" alt="a pull request popover: repo#N, Changes requested, the full title, author, labels, assignees, reviewers with verdicts and a checks line">
   <img src="../panel-popover-issue.png" width="440" alt="an issue popover: repo#N, its state, the full title, author, labels and assignees">
   <img src="../panel-popover-question.png" width="440" alt="a question popover: the amber question mark, Pending question, the whole question text, and click to copy">
+  <img src="../panel-popover-link.png" width="440" alt="a link popover: the chain icon, the word Link, and the whole URL over two lines">
 </p>
 
 Top to bottom: the type icon, `repo#N`, and the status *spelled out* (`Changes
@@ -215,6 +244,12 @@ before going back to being a question. Clicking again inside that window
 restarts it. If the popover happens to be open, its footer says `Copied` for the
 same moment — a rebuild in place, since the same row is still hovered and
 re-dwelling for it would be absurd.
+
+A **link** row gets the smallest shape of all: the chain icon, the word `Link`,
+and the whole URL. A URL is one unbreakable word, so it is broken by hand rather
+than by `DT_WORDBREAK` — measured once, then cut back to the last `/`, `?`, `&`,
+`=`, `-`, `_` or `.` so a break lands between path segments — over at most four
+lines. No `details` are ever fetched for it, so there is nothing else to show.
 
 A row whose `details` never arrived still gets a popover — its own title and its
 status, which is more than the row could show. Nothing here is interactive: the
@@ -441,7 +476,7 @@ listener as `/point` — the next port, `8124` by default.
 | `session` | required; the key a registration is remembered and deleted by |
 | `title` | required; the window title to look for, matched as above |
 | `summary` | optional; the header line, ellipsized around 70-odd characters. Empty falls back to `N items`, and is the whole card when `items` is empty |
-| `items[]` | `kind` (`pr`, `issue`, `path`, `question`), `repo`, `number`, `url`, `title`, `status`, optional [`details`](#the-details-contract) |
+| `items[]` | `kind` (`pr`, `issue`, `path`, `link`, `question`), `repo`, `number`, `url`, `title`, `status`, optional [`details`](#the-details-contract) |
 
 `url` is optional for a `pr` or an `issue` with a `repo` and a `number` — the
 daemon builds the GitHub URL — and it is the only thing a row click uses, so it
@@ -524,6 +559,7 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-collapsed.png` | the one-line pill |
 | `<prefix>-all.png` | everything, with `show less` hovered on the last row |
 | `<prefix>-tabs.png` | the `PRs` tab active |
+| `<prefix>-links.png` | the `Links` tab, two link rows |
 | `<prefix>-pending.png` | the `Pending` tab, two questions |
 | `<prefix>-summary-only.png` | a summary and nothing else |
 | `<prefix>-summary-only-pill.png` | what that card collapses to: the `info` glyph and `Info` |
@@ -531,6 +567,7 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-popover-pr.png` | a fully populated pull request popover |
 | `<prefix>-popover-issue.png` | the same for an issue |
 | `<prefix>-popover-question.png` | a question: the whole text and `click to copy` |
+| `<prefix>-popover-link.png` | a link: the word `Link` and the whole URL |
 
 The popovers come with two generated avatar PNGs beside them, so the previews
 show real decoded circles rather than the fallback disc. Every image on this page

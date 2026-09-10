@@ -9,7 +9,7 @@ corner.
   <img src="docs/hero-strip.png" width="880" alt="the orb going from silence to speaking and back, and the pointer's rings expanding out of a window">
 </p>
 <p align="center">
-  <img src="docs/panel-expanded.png" width="480" alt="the attention panel: a summary header, the All/Issues/PRs/Pending tabs, two question rows and four PR and issue rows">
+  <img src="docs/panel-expanded.png" width="480" alt="the attention panel: a summary header, the All/Issues/PRs/Links/Pending tabs, two question rows and four PR and issue rows">
 </p>
 
 One `speak.exe` (plus `onnxruntime.dll`) loads the

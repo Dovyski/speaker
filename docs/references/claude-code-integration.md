@@ -9,9 +9,10 @@ the two.
 
 A small card parked inside the bottom-right corner of one terminal window,
 listing what the Claude Code session running in that window is working on: open
-pull requests, issues, work directories, and questions the agent is waiting on an
-answer for. Rows are clickable — PRs and issues open in the browser, paths in
-Explorer, a question copies itself to the clipboard. See
+pull requests, issues, work directories, plain links it named, and questions the
+agent is waiting on an answer for. Rows are clickable — PRs, issues and links
+open in the browser, paths in Explorer, a question copies itself to the
+clipboard. See
 [attention-panel.md](attention-panel.md) for the card itself, its tabs, the
 collapsed pill and the `POST /panel` contract. This
 document covers only the producer chain that feeds it.
@@ -32,7 +33,8 @@ Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>
         ▼
    hooks/i47-attention.ps1  — the producer (regex, no model)
         ├─ reads the transcript .jsonl from `_cursor` to EOF (the delta only)
-        ├─ regex → items: GitHub URLs, owner/repo#N, repo#N, bare #N, work paths
+        ├─ regex → items: GitHub URLs, owner/repo#N, repo#N, bare #N, work paths,
+        │            plain http(s) links (8 most recent)
         ├─ resolves its own hosting terminal title (see below)
         ├─ writes ~/.claude/attention/<session_id>.json
         ├─ POSTs the `worked` items + questions to http://127.0.0.1:8124/panel
@@ -42,6 +44,7 @@ Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>
    hooks/i47-haiku.ps1  — detached, hidden pwsh, ~10-40 s
         ├─ `claude -p --model haiku` over the transcript delta since `_haiku_cursor`
         ├─ returns summary, per-item relevance (worked|mentioned), questions_open/resolved
+        ├─ `link` rows are exempt: they keep the producer's own relevance
         ├─ rewrites the session json (adds `summary`, `question` rows)
         └─ re-POSTs
 
@@ -215,7 +218,10 @@ there is exactly one state directory per user even with several
     { "kind": "question", "url": "", "title": "Merge the pending pair now or wait for D50?",
       "status": "open", "last_seen": "2026-09-09T12:04:24Z" },
     { "kind": "path", "url": "C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast",
-      "title": "1372-toast", "status": "unknown", "last_seen": "2026-09-09T12:04:24Z" }
+      "title": "1372-toast", "status": "unknown", "last_seen": "2026-09-09T12:04:24Z" },
+    { "kind": "link", "url": "https://optibotinho-594.test/dev-login",
+      "title": "optibotinho-594.test/dev-login", "status": "unknown",
+      "relevance": "worked", "last_seen": "2026-09-09T12:04:24Z" }
   ],
   "updated_at": "2026-09-09T12:04:24Z",
   "_cursor": 481233,
@@ -228,15 +234,24 @@ there is exactly one state directory per user even with several
   each writer preserves the other's, and a cursor past EOF resets to 0 so a
   rotated transcript is re-read rather than skipped.
 - `relevance` is the producer's confidence: `worked` for the strong rules (a real
-  URL, an explicit `owner/repo#N`, a work path), `mentioned` for the weak bare
-  `#N` rule. **Only `worked` items and `question` rows are POSTed**; `mentioned`
-  ones stay in the file for audit. An item with no `relevance` counts as
-  `worked`. A strong sighting promotes a weak row; nothing ever demotes one
-  except the Haiku verdict.
-- Items are pruned at 48 h since `last_seen` and capped at 30, most recent first.
+  URL, an explicit `owner/repo#N`, a work path, a link the assistant wrote or
+  ran), `mentioned` for the weak bare `#N` rule and for a link only somebody
+  else's text or some command's output mentioned. **Only `worked` items and
+  `question` rows are POSTed**; `mentioned` ones stay in the file for audit. An
+  item with no `relevance` counts as `worked`. A strong sighting promotes a weak
+  row; nothing ever demotes one except the Haiku verdict.
+- A `link` row carries no `repo` or `number`, so it is keyed by its lowercased
+  `url` everywhere (`link|<url>`) and is **exempt from the Haiku verdict**: it
+  has no `repo#N` key the model could answer for, and the producer already knows
+  whether the assistant wrote or ran the URL. Its relevance therefore only ever
+  changes when the producer sees the same URL again in a stronger position.
+- Items are pruned at 48 h since `last_seen` and capped at 30, most recent
+  first; `link` rows are capped at 8 before that, so a chatty turn full of URLs
+  cannot push the pull requests off the card.
 - `summary` and `question` rows only ever come from the Haiku worker.
 - `details` is the P6 hover popover's whole content, written only by the
-  enricher (`pr` and `issue` rows; never `path` or `question`). The producer and
+  enricher (`pr` and `issue` rows; never `path`, `link` or `question` — the
+  enricher makes no `gh` call for those and passes them through untouched). The producer and
   the Haiku worker copy every property of an item they did not author, so it
   survives their rewrites, and it is part of the `POST /panel` body. A daemon
   that does not know about it simply ignores it.
