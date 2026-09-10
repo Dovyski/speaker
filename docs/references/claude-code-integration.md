@@ -353,7 +353,7 @@ left to do by hand.
 | `-ExtraClaudeDirs` | `@("$env:USERPROFILE\.claude-max")` | further config dirs whose `settings.json` gets the same entries; a dir that does not exist is skipped, never created |
 | `-DaemonPort` | `8123` | the speech port; the panel listener is this **+ 1**, and a non-default value is patched into the copied scripts' endpoint |
 | `-RemoveLegacyTask` | — | say explicitly that the old `cto-i47-enrich` task should go; it goes anyway when it exists, so this is mostly for a `-WhatIf` run |
-| `-SkipTask` | — | accepted and ignored: there is no task to register any more |
+| `-SkipTask` | — | accepted and ignored: no task is registered |
 
 It also honours `-WhatIf`. Note that `-ExtraClaudeDirs @()` needs
 `pwsh -NoProfile -Command "& '…\install-claude-code.ps1' -ExtraClaudeDirs @()"`;
@@ -393,17 +393,13 @@ is recognised too, and an entry appended to a `SessionStart` group that already
 holds someone else's hook leaves that hook alone. **`settings.json` is read at
 session start**, so an already-open session will not pick the hooks up.
 
-### The enricher is the daemon's job, not the scheduler's
+### The enricher is the daemon's job
 
-It used to be a scheduled task, `cto-i47-enrich`, firing every minute. That is
-precisely what a scheduled task is bad at: it runs `pwsh` **in the interactive
-session**, and `-WindowStyle Hidden` hides a console window only *after* it has
-appeared. Once a minute, all day, a window flashed on screen.
-
-So the daemon runs it. `speak.exe --serve` starts
+The daemon runs the status poller itself, so nothing ever flashes a console on
+screen. `speak.exe --serve` starts
 `pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <script> -Once`
-with `CREATE_NO_WINDOW` — which never allocates a console at all, rather than
-allocating one and hiding it — and stdio pointed at `NUL`. It runs only while at
+with `CREATE_NO_WINDOW` — so no console is ever allocated — and stdio pointed
+at `NUL`. It runs only while at
 least one panel is registered (there is no status worth fetching for a panel
 nobody is looking at), a tick with a run still alive is a skipped tick, and a run
 that outlives 120 s is killed: a stale status beats a stuck poller. Each start
@@ -515,7 +511,7 @@ or a `POST` with empty `items`. Registrations expire 48 h after their last
 ## What is machine-specific
 
 Everything here is a constant in a script, not a parameter. Change them before
-using the chain outside Fernando's machine.
+using the chain on another machine.
 
 | Where | What |
 |---|---|

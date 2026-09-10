@@ -22,5 +22,10 @@ samples/
 !voice-sources/**/*.mp3
 !voice-sources/**/*.flac
 
+# the voice samples linked from the README are tracked
+!docs/samples/
+!docs/samples/*.wav
+!docs/samples/*.mp3
+
 # release artifacts (scripts/package-release.ps1)
 dist/

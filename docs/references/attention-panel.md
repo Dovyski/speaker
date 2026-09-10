@@ -337,9 +337,8 @@ That pass runs every ~500 ms (and immediately after a `POST`, so a card appears
 at once rather than up to half a second later), enumerating the desktop once and
 matching every registration against it. With nothing registered it does not run
 at all, so an idle daemon does not enumerate windows for a living — and the pid
-of every window it finds is turned into an image name through a cache, rather
-than by taking a `TH32CS_SNAPPROCESS` snapshot of the whole machine twice a
-second, which is what it used to do.
+of every window it finds is turned into an image name through a cache, so no
+`TH32CS_SNAPPROCESS` snapshot of the whole machine is taken to draw a card.
 
 Matching is: trim, lowercase, drop a leading non-ASCII glyph *and the space
 behind it* — from **both** sides, because the registered title was captured at
@@ -470,9 +469,9 @@ Running the script by hand still works and is still the way to debug it —
 
 ## Seeing it without a daemon
 
-```bat
-speak.exe --panel-preview p                        rem ten PNGs, then exit
-speak.exe --panel-demo --title "reviewer worker"   rem a real panel for 20 s
+```powershell
+speak.exe --panel-preview p                        # ten PNGs, then exit
+speak.exe --panel-demo --title "reviewer worker"   # a real panel for 20 s
 ```
 
 `--panel-preview <prefix>` writes the panel straight to PNG at the screen's own

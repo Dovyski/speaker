@@ -30,7 +30,7 @@ Paths default relative to the executable, not the working directory, so
 accents and non-ASCII work (`"Olá, tudo bem?"`).
 
 Audio starts playing while the rest of the sentence is still being generated, and
-`--save out.wav` keeps a 32-bit float WAV alongside (or instead of) playback.
+`--save out.wav` keeps a 32-bit float WAV of it as well.
 
 ## Voices
 
@@ -69,9 +69,9 @@ Loading the model costs ~5 s, and a one-shot process pays it *every* call. So
 `speak.exe` can also be the resident process that holds the model, using
 upstream PocketTTS.cpp's HTTP server:
 
-```bat
-speak.exe --serve            rem loads, warms up, primes the voice, then serves
-speak.exe --status           rem "daemon ready" / "daemon starting up" / "no daemon"
+```powershell
+speak.exe --serve            # loads, warms up, primes the voice, then serves
+speak.exe --status           # "daemon ready" / "daemon starting up" / "no daemon"
 speak.exe --stop
 ```
 
@@ -188,9 +188,9 @@ Two independent things clip the tail of an utterance, and both are handled here:
   default here is `--eos-extra 4`, which brings that to `-64.3 dB`, a real decay
   into silence, for ~160 ms more audio. Raise it further if you still hear
   clipping; the daemon takes it at `--serve` time, not per call.
-- **Playback stops too early.** The device used to stop the instant the last
-  sample was consumed, which cuts whatever the audio engine had not pushed out
-  yet. Playback now appends 250 ms of silence and drains that before stopping.
+- **Playback stops too early.** Playback appends 250 ms of silence and drains
+  that before stopping, so the device is never closed on a sample the audio
+  engine has not pushed out yet.
 
 Two more details worth knowing:
 

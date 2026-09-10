@@ -12,25 +12,33 @@ corner.
   <img src="docs/panel-expanded.png" width="480" alt="the attention panel: a summary header, the All/Issues/PRs/Pending tabs, two question rows and four PR and issue rows">
 </p>
 
-No Python. No server to start. No `ffplay` to pipe into. One `speak.exe` (plus
-`onnxruntime.dll`) that loads the [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
-model, renders audio straight to your speakers through WASAPI, and pulses a
-click-through overlay in the corner of the screen in time with the voice.
+One `speak.exe` (plus `onnxruntime.dll`) loads the
+[Pocket TTS](https://github.com/kyutai-labs/pocket-tts) model, renders audio
+straight to your speakers through WASAPI, and pulses a click-through overlay in
+the corner of the screen in time with the voice.
 
+```powershell
+speak.exe --serve             # once: resident daemon holding the model
+speak.exe "Hello world."      # ~100 ms to first audio
 ```
-speak.exe --serve             &:: once: resident daemon holding the model
-speak.exe "Hello world."      &:: ~100 ms to first audio
-```
+
+> [!NOTE]
+> **Voices** — several ship with the binary, Jarvis among them, and any short
+> WAV, MP3 or FLAC clip becomes another one. Hear Jarvis:
+> [jarvis-sample.wav](docs/samples/jarvis-sample.wav) (13 s, 1.2 MB) or
+> [jarvis-sample.mp3](docs/samples/jarvis-sample.mp3) (154 KB) — GitHub plays
+> neither in the page, so both links download. To clone your own voice, use
+> `make-voice.ps1`, described in [speech.md](docs/references/speech.md).
 
 ## What it does
 
 **Speech** — [speech.md](docs/references/speech.md)
 
 - **One binary**: inference, playback, daemon and UI in a single `speak.exe`
-- **~100 ms to first audio** with the resident daemon, against ~5.7 s loading per call
+- **~100 ms to first audio** with the resident daemon
 - **Voice cloning**: any short WAV/MP3/FLAC sample becomes the voice; `make-voice.ps1` joins several takes into one
 - **Streaming**: audio starts playing while the rest of the sentence is still being generated
-- Optional WAV output, UTF-8 arguments, and no Python at build or run time
+- Optional WAV output and UTF-8 arguments
 
 **On screen** — [overlay.md](docs/references/overlay.md)
 
@@ -53,6 +61,16 @@ speak.exe "Hello world."      &:: ~100 ms to first audio
 - **Glows with the voice** when speech is aimed at its window, carrying the caption in its header
 - **Hover popover** with the full title, labels, assignees, reviewers and their verdicts, and the check counts
 - Filled by the included Claude Code hooks, with an optional Haiku relevance pass and a headless GitHub status enricher the daemon runs
+
+> [!NOTE]
+> **Why was this created?**
+>
+> I run several coding agents at the same time, and I need to know what each one
+> is doing and where my attention is needed most. I want to keep every terminal
+> window open and visible — I like seeing all of them and what each one is up
+> to — so this is not a GUI or a tabbed tool standing in front of them. The
+> window that has something to say speaks, rings itself so I can find it, and
+> keeps its own pull requests, issues and open questions listed in its corner.
 
 ## Quick start
 
