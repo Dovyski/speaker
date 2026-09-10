@@ -3769,6 +3769,8 @@ struct Panel {
     int       scroll   = 0;          // px the full list is wheeled down by
     int       copied_item = -1;      // the question row acknowledging a copy
     DWORD     copied_at   = 0;
+    POINT     last_cursor{};         // for GET /panels?debug=1, and only for it
+    PanHit    last_hit{};
     int       max_h    = 0;          // ceiling from the target's client height
     bool      dirty     = true;      // content changed: the card needs rebuilding
     PanHit    hover{};
@@ -4857,6 +4859,7 @@ std::atomic<bool>     g_pan_trace{false};   // --panel-demo: report what it is d
 // only thing that ever touches them.
 std::mutex  g_pan_snapshot_mtx;
 std::string g_pan_snapshot = "[]";
+std::string g_pan_snapshot_debug = "[]";
 
 // Read by the enricher runner, which has nothing to do when no session has a
 // panel: there is no status worth fetching for a panel nobody is showing.
@@ -5056,6 +5059,59 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
 
     g_pan_registered.store(panels->size());
 
+    // GET /panels?debug=1. Built in the same pass rather than on demand, so the
+    // endpoint stays a lookup and the numbers are all from one moment. This is
+    // what a hover bug looks like from outside: the card's rectangle, the monitor
+    // it is on, the DPI it was drawn at, and the last cursor position and hit the
+    // panel thread actually saw.
+    std::string debug = "[";
+    for (size_t i = 0; i < panels->size(); ++i) {
+        const Panel* p = (*panels)[i].get();
+        RECT mon{};
+        UINT dpi = 0;
+        if (p->target) {
+            if (HMONITOR h = MonitorFromWindow(p->target, MONITOR_DEFAULTTONEAREST)) {
+                MONITORINFO mi{};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(h, &mi)) mon = mi.rcWork;
+            }
+            dpi = static_cast<UINT>(std::lround(PanelScaleFor(p->target) * 96.f));
+        }
+        const char* kind = p->last_hit.kind == PanHit::Kind::Row    ? "row"
+                         : p->last_hit.kind == PanHit::Kind::Tab    ? "tab"
+                         : p->last_hit.kind == PanHit::Kind::Header ? "header"
+                                                                    : "none";
+        int item = -1;
+        if (p->last_hit.kind == PanHit::Kind::Row &&
+            p->last_hit.index < static_cast<int>(p->card.rows.size())) {
+            item = p->card.rows[p->last_hit.index].item;
+        }
+        if (i) debug += ",";
+        debug += "{\"session\":\"" + JsonEscape(p->session) + "\"" +
+                 ",\"shown\":" + (p->shown ? "true" : "false") +
+                 ",\"scale\":" + std::to_string(p->scale) +
+                 ",\"dpi\":" + std::to_string(dpi) +
+                 ",\"card\":{\"x\":" + std::to_string(p->pos.x + p->card.margin) +
+                 ",\"y\":" + std::to_string(p->pos.y + p->card.margin) +
+                 ",\"w\":" + std::to_string(p->card.panel_w) +
+                 ",\"h\":" + std::to_string(p->card.panel_h) + "}" +
+                 ",\"monitor\":{\"x\":" + std::to_string(mon.left) +
+                 ",\"y\":" + std::to_string(mon.top) +
+                 ",\"w\":" + std::to_string(mon.right - mon.left) +
+                 ",\"h\":" + std::to_string(mon.bottom - mon.top) + "}" +
+                 ",\"cursor\":{\"x\":" + std::to_string(p->last_cursor.x) +
+                 ",\"y\":" + std::to_string(p->last_cursor.y) + "}" +
+                 ",\"hit\":{\"kind\":\"" + kind + "\"" +
+                 ",\"index\":" + std::to_string(p->last_hit.index) +
+                 ",\"item\":" + std::to_string(item) + "}" +
+                 ",\"rows\":" + std::to_string(p->card.rows.size()) + "}";
+    }
+    debug += "]";
+    {
+        std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
+        g_pan_snapshot_debug = std::move(debug);
+    }
+
     std::string json = "[";
     for (size_t i = 0; i < panels->size(); ++i) {
         Panel* p = (*panels)[i].get();
@@ -5117,7 +5173,10 @@ void PanelThread(float seconds) {
 
     std::vector<std::unique_ptr<Panel>> panels;
     Popover     pop;
-    std::string dwell_key;     // what the pointer has been resting on
+    // One pointer, so at most one hovered row per tick — and therefore one dwell
+    // timer, decided *after* every panel has been looked at rather than by each
+    // of them in turn. See the note at the bottom of the loop.
+    std::string dwell_key;
     DWORD       dwell_since = 0;
     g_pop_close = [&pop, &dwell_key] {
         PopoverHide(&pop);
@@ -5160,6 +5219,14 @@ void PanelThread(float seconds) {
         const bool reassert = g_pan_reassert.exchange(false);
         POINT cursor{};
         GetCursorPos(&cursor);
+
+        // The hovered row, for this tick, across every card. Filled in by
+        // whichever panel the pointer is actually over.
+        Panel*           hover_panel = nullptr;
+        const PanelItem* hover_item  = nullptr;
+        RECT             hover_rect{};
+        std::string      hover_key;
+        bool             hover_copied = false;
 
         std::unordered_map<HWND, SpeakingAt> speaking;
         {
@@ -5289,33 +5356,36 @@ void PanelThread(float seconds) {
                 redrawn = true;
             }
 
+            p->last_cursor = cursor;
+            p->last_hit     = hover;
+
             // The popover's key is everything that would make it wrong: which
             // row, in which session, at which scroll offset, on which tab. Any
             // of them changing restarts the dwell and takes the popover away —
             // which is also how "closes on scroll" and "closes on tab change"
             // are implemented, without either being a special case.
-            std::string key;
-            const PanelItem* over = nullptr;
+            //
+            // Recorded here and acted on after the loop. Deciding it *inside*
+            // the loop is what made the popover work on exactly one card: every
+            // panel the pointer was not over computed an empty key, saw it differ
+            // from the hovered panel's, and reset the shared timer — so only the
+            // card that happened to be looked at last could ever accumulate a
+            // dwell, and that was always the first session to register.
             if (hover.kind == PanHit::Kind::Row && !p->collapsed &&
                 hover.index < static_cast<int>(p->card.rows.size())) {
                 const int idx = p->card.rows[hover.index].item;
                 if (idx >= 0 && idx < static_cast<int>(p->items.size()) &&
                     (p->items[idx].kind == "pr" || p->items[idx].kind == "issue" ||
                      PanelIsQuestion(p->items[idx]))) {
-                    over = &p->items[idx];
-                    key  = p->session + "|" + p->tab + "|" + std::to_string(p->scroll) +
-                           "|" + over->kind + "|" + over->repo + "|" +
-                           std::to_string(over->number);
+                    hover_panel  = p;
+                    hover_item   = &p->items[idx];
+                    hover_rect   = p->card.rows[hover.index].hit;
+                    hover_copied = idx == p->copied_item;
+                    hover_key    = p->session + "|" + p->tab + "|" +
+                                   std::to_string(p->scroll) + "|" + hover_item->kind +
+                                   "|" + hover_item->repo + "|" +
+                                   std::to_string(hover_item->number);
                 }
-            }
-            if (key != dwell_key) {
-                dwell_key   = key;
-                dwell_since = GetTickCount();
-                if (pop.key != key) PopoverHide(&pop);
-            } else if (over && GetTickCount() - dwell_since >= kPopDwellMs) {
-                const int idx = p->card.rows[hover.index].item;
-                PopoverShow(&pop, *p, p->card.rows[hover.index].hit, *over, key,
-                            idx == p->copied_item);
             }
             // The glow moves every frame, which is a recompose and never a
             // rebuild: no text is re-measured to make a card breathe. The
@@ -5343,6 +5413,17 @@ void PanelThread(float seconds) {
                 SetWindowPos(p->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
+        }
+
+        // One pointer, one dwell. `hover_panel` is null when the pointer is on
+        // no row at all, which is what takes the popover away.
+        if (hover_key != dwell_key) {
+            dwell_key   = hover_key;
+            dwell_since = GetTickCount();
+            if (pop.key != hover_key) PopoverHide(&pop);
+        } else if (hover_panel && GetTickCount() - dwell_since >= kPopDwellMs) {
+            PopoverShow(&pop, *hover_panel, hover_rect, *hover_item, hover_key,
+                        hover_copied);
         }
 
         // The hover pass above already knows whether the pointer is on a card
@@ -5772,9 +5853,11 @@ void HandlePanelPost(SOCKET fd, const std::string& body,
     respond(fd, 200, out);
 }
 
-void HandlePanelList(SOCKET fd, void (*respond)(SOCKET, int, const std::string&)) {
+void HandlePanelList(SOCKET fd, const std::string& path,
+                     void (*respond)(SOCKET, int, const std::string&)) {
+    const bool debug = PanelQueryParam(path, "debug") == "1";
     std::lock_guard<std::mutex> lock(g_pan_snapshot_mtx);
-    respond(fd, 200, g_pan_snapshot);
+    respond(fd, 200, debug ? g_pan_snapshot_debug : g_pan_snapshot);
 }
 
 void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& body,
@@ -6108,7 +6191,7 @@ void HandlePointRequest(SOCKET fd) {
     // The attention panel. Unlike /point this returns as soon as the panel is
     // queued: it is a thing that stays on screen, not a gesture to wait out.
     if (req.method == "GET" && PanelPathOnly(req.path) == "/panels") {
-        HandlePanelList(fd, PointHttpRespond);
+        HandlePanelList(fd, req.path, PointHttpRespond);
         return;
     }
     if (PanelPathOnly(req.path) == "/panel") {
