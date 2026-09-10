@@ -134,7 +134,8 @@ dev-login route, a staging page with the query string that reproduces the bug, a
 dashboard. So the producer keeps the **8 most recent** per session and never
 makes a link out of something another tab already owns — a
 `github.com/<owner>/<repo>/(issues|pull)/<n>` URL is an issue or a pull request
-row, not a link — nor out of a commit page, an avatar or an image.
+row, not a link — nor out of a commit page, an avatar, an image, or anything on
+loopback (`127.0.0.1`, `localhost`): health checks and local ports are plumbing.
 
 Hovering a link shows the **whole** URL, broken over as many as four lines at its
 own separators. That is the one thing the row cannot show, and the only reason

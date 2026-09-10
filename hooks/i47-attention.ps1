@@ -182,6 +182,8 @@ function Test-LinkSkip([string]$u) {
     if ($u -match '(?i)^https?://(?:www\.)?github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+') { return $true }
     if ($u -match '(?i)^https?://(?:www\.)?github\.com/[^/\s]+/[^/\s]+/commit/') { return $true }
     if ($u -match '(?i)^https?://avatars[0-9]*\.githubusercontent\.com/') { return $true }
+    # loopback/daemon plumbing (health checks, local ports) is never something to look at
+    if ($u -match '(?i)^https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?(?:/|$)') { return $true }
     if ($u -match '(?i)/avatars?/') { return $true }
     $bare = $u -replace '[?#].*$', ''
     if ($bare -match '(?i)\.(png|jpe?g|gif|svg|webp|bmp|ico|avif|tiff?)$') { return $true }
