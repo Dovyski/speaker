@@ -22,8 +22,8 @@ later builds are seconds.
 
 If your Build Tools live somewhere else, edit `VSBT` at the top of `build.bat`.
 
-No Python is needed at build time or run time: the ONNX weights are pre-exported
-and fetched by a script.
+The ONNX weights are pre-exported and fetched by a script, so the toolchain
+above is everything the build and the binary need.
 
 ## Get the models
 

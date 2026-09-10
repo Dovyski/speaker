@@ -20,14 +20,14 @@ of the window's centre and fade, three times over across ~3.5 s, and then nothin
 
 ## Usage
 
-```bat
-speak.exe --point --title "reviewer worker"   rem point at that window
-speak.exe --title "reviewer worker" "Tests are green."   rem speak, then point
-speak.exe --list-targets                     rem what --title can match, as JSON
-speak.exe --point --at 1200,800 --pulses 2    rem a bare screen position
-speak.exe --point --title dev --duration 8    rem slower, for a big screen
-speak.exe --point --title dev --color red     rem a different kind of attention
-speak.exe --point-preview p                   rem render the frames, no screen needed
+```powershell
+speak.exe --point --title "reviewer worker"   # point at that window
+speak.exe --title "reviewer worker" "Tests are green."   # speak, then point
+speak.exe --list-targets                     # what --title can match, as JSON
+speak.exe --point --at 1200,800 --pulses 2    # a bare screen position
+speak.exe --point --title dev --duration 8    # slower, for a big screen
+speak.exe --point --title dev --color red     # a different kind of attention
+speak.exe --point-preview p                   # render the frames, no screen needed
 ```
 
 `--point` is the mode; `--pulses`, `--duration`, `--color` and `--size` shape the
