@@ -58,7 +58,7 @@ speak.exe "Hello world."      # ~100 ms to first audio
 - **Clickable rows**: pull requests and issues open in the browser, work directories in Explorer
 - **Tabs** — `All`, `Issues`, `PRs`, `Pending` — six rows by default, `+N more` to expand everything, and a **one-line pill** when collapsed
 - **Pending questions**: what an agent is waiting on you for, sorted to the top; click to copy
-- **Glows with the voice** when speech is aimed at its window, carrying the caption in its header
+- **The orb turns up on the card** when speech is aimed at its window — a mini one, churning with the same voice — and the header carries the caption while it lasts
 - **Hover popover** with the full title, labels, assignees, reviewers and their verdicts, and the check counts
 - Filled by the included Claude Code hooks, with an optional Haiku relevance pass and a headless GitHub status enricher the daemon runs
 

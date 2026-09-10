@@ -299,29 +299,51 @@ finding the header.
 ## Speaking
 
 <p align="center">
-  <img src="../panel-speaking.png" width="520" alt="the card lit by a white halo, its header carrying the caption title and caption instead of the summary">
+  <img src="../panel-speaking.png" width="520" alt="the card with a small orb at the head of its header line, which carries the caption title and caption instead of the summary">
 </p>
 
 When an utterance is aimed at a window — `speak.exe --title "…" "text"`, or
-`--hwnd`, or `--session` — the card parked in that window's corner **glows with
-the voice**: an soft white halo off its own outline, its hairline lit, intensity
-riding the same amplitude envelope the orb is drawn from, so the ring in the
-corner of the screen and the card in the corner of the terminal move together
-rather than merely coinciding. White, deliberately, and not the ring's ember: on
-the card that read as a warning rather than as a voice, and the panel already
-spends red, amber and green on what its rows *mean*. (`#f0f3f6` rather than pure
-white, which blooms harder than it looks against a pale terminal.) It lights with
-the first sample and lets go over a second and a half
-— linearly, so the halo actually reaches zero rather than merely approaching it,
-with one last frame drawn when it does. The collapsed pill glows the same way, and a card that is hidden (its
-terminal tab in the background) does not glow at all — there is nothing there to
-light.
+`--hwnd`, or `--session` — **the orb turns up on the card** parked in that
+window's corner: a mini one, a glyph wide, at the head of the header line, with
+the title moved over by a glyph and cut to what is left.
+
+<p align="center">
+  <img src="../panel-speaking-pill.png" width="240" alt="a collapsed pill with the mini orb where its icon usually is">
+</p>
+
+A collapsed pill gets it in the slot its **icon** was already in — the icon
+fades out under it and back in afterwards — so a pill that starts talking does
+not change shape. On an open card the slot is reserved for the length of the
+fade and collapses in one rebuild at the end, so the title does not shuffle
+sideways while the orb is still on it.
+
+It is the *same object* as the ring in the corner of the screen, not a small
+thing that also pulses: the same `ComposeAurora`, so the same outline churned by
+the same amplitude (silence is a true circle, loud passages get sharp kinks), the
+same ember→white-hot→azure ramp travelling round it, the same slow spin, the same
+idle breath keeping it alive between words — driven off the same beacon, sample
+for sample, so the two move together rather than merely coinciding. Two things
+are adapted for the size: it is composed several times larger (at least 64 px
+across, so 4–5× depending on the display's scale) and box-filtered down, because the
+wobble is what the object *is* and at 14 px a hard-edged ring loses it to
+aliasing; and the rim and its bloom are given in output pixels rather than scaled
+with the radius, which is what it takes for a dozen pixels to still read as a
+luminous ring instead of a dot. (A white *halo* around the card's outline came
+first and is gone. It said "this one is talking" and nothing more; the orb says
+it with the object Fernando is already watching.)
+
+It arrives with the first sample and lets go over a second and a half —
+linearly, so the fade actually reaches zero rather than merely approaching it,
+with one last frame drawn when it does. A card that is hidden (its terminal tab
+in the background) gets no orb at all: there is nothing there to draw on.
 
 While it lasts, the header line carries what is being *said* instead of what the
 session is working on: `--caption-title` in bold, `--caption` beside it, back to
-the summary when the voice stops. What the voice is saying about this terminal is
-the more urgent of the two, and it is the same line either way rather than a row
-that appears and shoves the list down.
+the summary when the orb has finished fading. What the voice is saying about this
+terminal is the more urgent of the two, and it is the same line either way rather
+than a row that appears and shoves the list down. Both revert on the same
+rebuild, deliberately: the line snapping back while the orb was still on it read
+as two things ending at two different times.
 
 The card is matched by **resolved `hwnd`**, never by comparing titles: whichever
 registration owns the card currently shown in that window is the context for that
@@ -337,7 +359,7 @@ fixed-size UDP datagram every other frame (~30 Hz) to loopback on the port after
 the pointing one (`8125` by default), each carrying the whole state — target
 window, level, caption title and caption. No setup, no teardown, no session; the client sends a last few with
 `active` clear when the voice is done, and a *gap* in the datagrams ends it too —
-so a client killed mid-sentence cannot leave a card glowing forever. A stream of tiny HTTP requests at that rate would have
+so a client killed mid-sentence cannot leave an orb on a card forever. A stream of tiny HTTP requests at that rate would have
 queued `/panel` behind it.
 
 `GET /panels` reports it as `speaking`.
@@ -397,13 +419,15 @@ Almost none of a card changes between frames — the shadow, the fill, the
 hairline, the header rule, the icons and every glyph of text are fixed until the
 content is. So they are composed once, when the card is built, into two
 premultiplied layers (everything under the interactive parts and everything over
-them) plus the halo's shape; and a frame is a copy, a hovered band, a glow whose
-*brightness* is all that follows the voice, and the top layer. That is 0.3 ms a
-frame instead of 5.5, which matters because a glowing card redraws twenty-five
-times a second on the same thread that answers every panel `POST`. Nothing is
-pushed to the screen at all unless the geometry, the hover, the content or the
-glow actually changed: an idle daemon with a card on screen measures 0.0% of a
-core.
+them); and a frame is a copy, a hovered band, the top layer, and the mini orb —
+a couple of thousand pixels of ring composed into a 14 px box, the only thing on
+the card that is redrawn from scratch. That is 0.3 ms a frame instead of 5.5 (0.6
+ms with the orb on it, measured by `--panel-preview`), which matters because a
+speaking card redraws twenty-five times a second on the same thread that answers
+every panel `POST`. Nothing is pushed to the screen at all unless the geometry,
+the hover, the content or the orb actually changed: an idle daemon with a card on
+screen measures 0.0% of a core, and only the one card the beacon names redraws
+while a voice is going.
 
 One thread owns every panel window — they are created, drawn, bound and clicked
 there, so no panel state needs a lock, and the endpoint only leaves a command
@@ -527,7 +551,8 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-pending.png` | the `Pending` tab, two questions |
 | `<prefix>-summary-only.png` | a summary and nothing else |
 | `<prefix>-summary-only-pill.png` | what that card collapses to: the `info` glyph and `Info` |
-| `<prefix>-speaking.png` | mid-utterance: lit, the header carrying the caption |
+| `<prefix>-speaking.png` | mid-utterance: the orb on the header line, which carries the caption |
+| `<prefix>-speaking-pill.png` | the same on a pill: the orb in the icon's slot |
 | `<prefix>-popover-pr.png` | a fully populated pull request popover |
 | `<prefix>-popover-issue.png` | the same for an issue |
 | `<prefix>-popover-question.png` | a question: the whole text and `click to copy` |

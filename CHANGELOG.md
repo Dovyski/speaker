@@ -9,6 +9,21 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ## [Unreleased]
 
+### Changed
+
+- **The speaking card carries a mini orb instead of a white halo.** While an
+  utterance is aimed at a window, the card in that window's corner now shows the
+  orb itself, a glyph wide, animated from the same per-frame amplitude beacon:
+  the same outline churned by the voice, the same ember→white→azure ramp
+  travelling round it, the same idle breath between words — the real orb math,
+  scaled, rather than a second animation that also pulses. On the collapsed pill
+  it takes over the leading icon's slot, so a pill that starts talking does not
+  change shape; on an open card it opens the header line and the title moves over
+  by a glyph, cut to what is left. The white halo around the outline is gone, and
+  with it the baked halo layer. The captions and the orb now leave together at
+  the end of the fade, rather than the header snapping back while the card was
+  still lit. `--panel-preview` gained `<prefix>-speaking-pill.png`.
+
 ## [1.0.0] — 2026-09-09
 
 First release with a prebuilt binary. Everything below already existed in the

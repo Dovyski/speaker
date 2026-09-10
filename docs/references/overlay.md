@@ -41,6 +41,13 @@ per pixel:    dr   = distance − R(θ)
               bleed= gauss(−dr / 0.5R)      ← light leaking inward (dr < 0 only)
 ```
 
+The same composer draws the **mini orb** on a speaking attention card
+([attention-panel.md](attention-panel.md)): same formula, same drives, same
+beacon, composed at 4–5× into a ~14 px box and box-filtered down, with the two
+`gauss` widths above given in output pixels instead of scaled with `R₀` — they
+are the ring's only absolute dimensions, and at that size proportional ones are
+a fraction of a pixel each.
+
 Two independent drives, which is what makes it read as *listening* rather than
 merely animated:
 
