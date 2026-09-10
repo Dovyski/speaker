@@ -3252,7 +3252,7 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
                     const std::vector<PanelItem>& items, bool collapsed,
                     const std::string& tab, bool expanded_all, float scale, int max_h,
                     int* scroll, const std::string& cap_title = std::string(),
-                    const std::string& cap = std::string()) {
+                    const std::string& cap = std::string(), int copied_item = -1) {
     *out = PanelCard{};
     g_pan_scale = scale;
 
@@ -3407,6 +3407,7 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
         struct RowBuild {
             TextMask label, title;
             int      h = 0, item = 0;
+            bool     copied = false;   // showing "Copied to clipboard" for a moment
         };
         std::vector<RowBuild> built;
         const int text_w = inner - icon - igap;
@@ -3418,7 +3419,9 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             r.item  = view[k];
             // A handle is bold; a *sentence* is not. A question's label is the
             // question, so it keeps the primary ink and drops the weight.
-            r.label = PanLine(item.Label(), !PanelIsQuestion(item), text_w);
+            r.copied = r.item == copied_item && PanelIsQuestion(item);
+            r.label  = PanLine(r.copied ? "Copied to clipboard" : item.Label(),
+                               !PanelIsQuestion(item), text_w);
             // Whatever the label leaves. Below a usable remainder the title is
             // dropped entirely rather than shown as three characters and a dot.
             const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
@@ -3545,12 +3548,16 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
                 PanStampMask(&out->dim, out->w, out->h, r.label, margin + pad,
                              y + (r.h - r.label.h) / 2, view_top, view_bottom);
             } else {
-                const PanGlyph g = PanelGlyphFor(items[r.item]);
+                // A green check where the amber question mark was, and the
+                // acknowledgement in the secondary ink: the row steps back for a
+                // moment rather than shouting about having been clicked.
+                const PanGlyph g = r.copied ? PanGlyph{kOctCheck, kOctGreen}
+                                            : PanelGlyphFor(items[r.item]);
                 StampOcticon(&out->deco, out->w, out->h, margin + pad,
                              y + (r.h - icon) / 2, icon, g.path, g.colour,
                              view_top, view_bottom);
                 const int lx = margin + pad + icon + igap;
-                PanStampMask(&out->ink, out->w, out->h, r.label, lx,
+                PanStampMask(r.copied ? &out->dim : &out->ink, out->w, out->h, r.label, lx,
                              y + (r.h - r.label.h) / 2, view_top, view_bottom);
                 if (r.title.w) {
                     PanStampMask(&out->dim, out->w, out->h, r.title,
@@ -3749,6 +3756,8 @@ struct Panel {
     std::string tab = "all";         // which tab is selected, by id
     bool      expanded_all = false;  // the "+N more" row has been clicked
     int       scroll   = 0;          // px the full list is wheeled down by
+    int       copied_item = -1;      // the question row acknowledging a copy
+    DWORD     copied_at   = 0;
     int       max_h    = 0;          // ceiling from the target's client height
     bool      dirty     = true;      // content changed: the card needs rebuilding
     PanHit    hover{};
@@ -3907,6 +3916,13 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const int idx = p->card.rows[hit.index].item;
                 if (idx >= 0 && idx < static_cast<int>(p->items.size())) {
                     PanelOpen(p->items[idx]);
+                    if (PanelIsQuestion(p->items[idx])) {
+                        // Clicking again inside the window restarts it rather
+                        // than toggling it off half-shown.
+                        p->copied_item = idx;
+                        p->copied_at   = GetTickCount();
+                        p->dirty       = true;
+                    }
                 } else if (idx == kPanRowMore || idx == kPanRowLess) {
                     p->expanded_all = (idx == kPanRowMore);
                     p->scroll       = 0;
@@ -3968,7 +3984,7 @@ void PanelCompose(Panel* p) {
 void PanelRender(Panel* p) {
     BuildPanelCard(&p->card, p->summary, p->items, p->collapsed, p->tab,
                    p->expanded_all, p->scale, p->max_h, &p->scroll, p->cap_title,
-                   p->cap);
+                   p->cap, p->copied_item);
     if (p->card.w != p->dib_w || p->card.h != p->dib_h) {
         p->ReleaseDib();
         HDC screen = GetDC(nullptr);
@@ -4158,6 +4174,11 @@ constexpr int   kPopRowGap  = 8;     // between sections
 constexpr int   kPopLinePx  = 13;
 constexpr int   kPopSmallPx = 11;    // label pills
 constexpr int   kPopTitleLines = 3;
+constexpr int   kPopQuestionLines = 12;   // a question is the text, not a handle
+// A copy is invisible: the clipboard says nothing, and the row it came from
+// looks exactly as it did. Long enough to be read, short enough that the row
+// is a question again before you look for it.
+constexpr DWORD kPanCopiedMs = 1200;
 constexpr int   kPopMaxPeople  = 6;
 constexpr DWORD kPopDwellMs = 350;
 
@@ -4360,7 +4381,8 @@ TextMask PopLine(const std::string& text, bool bold, int max_w, int px = kPopLin
     return RenderText(Wide(text), PanScale(px), bold, max_w, lines, extra);
 }
 
-void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale) {
+void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
+                      bool copied = false) {
     *out = PanelCard{};
     g_pan_scale = scale;
 
@@ -4399,11 +4421,14 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale) {
         pieces.push_back(std::move(p));
     };
 
-    // 1. the handle line: glyph, repo#N, the status in words
+    // 1. the handle line: glyph, repo#N, the status in words. A question has
+    // neither — its handle *is* its text — so it says what it is instead.
+    const bool question = PanelIsQuestion(item);
     {
         const PanGlyph  g     = PanelGlyphFor(item);
-        const TextMask  label = PopLine(item.Label(), true, inner - icon - PanScale(8));
-        const std::string word = PanStatusWord(item.status);
+        const TextMask  label = PopLine(question ? "Pending question" : item.Label(), true,
+                                        inner - icon - PanScale(8));
+        const std::string word = question ? std::string() : PanStatusWord(item.status);
         const int       used  = icon + PanScale(8) + label.w + PanScale(10);
         const TextMask  state = word.empty() ? TextMask{}
                                              : PopLine(word, false, std::max(0, inner - used));
@@ -4425,14 +4450,26 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale) {
     {
         const std::string t = d.have && !d.title.empty() ? d.title : item.title;
         if (!t.empty()) {
-            const TextMask m = PopLine(t, false, inner, kPopLinePx, kPopTitleLines,
-                                       DT_WORDBREAK | DT_END_ELLIPSIS);
+            const TextMask m =
+                PopLine(t, false, inner, kPopLinePx,
+                        question ? kPopQuestionLines : kPopTitleLines,
+                        DT_WORDBREAK | DT_END_ELLIPSIS);
             text(m, 0, m.h, false);
             y += m.h + gap;
         }
     }
 
-    if (d.have) {
+    // A question has nowhere to navigate to, so the popover says what clicking
+    // it *does* — otherwise the one row on the card with a non-obvious action is
+    // also the one whose action is never mentioned.
+    if (question) {
+        const TextMask m =
+            PopLine(copied ? "Copied" : "click to copy", false, inner, kPopSmallPx);
+        text(m, 0, m.h, true);
+        y += m.h + gap;
+    }
+
+    if (d.have && !question) {
         // 3. the author
         if (!d.author.login.empty()) {
             const TextMask m = PopLine(d.author.login, false, inner - av - PanScale(8));
@@ -4624,6 +4661,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale) {
 
 struct Popover {
     HWND      hwnd = nullptr;
+    bool      copied = false;   // what its footer currently says
     PanelCard card;
     HDC       dc      = nullptr;
     HBITMAP   dib     = nullptr;
@@ -4655,11 +4693,14 @@ void PopoverHide(Popover* pop) {
 // pushed back on screen — a row near the bottom of a maximized terminal would
 // otherwise hang the popover off the taskbar.
 void PopoverShow(Popover* pop, const Panel& panel, const RECT& row, const PanelItem& item,
-                 const std::string& key) {
-    if (pop->key == key && pop->shown) return;
+                 const std::string& key, bool copied) {
+    // The footer flipping to "Copied" is a rebuild in place, not a new popover:
+    // the same row is still hovered, and re-dwelling for it would be absurd.
+    if (pop->key == key && pop->shown && pop->copied == copied) return;
 
-    pop->scale = panel.scale;
-    BuildPopoverCard(&pop->card, item, panel.scale);
+    pop->scale  = panel.scale;
+    pop->copied = copied;
+    BuildPopoverCard(&pop->card, item, panel.scale, copied);
     if (!pop->card.w) { PopoverHide(pop); return; }
 
     if (!pop->hwnd) {
@@ -5193,6 +5234,13 @@ void PanelThread(float seconds) {
                 }
             }
 
+            // Back to being a question, on its own, without anything having to
+            // remember to put it back.
+            if (p->copied_item >= 0 && GetTickCount() - p->copied_at >= kPanCopiedMs) {
+                p->copied_item = -1;
+                p->dirty       = true;
+            }
+
             bool redrawn = false;
             if (p->dirty || !p->bits) {
                 PanelRender(p);
@@ -5241,7 +5289,8 @@ void PanelThread(float seconds) {
                 hover.index < static_cast<int>(p->card.rows.size())) {
                 const int idx = p->card.rows[hover.index].item;
                 if (idx >= 0 && idx < static_cast<int>(p->items.size()) &&
-                    (p->items[idx].kind == "pr" || p->items[idx].kind == "issue")) {
+                    (p->items[idx].kind == "pr" || p->items[idx].kind == "issue" ||
+                     PanelIsQuestion(p->items[idx]))) {
                     over = &p->items[idx];
                     key  = p->session + "|" + p->tab + "|" + std::to_string(p->scroll) +
                            "|" + over->kind + "|" + over->repo + "|" +
@@ -5253,7 +5302,9 @@ void PanelThread(float seconds) {
                 dwell_since = GetTickCount();
                 if (pop.key != key) PopoverHide(&pop);
             } else if (over && GetTickCount() - dwell_since >= kPopDwellMs) {
-                PopoverShow(&pop, *p, p->card.rows[hover.index].hit, *over, key);
+                const int idx = p->card.rows[hover.index].item;
+                PopoverShow(&pop, *p, p->card.rows[hover.index].hit, *over, key,
+                            idx == p->copied_item);
             }
             // The glow moves every frame, which is a recompose and never a
             // rebuild: no text is re-measured to make a card breathe. The
@@ -5850,13 +5901,25 @@ PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string&
     return it;
 }
 
+// The row that is a sentence rather than a handle.
+PanelItem SampleQuestionItem() {
+    PanelItem it;
+    it.kind   = "question";
+    it.status = PanStatus::Open;
+    it.title  = "The quantity step applies per SKU today. Should it also apply to "
+                "archived prices, or only to the ones still on sale? Archived rows "
+                "would need a migration either way, so it changes the size of the "
+                "change more than the shape of it.";
+    return it;
+}
+
 void PanelPopoverPreview(const std::string& prefix, float scale) {
     const std::string a = WriteFakeAvatar(prefix + "-avatar-a.png",
                                           Rgb{0.16f, 0.38f, 0.72f}, Rgb{0.42f, 0.20f, 0.62f});
     const std::string b = WriteFakeAvatar(prefix + "-avatar-b.png",
                                           Rgb{0.10f, 0.47f, 0.33f}, Rgb{0.70f, 0.62f, 0.14f});
-    for (int i = 0; i < 2; ++i) {
-        const PanelItem item = SamplePopoverItem(i == 0, a, b);
+    for (int i = 0; i < 3; ++i) {
+        const PanelItem item = i < 2 ? SamplePopoverItem(i == 0, a, b) : SampleQuestionItem();
         PanelCard card;
         BuildPopoverCard(&card, item, scale);
         if (!card.w) continue;
@@ -5866,7 +5929,10 @@ void PanelPopoverPreview(const std::string& prefix, float scale) {
         QueryPerformanceCounter(&t0);
         ComposePanel(px.data(), card, nullptr, 1.f, 0.f, 0.f);
         QueryPerformanceCounter(&t1);
-        const std::string path = prefix + (i == 0 ? "-popover-pr.png" : "-popover-issue.png");
+        const char* suffix = i == 0 ? "-popover-pr.png"
+                           : i == 1 ? "-popover-issue.png"
+                                    : "-popover-question.png";
+        const std::string path = prefix + suffix;
         WritePng(path, px, card.w, card.h);
         std::printf("%s (%dx%d)  compose %.2f ms\n", path.c_str(), card.w, card.h,
                     1000.0 * (t1.QuadPart - t0.QuadPart) / f.QuadPart);
@@ -6408,8 +6474,11 @@ void Usage() {
         "  --size <px>           pointer square size (default 320)\n"
         "                        (--point-* also works for these four)\n"
         "  --point-preview <pfx> render a strip of pointer frames and exit\n"
-        "  --panel-preview <pfx> render the attention panel to <pfx>-expanded.png,\n"
-        "                        -hover.png and -collapsed.png, and exit\n"
+        "  --panel-preview <pfx> render the attention panel and exit: <pfx>- plus\n"
+        "                        expanded, hover, collapsed, all, tabs, pending,\n"
+        "                        summary-only, speaking, popover-pr,\n"
+        "                        popover-issue, popover-question (and two\n"
+        "                        avatar PNGs the popovers use)\n"
         "  --panel-demo          park a sample panel in the bottom-right of the\n"
         "                        --title window, with no daemon and no producer\n"
         "  --panel-seconds <s>   how long --panel-demo lasts (default 20)\n"

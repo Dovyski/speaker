@@ -181,12 +181,14 @@ that belongs to the icons.
 
 A row has space for a handle, a glyph and a title with its end cut off.
 Everything else the enricher knows about it goes in a popover: **hover a pull
-request or issue row for about a third of a second** and a second card opens to
-the left of the first, aligned with the row that summoned it.
+request, issue or question row for about a third of a second** and a second card
+opens to the left of the first, aligned with the row that summoned it. Path rows
+have no popover — a directory has nothing else to say.
 
 <p align="center">
   <img src="../panel-popover-pr.png" width="440" alt="a pull request popover: repo#N, Changes requested, the full title, author, labels, assignees, reviewers with verdicts and a checks line">
   <img src="../panel-popover-issue.png" width="440" alt="an issue popover: repo#N, its state, the full title, author, labels and assignees">
+  <img src="../panel-popover-question.png" width="440" alt="a question popover: the amber question mark, Pending question, the whole question text, and click to copy">
 </p>
 
 Top to bottom: the type icon, `repo#N`, and the status *spelled out* (`Changes
@@ -197,6 +199,22 @@ them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a gr
 speech bubble for `COMMENTED`, a hollow circle for a review that has been
 requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
 1 failing`.
+
+A **question** row gets a shape of its own, because it has neither a `repo#N`
+nor a status: the amber question mark, the words `Pending question`, then the
+whole question wrapped over as many as twelve lines — a row can only ever show
+the first few words of one — and a dim `click to copy`, since a question is the
+one row whose click does something other than navigate and it would otherwise go
+unmentioned.
+
+Clicking a question copies it, and a copy is otherwise invisible — the
+clipboard says nothing and the row looks exactly as it did. So for about
+1.2 seconds the row *acknowledges* it: a green check where the amber question
+mark was, and `Copied to clipboard` in the secondary ink where the question was,
+before going back to being a question. Clicking again inside that window
+restarts it. If the popover happens to be open, its footer says `Copied` for the
+same moment — a rebuild in place, since the same row is still hovered and
+re-dwelling for it would be absurd.
 
 A row whose `details` never arrived still gets a popover — its own title and its
 status, which is more than the row could show. Nothing here is interactive: the
@@ -490,8 +508,9 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-speaking.png` | mid-utterance: lit, the header carrying the caption |
 | `<prefix>-popover-pr.png` | a fully populated pull request popover |
 | `<prefix>-popover-issue.png` | the same for an issue |
+| `<prefix>-popover-question.png` | a question: the whole text and `click to copy` |
 
-The two popovers come with two generated avatar PNGs beside them, so the previews
+The popovers come with two generated avatar PNGs beside them, so the previews
 show real decoded circles rather than the fallback disc. Every image on this page
 was produced this way. Layered windows are invisible to GDI screen capture, so
 rendering them is the only way to review the look — same reason `--orb-preview`
