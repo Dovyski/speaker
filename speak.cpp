@@ -4226,8 +4226,13 @@ std::string PanKey(const std::string& title) {
 }
 
 // 2 = a unique exact match, 1 = a unique containing one, 0 = none or several (in
-// which case `hits` holds the candidates). The quality is what breaks a tie when
-// two registrations land on the same window.
+// which case `hits` holds the candidates). The quality is what decides which of
+// two registrations landing on the same window takes it.
+//
+// Known residual: the containing fallback lets a short title bind to a sibling
+// tab whose title merely contains it. Left as it is deliberately — it is what
+// makes a prefix title bind at all — and not touched by the incumbent rule in
+// PanelResolveAll, which only decides who wins once both have matched.
 int PanPickWindow(const std::vector<WindowTarget>& pool, const std::string& title,
                   HWND* out, std::vector<WindowTarget>* hits) {
     const std::string want = PanKey(title);
@@ -5192,7 +5197,8 @@ std::string PanelIso8601(time_t t) {
 // Re-match every registration against the desktop as it is now, then decide who
 // gets which window. Two registrations can name the same window over time — that
 // is what a tab switch looks like — so at most one card is shown per hwnd and the
-// better match takes it.
+// better match takes it. Equally good matches go to whoever holds the window
+// already: see the tiebreak below for why recency is noise here.
 void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
     const PanelPools pools = PanelPools::Snapshot();
     const time_t     now   = std::time(nullptr);
@@ -5221,6 +5227,14 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
         if (!c.quality) c.hwnd = nullptr;
     }
 
+    // The incumbent keeps the window on a tie. Recency cannot decide this: the
+    // enricher re-POSTs every session file every 60 s and the Haiku worker POSTs
+    // again after every turn, so `updated_at` moves without anyone touching the
+    // keyboard — an idle session would take the window from the active one and
+    // the card would flip to another session's items mid-session. So a challenger
+    // has to be *strictly* better matched to take a bound window, and recency
+    // only decides a window that has no incumbent: a first bind, or one the
+    // incumbent let go of because its title stopped matching.
     std::unordered_map<HWND, size_t> best;
     for (size_t i = 0; i < claims.size(); ++i) {
         if (!claims[i].hwnd) continue;
@@ -5230,10 +5244,14 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
             continue;
         }
         const size_t k = it->second;
+        const HWND   hwnd = claims[i].hwnd;
+        // Bound *right now* to this very window, and still matching it.
+        const bool   k_incumbent = (*panels)[k]->target == hwnd;
+        const bool   i_incumbent = (*panels)[i]->target == hwnd;
         const bool   i_wins =
             claims[i].quality > claims[k].quality ||
-            (claims[i].quality == claims[k].quality &&
-             (*panels)[i]->updated_at > (*panels)[k]->updated_at);
+            (claims[i].quality == claims[k].quality && !k_incumbent &&
+             (i_incumbent || (*panels)[i]->updated_at > (*panels)[k]->updated_at));
         if (i_wins) {
             claims[k].hwnd = nullptr;
             it->second     = i;
