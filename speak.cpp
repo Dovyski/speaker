@@ -3106,8 +3106,8 @@ constexpr int kPanIcon      = 14;   // octicon box, at 96 dpi
 constexpr int kPanIconGap   = 9;    // icon to label
 constexpr int kPanLabelGap  = 8;    // label to title
 constexpr int kPanTextPx    = 13;
-constexpr int kPanToggle    = 11;   // the − / + mark, corner to corner
-constexpr int kPanToggleGap = 12;
+constexpr int kPanToggle    = 11;   // the × mark, corner to corner
+constexpr int kPanToggleGap = 12;   // text to that mark
 constexpr int kPanHeadGap   = 7;    // padding added to the header row
 constexpr int kPanRuleGap   = 5;    // header rule to the first row
 constexpr int kPanStroke    = 2;
@@ -3252,6 +3252,7 @@ struct PanelCard {
     std::vector<uint8_t>  ink, dim;          // text coverage, full and muted
     std::vector<uint32_t> deco;              // premultiplied: the icons carry colour
     RECT                  header{};          // the collapse toggle's click target
+    RECT                  close{};           // the × that hides the card, at its right
     int                   rule_y = -1;       // hairline under the header, -1 for none
     struct Row {
         RECT hit;
@@ -3304,6 +3305,19 @@ void PanFillRect(std::vector<uint32_t>* deco, int w, int h, RECT r, const Rgb& c
 TextMask PanLine(const std::string& text, bool bold, int max_w) {
     return RenderText(Wide(text), PanScale(kPanTextPx), bold, max_w, 1,
                       DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// The one mark on the card: an `×` at the right of the header line, which hides
+// it. Two diagonals of a square, stamped rather than set in a font — at 11 px
+// that is what it takes for a stroke to land on the same pixel grid at 1×, 1.5×
+// and 2×, and it is how the `−` it replaced was drawn too.
+void PanStampClose(PanelCard* out, int x, int y, int size) {
+    const float w = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
+    const float a = 0.5f, b = size - 0.5f;
+    StampSdf(&out->ink, out->w, out->h, x, y, size, size, [=](float px, float py) {
+        return std::min(SegDist(px, py, a, a, b, b),
+                        SegDist(px, py, b, a, a, b)) - w;
+    });
 }
 
 // `max_h` caps the card (0 = no ceiling) and `scroll` is clamped in place, so a
@@ -3405,15 +3419,15 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             StampOcticon(&out->deco, out->w, out->h, margin + pad,
                          margin + (panel_h - icon) / 2, icon, g.path, g.colour);
         }
-        // A `+`, because from here the gesture is to unfold it.
-        const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
-        const float tc = toggle * 0.5f;
-        StampSdf(&out->ink, out->w, out->h, margin + panel_w - pad - toggle,
-                 margin + (panel_h - toggle) / 2, toggle, toggle,
-                 [=](float px, float py) {
-            return std::min(SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc),
-                            SegDist(px, py, tc, 0.5f, tc, toggle - 0.5f)) - tw;
-        });
+        // The `×` sits where the `+` used to: unfolding a pill is what clicking
+        // anywhere else on it does, and a mark is better spent on the thing that
+        // has no other gesture. Its target reaches from halfway across the gap
+        // to the pill's edge — an 11 px square is not a thing to ask anyone to
+        // hit — and the rest of the pill still toggles.
+        const int cx = margin + panel_w - pad - toggle;
+        const int ty = margin + (panel_h - toggle) / 2;
+        PanStampClose(out, cx, ty, toggle);
+        out->close = RECT{cx - tgap / 2, margin, margin + panel_w, margin + panel_h};
     } else {
         // ── the expanded card ──
         const int panel_w = PanScale(kPanWidth);
@@ -3601,14 +3615,14 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
                       margin + pad + oslot + head.w + PanScale(kPanLabelGap),
                       y + (head_h - head_rest.h) / 2);
         }
-        const int tx = margin + panel_w - pad - toggle;
+        // The `×` takes the far right, where a window's dismiss always is. The
+        // header band underneath it is still the collapse target, so this is
+        // carved out of it — and out->close is tested first, or it would not
+        // exist at all.
+        const int cx = margin + panel_w - pad - toggle;
         const int ty = y + (head_h - toggle) / 2;
-        const float tw = std::max(1.f, PanScale(kPanStroke) * 0.9f) * 0.5f;
-        const float tc = toggle * 0.5f;
-        StampSdf(&out->ink, out->w, out->h, tx, ty, toggle, toggle,
-                 [=](float px, float py) {
-            return SegDist(px, py, 0.5f, tc, toggle - 0.5f, tc) - tw;
-        });
+        PanStampClose(out, cx, ty, toggle);
+        out->close = RECT{cx - tgap / 2, margin, margin + panel_w, y + head_h};
         y += head_h;
         if (bare) {
             PanelShapeAndBake(out);
@@ -3833,10 +3847,11 @@ void ComposePanel(uint32_t* frame, const PanelCard& card, const RECT* hover, flo
 
 // ── a live panel ────────────────────────────────────────────────────────────
 
-// What is under the pointer. Three kinds of thing are clickable now — the
-// header, a tab, a row — so this is a pair rather than an index with sentinels.
+// What is under the pointer. Four kinds of thing are clickable now — the
+// header, its `×`, a tab, a row — so this is a pair rather than an index with
+// sentinels.
 struct PanHit {
-    enum class Kind { None, Header, Tab, Row } kind = Kind::None;
+    enum class Kind { None, Header, Close, Tab, Row } kind = Kind::None;
     int index = -1;
 
     bool operator==(const PanHit& o) const { return kind == o.kind && index == o.index; }
@@ -3857,6 +3872,16 @@ struct Panel {
     std::vector<PanelItem> items;
     time_t    updated_at = 0;        // last POST; registrations expire 48 h after it
     bool      collapsed = false;
+    // Dismissed with the `×`. Like `collapsed`, this belongs to the reader and
+    // survives every POST — hooks post on every tool use, so a card that a POST
+    // could un-hide would be back within seconds. `away` is how it comes back:
+    // the resolver sets it once the target stops being the foreground window,
+    // and the card returns when the target is foreground again. So dismissing
+    // from another window means "gone until I look at this terminal again", and
+    // dismissing while sitting in the terminal keeps it gone until you leave and
+    // come back — which is the only signal available that you are done with it.
+    bool      hidden     = false;
+    bool      hidden_away = false;
     // These three survive a POST and a collapse: what the card is showing is the
     // reader's business, not the producer's.
     std::string tab = "all";         // which tab is selected, by id
@@ -3916,6 +3941,9 @@ bool PanelInside(const Panel* p, POINT screen) {
 PanHit PanelHitAt(const Panel* p, POINT screen) {
     if (!PanelInside(p, screen)) return {};
     POINT q{screen.x - p->pos.x, screen.y - p->pos.y};
+    // Before the header: that rect spans the whole top line, `×` included, and
+    // whichever is tested first is the one that can be clicked.
+    if (PtInRect(&p->card.close, q))  return {PanHit::Kind::Close, 0};
     if (PtInRect(&p->card.header, q)) return {PanHit::Kind::Header, 0};
     for (size_t i = 0; i < p->card.tabs.size(); ++i) {
         if (PtInRect(&p->card.tabs[i].hit, q)) {
@@ -4015,7 +4043,13 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT cur{};
             GetCursorPos(&cur);
             const PanHit hit = PanelHitAt(p, cur);
-            if (hit.kind == PanHit::Kind::Header) {
+            if (hit.kind == PanHit::Kind::Close) {
+                // Not a DELETE: the registration is fine, it is the card that is
+                // in the way. The resolver puts it back on the next visit.
+                p->hidden      = true;
+                p->hidden_away = false;
+                p->hover       = PanHit{};
+            } else if (hit.kind == PanHit::Kind::Header) {
                 PanelToggle(p);
             } else if (hit.kind == PanHit::Kind::Tab) {
                 p->tab    = kPanTabs[p->card.tabs[hit.index].index].id;
@@ -4073,6 +4107,9 @@ void PanelCompose(Panel* p) {
     switch (p->hover.kind) {
         case PanHit::Kind::Header:
             hover = &p->card.header;
+            break;
+        case PanHit::Kind::Close:
+            hover = &p->card.close;
             break;
         case PanHit::Kind::Tab:
             if (i >= 0 && i < static_cast<int>(p->card.tabs.size())) {
@@ -5227,6 +5264,7 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
         }
         const char* kind = p->last_hit.kind == PanHit::Kind::Row    ? "row"
                          : p->last_hit.kind == PanHit::Kind::Tab    ? "tab"
+                         : p->last_hit.kind == PanHit::Kind::Close  ? "close"
                          : p->last_hit.kind == PanHit::Kind::Header ? "header"
                                                                     : "none";
         int item = -1;
@@ -5284,6 +5322,7 @@ void PanelResolveAll(std::vector<std::unique_ptr<Panel>>* panels) {
                 ",\"resolved\":" + (p->target ? "true" : "false") +
                 ",\"items\":" + std::to_string(p->items.size()) +
                 ",\"collapsed\":" + (p->collapsed ? "true" : "false") +
+                ",\"hidden\":" + (p->hidden ? "true" : "false") +
                 ",\"tab\":\"" + JsonEscape(p->tab) + "\"" +
                 ",\"expanded_all\":" + (p->expanded_all ? "true" : "false") +
                 ",\"speaking\":" + (p->speaking ? "true" : "false") +
@@ -5411,6 +5450,22 @@ void PanelThread(float seconds) {
                 // panel goes with it and comes back on restore.
                 PanelHide(p, "target not showing");
                 continue;
+            }
+            // Dismissed with the `×`, and after the two checks above so the
+            // ordinary reasons still win in the trace: a card whose window is
+            // minimized is hidden because of that, not because of this.
+            if (p->hidden) {
+                const HWND fg = GetForegroundWindow();
+                if (fg != p->target) {
+                    p->hidden_away = true;      // you left; coming back is the signal
+                } else if (p->hidden_away) {
+                    p->hidden = p->hidden_away = false;
+                    p->dirty  = true;
+                }
+                if (p->hidden) {
+                    PanelHide(p, "dismissed");
+                    continue;
+                }
             }
             if (!PanelEnsureWindow(p)) continue;
 
