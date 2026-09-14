@@ -9,6 +9,19 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ## [Unreleased]
 
+### Added
+
+- **A `×` on the attention panel's card hides it.** The card is topmost and
+  re-asserted on every foreground change, so a terminal covered by whatever you
+  were actually working in still floated its panel over the lot, and minimizing
+  that terminal was the only way out. The `−`/`+` collapse mark is **replaced**
+  by the `×`, on the expanded header and on the pill: collapsing already had
+  gestures (click the header line, click the pill, right click anywhere on the
+  card) and hiding had none. The card comes back when you leave the target
+  window and come back to it — not on a timer and not on the next `POST`, since
+  the hooks post on every tool use. The registration is untouched, and
+  `GET /panels` reports the state as `hidden`.
+
 ## [1.1.0] — 2026-09-10
 
 ### Added

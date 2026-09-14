@@ -18,6 +18,7 @@ in it is working on.
 - [Hover: the popover](#hover-the-popover)
 - [The `details` contract](#the-details-contract)
 - [Collapse](#collapse)
+- [Hide](#hide)
 - [Speaking](#speaking)
 - [Which window? (it changes)](#which-window-it-changes)
 - [Following the window](#following-the-window)
@@ -311,15 +312,17 @@ wrong. `checks.total` counts everything, so *passing* is
 ## Collapse
 
 <p align="center">
-  <img src="../panel-collapsed.png" width="240" alt="the collapsed pill: the amber question glyph, 2 pending, and the + that expands it">
+  <img src="../panel-collapsed.png" width="240" alt="the collapsed pill: the amber question glyph, 2 pending, and the × that hides it">
 </p>
 
-The header is the summary line, with a `−` at the right. Click either and the
-card becomes a one-line pill: how many items, and the **worst** item's icon and
-colour among them. That is enough to know whether the window wants attention,
+The header is the summary line. Click it and the card becomes a one-line pill:
+how many items, and the **worst** item's icon and colour among them. That is enough to know whether the window wants attention,
 while giving the terminal underneath its corner back.
 
-A pill is always a glyph, two or three words and the toggle — `2 pending`,
+Clicking the pill anywhere but its `×` opens it again; the `×` itself is the
+[hide](#hide) control, the one gesture the card has no other way to ask for.
+
+A pill is always a glyph, two or three words and that mark — `2 pending`,
 `8 items`, `Info` — and never anything that grows with the payload. Its whole
 job is to get out of the way, so its width is capped at the longest of those
 forms rather than at whatever text it was handed.
@@ -331,6 +334,37 @@ its terminal tab went to the background comes back exactly as it was. A card unf
 while you read the terminal is exactly what collapsing it was meant to stop.
 Right click anywhere on the card toggles it too, so the gesture does not require
 finding the header.
+
+## Hide
+
+<p align="center">
+  <img src="../panel-collapsed.png" width="240" alt="the collapsed pill, with the × at its right that hides the card">
+</p>
+
+The `×` at the right of the header line — and of the pill — takes the card off
+the screen altogether. Even a pill keeps the corner, and the card is topmost and
+re-asserted on every foreground change, which is right while you are in the
+terminal it annotates and wrong the moment you are working in something that
+happens to sit over it. Before this, the only way out was to find the parent
+terminal and minimize it.
+
+It is the card's only mark, which is why it is the one that hides rather than
+the one that collapses: collapsing already has a gesture (the header, the pill,
+a right click anywhere), and hiding had none.
+
+It comes back when **you leave the target window and come back to it**. Not on a
+timer, and deliberately not on the next `POST`: the hooks post on every tool
+use, so a card a `POST` could un-hide would be back within seconds, which is no
+dismissal at all. The terminal taking the foreground again is the signal that
+you are back at it and that whatever you hid it for is over. So hiding it from
+another window brings it back the next time that terminal is focused, and hiding
+it while sitting *in* the terminal keeps it away until you alt-tab off and
+return.
+
+The registration is untouched: the session keeps its items, the enricher keeps
+polling them, `GET /panels` reports the state as `hidden`, and the card that
+comes back is the one that went away, tab and scroll included. Taking a panel
+away for good is still `DELETE /panel`, or a `POST` with empty `items`.
 
 ## Speaking
 
@@ -519,7 +553,7 @@ a UNC path, and nothing else.
   producer never has to remember to `DELETE` when its last pull request merges.
   `DELETE /panel?session=<id>` does the same.
 - An empty `items` with a `summary` is **not** a goodbye: it renders a
-  header-only card — the summary line and the collapse toggle, no tab strip, no
+  header-only card — the summary line and its `×`, no tab strip, no
   rows, one line tall. "Rebasing the forms PRs on dev" is worth a line in the
   corner of the terminal doing it, and a session that has not found anything to
   link yet should not have its panel taken away. Collapsed, it becomes the
@@ -529,7 +563,7 @@ a UNC path, and nothing else.
   thing it cannot be.
 
   <p align="center">
-    <img src="../panel-summary-only.png" width="440" alt="a header-only card: just the summary line and the collapse toggle">
+    <img src="../panel-summary-only.png" width="440" alt="a header-only card: just the summary line and its ×">
   </p>
 - `GET /panels?debug=1` answers with the same registrations as the panel thread
   sees them: each card's rectangle, its monitor, the DPI it was drawn at, and the
@@ -538,7 +572,7 @@ a UNC path, and nothing else.
   else — and it is the difference between guessing at a hover bug and reading
   one.
 - `GET /panels` lists what is registered — `session`, `title`, `hwnd` or `null`,
-  `resolved`, the item count, `collapsed`, `tab`, `expanded_all`, `speaking` and
+  `resolved`, the item count, `collapsed`, `hidden`, `tab`, `expanded_all`, `speaking` and
   `updated_at` — which is the first
   thing to look at when a card is not where it should be. It is a snapshot
   published by the resolver, so it is at most half a second stale.
