@@ -31,7 +31,8 @@ function Add-Err([string]$where, $e) {
 $log = [ordered]@{
     ts = (Get-Date).ToString('o'); session = $null; event = $null
     delta_bytes = 0; items_total = 0; items_new = 0; items_sent = 0
-    title = $null; post_status = $null; haiku = $null; ms = $null; errors = @()
+    title = $null; title_rejected = $null; post_status = $null; haiku = $null
+    ms = $null; errors = @()
 }
 
 function Write-Log {
@@ -507,16 +508,41 @@ public static class I47P1 {
     }
 }
 '@
+# The leading spinner glyph and the space behind it (`◐ ◑ ◒ ◓ ✳`), the same strip
+# the daemon does before matching (speak.cpp, PanStripGlyph). The space is the
+# test, so a title that merely starts with a non-ASCII word keeps its first
+# letter. A title that is nothing but a glyph normalises to empty.
+function Get-BareTitle([string]$v) {
+    if (-not $v) { return '' }
+    $s = $v.Trim()
+    if ($s -match '^[^\x00-\x7F]+[ \t]+(.*)$') { $s = $Matches[1].Trim() }
+    elseif ($s -match '^[^\x00-\x7F]+$') { $s = '' }
+    return $s
+}
+
+# Canonical usable-title test for the whole producer chain (i47-enrich.ps1 and
+# i47-haiku.ps1 carry a minimal copy of the `Claude Code` / empty rules, since
+# the three scripts share no module).
+#
+# `Claude Code` is the literal title Claude Code gives a tab until the
+# conversation earns a summary, so *every* fresh session would register it. The
+# daemon keys registrations by normalised title, so several sessions would then
+# exact-match one window and the card would flip between them mid-session. A
+# title that cannot identify one window is no title: the state file is still
+# written, but nothing is registered until a real one shows up.
 function Test-Title([string]$v) {
-    if (-not $v) { return $false }
-    if ($v -in @('Windows PowerShell', 'Administrator: Windows PowerShell', 'Command Prompt')) { return $false }
-    if ($v -match '(?i)\.(exe|cmd|bat|ps1)$') { return $false }
-    if ($v -match '(?i)^(pwsh|powershell|cmd|node|bash)$') { return $false }
-    if ($v -match '(?i)^(mingw|msys)') { return $false }         # Bash-tool child title
-    if ($v -match '^(/|[A-Za-z]:\\)') { return $false }
+    $b = Get-BareTitle $v
+    if (-not $b) { return $false }                              # empty, or a bare glyph
+    if ($b -match '(?i)^claude\s+code$') { return $false }       # every session's default tab title
+    if ($b -in @('Windows PowerShell', 'Administrator: Windows PowerShell', 'Command Prompt')) { return $false }
+    if ($b -match '(?i)\.(exe|cmd|bat|ps1)$') { return $false }
+    if ($b -match '(?i)^(pwsh|powershell|cmd|node|bash)$') { return $false }
+    if ($b -match '(?i)^(mingw|msys)') { return $false }         # Bash-tool child title
+    if ($b -match '^(/|[A-Za-z]:\\)') { return $false }
     return $true
 }
 $termTitle = $null
+$titleRejected = $null
 try {
     if (-not ('I47P1' -as [type])) { Add-Type -TypeDefinition $sig -Language CSharp | Out-Null }
     $chain = @()
@@ -538,13 +564,20 @@ try {
             if ([I47P1]::AttachConsole([uint32]$apid)) {
                 $v = [I47P1]::ConTitle()
                 if (Test-Title $v) { $termTitle = $v; break }
+                elseif ($v) { $titleRejected = $v }
             }
         } catch {}
     }
     try { [void][I47P1]::FreeConsole() } catch {}
-    if (-not $termTitle) { try { if (Test-Title ([Console]::Title)) { $termTitle = [Console]::Title } } catch {} }
+    if (-not $termTitle) {
+        try {
+            if (Test-Title ([Console]::Title)) { $termTitle = [Console]::Title }
+            elseif ([Console]::Title) { $titleRejected = [Console]::Title }
+        } catch {}
+    }
 } catch { Add-Err 'title' $_ }
 $log.title = $termTitle
+if (-not $termTitle) { $log.title_rejected = $titleRejected }
 
 # --- 7. persist -------------------------------------------------------------
 $payload = [ordered]@{
@@ -583,18 +616,27 @@ try {
     $log.items_sent = @($send).Count
 } catch { Add-Err 'filter' $_ }
 
-try {
-    $body = $payload | ConvertTo-Json -Depth 8 -Compress
-    $client = New-Object System.Net.Http.HttpClient
-    $client.Timeout = [TimeSpan]::FromMilliseconds(1000)
-    $content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, 'application/json')
-    $t = $client.PostAsync($Endpoint, $content)
-    if ($t.Wait(1200)) { $log.post_status = [int]$t.Result.StatusCode } else { $log.post_status = 'timeout' }
-    $client.Dispose()
-} catch {
-    $m = $_.Exception.Message
-    if ($m -match '(?i)refused|actively refused|No connection') { $log.post_status = 'refused' }
-    else { $log.post_status = 'error'; Add-Err 'post' $_ }
+# No usable title, no registration. A title that does not identify one window —
+# missing, or the literal `Claude Code` every session starts out with — would
+# have the daemon bind this session's card to whichever window some *other*
+# session already owns. The state file above is written either way, so nothing
+# is lost: the next hook that resolves a real title posts the whole list.
+if (-not (Test-Title $termTitle)) {
+    $log.post_status = 'skip:no-usable-title'
+} else {
+    try {
+        $body = $payload | ConvertTo-Json -Depth 8 -Compress
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromMilliseconds(1000)
+        $content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, 'application/json')
+        $t = $client.PostAsync($Endpoint, $content)
+        if ($t.Wait(1200)) { $log.post_status = [int]$t.Result.StatusCode } else { $log.post_status = 'timeout' }
+        $client.Dispose()
+    } catch {
+        $m = $_.Exception.Message
+        if ($m -match '(?i)refused|actively refused|No connection') { $log.post_status = 'refused' }
+        else { $log.post_status = 'error'; Add-Err 'post' $_ }
+    }
 }
 
 # --- 9. P4: spawn the Haiku worker, do not wait -----------------------------

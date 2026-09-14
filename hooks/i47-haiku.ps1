@@ -55,9 +55,25 @@ $log = [ordered]@{
     delta_chars = 0; model = $null; ms = $null; cost_usd = $null
     in_tokens = $null; out_tokens = $null; cache_w = $null; cache_r = $null; attempts = 0
     summary = $null; worked = 0; mentioned = 0
-    q_open = 0; q_resolved = 0; errors = @()
+    q_open = 0; q_resolved = 0; post_status = $null; errors = @()
 }
 $lockHeld = $false
+
+# Minimal copy of the canonical usable-title test in i47-attention.ps1
+# (`Test-Title` / `Get-BareTitle`) — the three producer scripts share no module.
+# Re-POSTing a file whose stored title is unusable (missing, a bare spinner
+# glyph, or the literal `Claude Code` every session starts out with) would
+# register this session against a window another session is already showing in.
+# Keep in sync there.
+function Test-PanelTitle([string]$v) {
+    if (-not $v) { return $false }
+    $s = $v.Trim()
+    if ($s -match '^[^\x00-\x7F]+[ \t]+(.*)$') { $s = $Matches[1].Trim() }
+    elseif ($s -match '^[^\x00-\x7F]+$') { $s = '' }
+    if (-not $s) { return $false }
+    if ($s -match '(?i)^claude\s+code$') { return $false }
+    return $true
+}
 function Write-Log {
     try {
         $log.ms     = [int]$sw.ElapsedMilliseconds
@@ -531,29 +547,34 @@ Set-Prop $state 'updated_at' $now
 try { Write-JsonFileAtomic $File $state } catch { Add-Err 'persist' $_ }
 
 # --- 8. POST (worked items + questions only) --------------------------------
-try {
-    $send = New-Object System.Collections.ArrayList
-    foreach ($it in @($state.items)) {
-        if (-not $it) { continue }
-        if (([string]$it.kind) -eq 'question') { [void]$send.Add($it); continue }
-        $rel = if ($it.PSObject.Properties['relevance'] -and $it.relevance) { [string]$it.relevance } else { 'worked' }
-        if ($rel -ne 'mentioned') { [void]$send.Add($it) }
-    }
-    $payload = [ordered]@{
-        session    = [string]$state.session
-        title      = [string]$state.title
-        items      = @($send.ToArray())
-        updated_at = $now
-    }
-    if ($state.summary) { $payload['summary'] = [string]$state.summary }
-    $body    = $payload | ConvertTo-Json -Depth 12 -Compress
-    $client  = New-Object System.Net.Http.HttpClient
-    $client.Timeout = [TimeSpan]::FromMilliseconds(1500)
-    $content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, 'application/json')
-    $t = $client.PostAsync($Endpoint, $content)
-    [void]$t.Wait(2000)
-    $client.Dispose()
-} catch { Add-Err 'post' $_ }
+# No usable stored title, no registration: see Test-PanelTitle above.
+if (-not (Test-PanelTitle ([string]$state.title))) { $log.post_status = 'skip:no-usable-title' }
+else {
+    try {
+        $send = New-Object System.Collections.ArrayList
+        foreach ($it in @($state.items)) {
+            if (-not $it) { continue }
+            if (([string]$it.kind) -eq 'question') { [void]$send.Add($it); continue }
+            $rel = if ($it.PSObject.Properties['relevance'] -and $it.relevance) { [string]$it.relevance } else { 'worked' }
+            if ($rel -ne 'mentioned') { [void]$send.Add($it) }
+        }
+        $payload = [ordered]@{
+            session    = [string]$state.session
+            title      = [string]$state.title
+            items      = @($send.ToArray())
+            updated_at = $now
+        }
+        if ($state.summary) { $payload['summary'] = [string]$state.summary }
+        $body    = $payload | ConvertTo-Json -Depth 12 -Compress
+        $client  = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromMilliseconds(1500)
+        $content = New-Object System.Net.Http.StringContent($body, [System.Text.Encoding]::UTF8, 'application/json')
+        $t = $client.PostAsync($Endpoint, $content)
+        [void]$t.Wait(2000)
+        $client.Dispose()
+        $log.post_status = 'sent'
+    } catch { Add-Err 'post' $_; $log.post_status = 'error' }
+}
 
 Release-Lock
 Write-Log

@@ -53,7 +53,7 @@ function Add-Err([string]$where, $e) {
 
 $log = [ordered]@{
     ts = (Get-Date).ToString('o'); sessions = 0; items = 0
-    gh_calls = 0; changed = 0; avatars = 0; ms = $null; errors = @()
+    gh_calls = 0; changed = 0; avatars = 0; post_skipped = 0; ms = $null; errors = @()
 }
 function Write-Log {
     try {
@@ -64,6 +64,22 @@ function Write-Log {
         $s = New-Object System.IO.StreamWriter($LogFile, $true, (New-Object System.Text.UTF8Encoding($false)))
         try { $s.WriteLine($line) } finally { $s.Dispose() }
     } catch {}
+}
+
+# Minimal copy of the canonical usable-title test in i47-attention.ps1
+# (`Test-Title` / `Get-BareTitle`) — the three producer scripts share no module.
+# Re-POSTing a file whose stored title is unusable (missing, a bare spinner
+# glyph, or the literal `Claude Code` every session starts out with) is how an
+# idle session used to take the window of an active one: the POST bumps
+# `updated_at` in the daemon with no user action behind it. Keep in sync there.
+function Test-PanelTitle([string]$v) {
+    if (-not $v) { return $false }
+    $s = $v.Trim()
+    if ($s -match '^[^\x00-\x7F]+[ \t]+(.*)$') { $s = $Matches[1].Trim() }
+    elseif ($s -match '^[^\x00-\x7F]+$') { $s = '' }
+    if (-not $s) { return $false }
+    if ($s -match '(?i)^claude\s+code$') { return $false }
+    return $true
 }
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -735,6 +751,7 @@ try { if ($httpAv) { $httpAv.Dispose() } } catch {}
 
 foreach ($obj in $changedFiles) {
     try {
+        if (-not (Test-PanelTitle ([string]$obj.title))) { $log.post_skipped++; continue }
         $post = Read-JsonString ($obj | ConvertTo-Json -Depth 12)
         if ($post.PSObject.Properties['_cursor']) { $post.PSObject.Properties.Remove('_cursor') }
         if ($post.PSObject.Properties['_haiku_cursor']) { $post.PSObject.Properties.Remove('_haiku_cursor') }
