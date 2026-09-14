@@ -92,6 +92,17 @@ Claude Code sets it to a spinner glyph plus a short description of the turn.
   a BEL, so the result is truncated to the returned length and stripped of
   control characters. `Test-Title` then rejects the obvious impostors
   (`pwsh`, `bash`, `mingw…`, anything ending in `.exe`, anything that is a path).
+- **`Claude Code` is not a title.** Claude Code names the tab the literal
+  `Claude Code` until the conversation earns a summary, so every fresh session
+  would register the same one and the daemon would have several registrations
+  exact-matching one window — which is how a card ends up showing another
+  session's items. `Test-Title` rejects it (after the glyph strip, and along with
+  an empty or glyph-only title), and **a hook with no usable title does not
+  POST**: the session file is written as usual so nothing is lost, and
+  `producer.log` records `post_status: "skip:no-usable-title"`. The enricher and
+  the Haiku worker apply the same check before re-POSTing a file's stored title
+  (`Test-PanelTitle`, a minimal copy — the three scripts share no module; the
+  canonical one is `Test-Title` in `i47-attention.ps1`).
 - `hooks/i47-terminal-title.ps1` is the P0 spike that established all of the
   above. It is not needed at runtime; it is kept because it logs every method it
   tried and matches the result against `speak.exe --list-targets`, which is the

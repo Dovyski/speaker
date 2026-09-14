@@ -22,6 +22,22 @@ in `version.h`, and a `v*` tag ships whatever that header says.
   the hooks post on every tool use. The registration is untouched, and
   `GET /panels` reports the state as `hidden`.
 
+### Fixed
+
+- **A session's card no longer flips to another session's content.** Two things
+  put several sessions on one window. The producer registered the literal
+  `Claude Code` — the title Claude Code gives a tab until the conversation earns
+  a summary — so every fresh session claimed the same window; `Test-Title` now
+  rejects it (and an empty or glyph-only title), and a hook with no usable title
+  writes its session file but **does not register**, logging
+  `skip:no-usable-title`. The enricher and the Haiku worker skip the same
+  re-POST. And when two registrations did match one window equally well, the tie
+  went to the more recently posted one — which the enricher's 60 s re-POST moves
+  with nobody at the keyboard, so an idle session kept stealing the window from
+  the active one. The **incumbent now keeps the window**: a challenger has to
+  match strictly better to take a bound window, and recency only decides a window
+  that has no incumbent.
+
 ## [1.1.0] — 2026-09-10
 
 ### Added

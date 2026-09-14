@@ -474,9 +474,21 @@ are searched first and everything else second, which is what makes
 
 Two sessions can name the same window — that is what a tab switch looks like
 from here, and both registrations are perfectly valid. At most one card is shown
-per window: the better match wins, and the more recently posted one breaks a tie.
-The loser hides and keeps its registration, so switching back is a rebind rather
-than a re-POST.
+per window: the better match wins, and **the session already bound to that window
+keeps it on a tie**. A challenger has to match *strictly* better to take a bound
+window; recency only decides a window with no incumbent — a first bind, or one
+whose incumbent let go because its title stopped matching. The loser hides and
+keeps its registration, so switching back is a rebind rather than a re-POST.
+
+Recency used to break the tie, and it is the wrong signal: the status enricher
+re-POSTs every session file every 60 s and the Haiku worker POSTs again after
+every turn, so `updated_at` moves with nobody at the keyboard. An idle session
+kept taking the window from the active one, and the card in front of you flipped
+to another session's items mid-session. (The producer also refuses to register a
+title that cannot identify one window — `Claude Code` is the literal title Claude
+Code gives a tab until the conversation earns a summary, so every fresh session
+was registering the same one.) A known residual: the containing-match fallback
+can still bind a short title to a sibling tab whose title merely contains it.
 
 Registrations expire 48 hours after their last `POST` — long enough that a
 session left alone overnight still has its panel in the morning, short enough
