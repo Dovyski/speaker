@@ -209,8 +209,13 @@ that belongs to the icons.
 
 ## Hover: the popover
 
-A row has space for a handle, a glyph and a title with its end cut off.
-Everything else the enricher knows about it goes in a popover: **hover a pull
+A row has space for a handle, a glyph and a title with its end cut off. The
+title it shows there is the item's own `title` field — except when that field
+is empty or is nothing but `#<number>` (a chat message that linked the row
+with its own number as the link text leaves exactly that behind); the row
+then reaches into `details.title`, the one the enricher actually fetched from
+GitHub, rather than repeat the handle a second time. Everything else the
+enricher knows about it goes in a popover: **hover a pull
 request, issue or question row for about a third of a second** and a second card
 opens to the left of the first, aligned with the row that summoned it. Path rows
 have no popover — a directory has nothing else to say.
@@ -222,11 +227,17 @@ have no popover — a directory has nothing else to say.
   <img src="../panel-popover-link.png" width="440" alt="a link popover: the chain icon, the word Link, and the whole URL over two lines">
 </p>
 
-Top to bottom: the type icon, `repo#N`, and the status *spelled out* (`Changes
-requested`, not a coloured dot); the **full title**, wrapped to at most three
-lines; the author, with their avatar; the labels as pills in GitHub's own label
-colours; `Assignees`; for pull requests `Reviewers`, each with the verdict beside
-them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a grey
+A pull request or an issue is laid out as **GitHub's own hover card**, in
+GitHub's own order: a muted `owner/repo on Sep 16`; the **full title** in bold,
+wrapped to at most three lines, with a muted `#N` at the end of its last line —
+which is why the wrap is done by hand rather than by `DT_WORDBREAK`, since a
+single mask cannot say where its last line ends; the status as a *filled pill*
+carrying the type's octicon (green `Open`, purple `Merged`, red `Closed`, grey
+`Draft`); then, under a separator, the opening of the body, and for a pull
+request the `base ← head` pair as two pills. Under a second separator, the part
+that is about people rather than about the thing: the labels as pills in
+GitHub's own label colours; `Assignees`; for pull requests `Reviewers`, each
+with the verdict beside them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a grey
 speech bubble for `COMMENTED`, a hollow circle for a review that has been
 requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
 1 failing`.
@@ -282,6 +293,18 @@ costs one `GetFileAttributesEx` and one decode attempt rather than one per
 frame. A missing or unreadable file falls back to a grey disc with the login's
 initial, which is what every other product does for the same reason.
 
+A **team** review request (`reviewRequests` entries with no `login`, just
+`name`/`slug`) has no user avatar to fall back on, so the enricher resolves
+one instead of leaving it blank: it tries the team's own logo
+(`avatars.githubusercontent.com/t/<id>`, which GitHub itself serves as the
+parent org's logo when the team has no custom one) and falls back to the org
+logo (`github.com/<org>.png`) if that fails outright. The numeric team id
+never changes, so it is looked up once per team ever via `gh api
+orgs/<org>/teams/<slug>` and cached forever in `avatars/.teams.json`,
+separate from the per-login 7-day avatar cache and its `.failed.json`
+backoff. The file lands as `avatars/team-<org>-<slug>.png` and the JSON
+carries it the same way a person's avatar path is carried.
+
 ## The `details` contract
 
 `items[]` may carry a `details` object, filled in by the enricher and passed
@@ -292,14 +315,37 @@ has.
 ```json
 "details": {
   "title": "<the full title, before the row cut it>",
+  "snippet": "<the opening of the body, already plain text, ≤140 chars>",
+  "created_at": "2026-09-16T14:08:39Z",
+  "base": "main",
+  "head": "8-rollouts-targets",
   "author":    {"login": "dovyski", "avatar": "<absolute path to a local png>"},
   "assignees": [{"login": "…", "avatar": "…"}],
   "labels":    [{"name": "bug", "color": "d73a4a"}],
-  "reviews":   [{"login": "…", "avatar": "…", "state": "APPROVED|CHANGES_REQUESTED|COMMENTED|PENDING"}],
+  "reviews":   [{"login": "…", "avatar": "…", "state": "APPROVED|CHANGES_REQUESTED|COMMENTED|PENDING",
+                 "display": "Copilot", "icon": "copilot"}],
   "review_requests": [{"login": "…", "avatar": "…"}],
   "checks":    {"total": 6, "failing": 1, "pending": 1}
 }
 ```
+
+`snippet` is the producer's job, not the panel's: the markdown is already
+reduced to plain text — fences, headings, emphasis and link targets gone, inline
+code keeping what is inside the backticks — and already cut, with an ellipsis
+where it was cut. The panel wraps it and nothing else. `created_at` is ISO 8601
+and is shown as `Sep 16`, with the year once it is not this one. `base` and
+`head` are branch names, pull requests only, drawn as two pills with the longer
+names cut out of the *middle* so both the number a branch starts with and the
+words it ends with survive.
+
+A person — in `author`, `assignees`, `reviews` or `review_requests` alike — may
+carry two more fields. `display` is what to show instead of the login, and
+`icon` names a glyph to draw in place of the avatar file; the only one the panel
+knows is `copilot`, drawn as GitHub's own mark on a dark disc. Both exist for
+the same reason: a bot's login belongs to whoever registered the app
+(`copilot-pull-request-reviewer` reviewing, `app/copilot-swe-agent` assigned,
+`Copilot` merely requested — one reviewer, three names, each wider than the
+column). The panel does not pattern-match logins; the producer says what to show.
 
 `reviews` is the latest review per reviewer; `review_requests` are the ones who
 have not reviewed yet, and they are merged into the `Reviewers` list as

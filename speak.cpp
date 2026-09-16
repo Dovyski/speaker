@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -2663,6 +2664,14 @@ struct PanPerson {
     std::string login;
     std::string avatar;   // absolute path to a local PNG
     std::string state;    // reviews only: APPROVED / CHANGES_REQUESTED / ...
+    // What a human calls them, and a built-in glyph to draw instead of the
+    // avatar file. A bot's raw login (`copilot-pull-request-reviewer`) is an
+    // implementation detail of whoever registered the app, and it is wider than
+    // the column: the producer says what to *show*, the panel does not guess.
+    std::string display;
+    std::string icon;     // "copilot", or empty for the avatar
+
+    const std::string& Name() const { return display.empty() ? login : display; }
 };
 
 struct PanLabel {
@@ -2673,6 +2682,11 @@ struct PanLabel {
 struct PanDetails {
     bool                   have = false;
     std::string            title;
+    // The first sentences of the body, already reduced to plain text by the
+    // enricher, and the three facts GitHub's own hover card leads with.
+    std::string            snippet;
+    std::string            created_at;   // ISO 8601
+    std::string            base, head;   // pull requests only
     PanPerson              author;
     std::vector<PanPerson> assignees, reviews, review_requests;
     std::vector<PanLabel>  labels;
@@ -3040,6 +3054,15 @@ constexpr const char* kOctLink =
 constexpr const char* kOctFileDirectory =
     "M0 2.75C0 1.784.784 1 1.75 1H5c.55 0 1.07.26 1.4.7l.9 1.2a.25.25 0 0 0 .2.1h6.75c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Z"
     "m1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H7.5c-.55 0-1.07-.26-1.4-.7l-.9-1.2a.25.25 0 0 0-.2-.1Z";
+// Drawn where a person's avatar would be. The body is one path whose visor is a
+// counter-wound hole; the eyes are a second path, filled — nonzero winding gets
+// both right, so no even-odd flag is needed here.
+constexpr const char* kOctCopilot =
+    "M7.998 15.035c-4.562 0-7.873-2.914-7.998-3.749V9.338c.085-.628.677-1.686 1.588-2.065.013-.07.024-.143.036-.218.029-.183.06-.384.126-.612-.201-.508-.254-1.084-.254-1.656 0-.87.128-1.769.693-2.484.579-.733 1.494-1.124 2.724-1.261 1.206-.134 2.262.034 2.944.765.05.053.096.108.139.165.044-.057.094-.112.143-.165.682-.731 1.738-.899 2.944-.765 1.23.137 2.145.528 2.724 1.261.566.715.693 1.614.693 2.484 0 .572-.053 1.148-.254 1.656.066.228.098.429.126.612.012.076.024.148.037.218.924.385 1.522 1.471 1.591 2.095v1.872c0 .766-3.351 3.795-8.002 3.795Zm0-1.485c2.28 0 4.584-1.11 5.002-1.433V7.862l-.023-.116c-.49.21-1.075.291-1.727.291-1.146 0-2.059-.327-2.71-.991A3.222 3.222 0 0 1 8 6.303a3.24 3.24 0 0 1-.544.743c-.65.664-1.563.991-2.71.991-.652 0-1.236-.081-1.727-.291l-.023.116v4.255c.419.323 2.722 1.433 5.002 1.433ZM6.762 2.83c-.193-.206-.637-.413-1.682-.297-1.019.113-1.479.404-1.713.7-.247.312-.369.789-.369 1.554 0 .793.129 1.171.308 1.371.162.181.519.379 1.442.379.853 0 1.339-.235 1.638-.54.315-.322.527-.827.617-1.553.117-.935-.037-1.395-.241-1.614Zm4.155-.297c-1.044-.116-1.488.091-1.681.297-.204.219-.359.679-.242 1.614.091.726.303 1.231.618 1.553.299.305.784.54 1.638.54.922 0 1.28-.198 1.442-.379.179-.2.308-.578.308-1.371 0-.765-.123-1.242-.37-1.554-.233-.296-.693-.587-1.713-.7Z"
+    "M6.25 9.037a.75.75 0 0 1 .75.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 .75-.75Zm4.25.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 1.5 0Z";
+// A pull request's base and head, on the branch pills.
+constexpr const char* kOctGitBranch =
+    "M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z";
 
 struct PanGlyph {
     const char* path;
@@ -3047,6 +3070,21 @@ struct PanGlyph {
 };
 
 bool PanelIsQuestion(const PanelItem& item) { return item.kind == "question"; }
+
+// True for "", "#137", "#0" — the placeholder a chat message leaves behind
+// when it links a PR/issue with just its number as the visible text
+// (`[#137](url)`). The row's real title lives in `details.title` once the
+// enricher has fetched it; this is what decides whether that fetched title
+// should stand in for the one the producer stored.
+bool PanelIsBareHashTitle(const std::string& s) {
+    if (s.empty()) return true;
+    if (s[0] != '#') return false;
+    if (s.size() == 1) return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    }
+    return true;
+}
 
 PanGlyph PanelGlyphFor(const PanelItem& item) {
     // A question an agent is waiting on is the one row that is about *you*, so it
@@ -3552,6 +3590,10 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             // dropped entirely rather than shown as three characters and a dot.
             const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
             std::string title = item.title;
+            if (PanelIsBareHashTitle(title) && item.details.have &&
+                !item.details.title.empty()) {
+                title = item.details.title;
+            }
             if (title == item.Label()) title.clear();
             if (!title.empty() && rest >= PanScale(56)) r.title = PanLine(title, false, rest);
             r.h = std::max({r.label.h, r.title.h, icon}) + PanScale(kPanRowGap);
@@ -4328,6 +4370,10 @@ constexpr int   kPopSmallPx = 11;    // label pills
 constexpr int   kPopTitleLines = 3;
 constexpr int   kPopQuestionLines = 12;   // a question is the text, not a handle
 constexpr int   kPopUrlLines = 4;         // a link's whole URL, broken by hand
+constexpr int   kPopSnippetLines = 4;     // the opening of the body, no more
+constexpr int   kPopSepGap  = 9;          // above and below a separator rule
+constexpr int   kPopBranchPad = 7;        // inside a branch pill, either side
+constexpr int   kPopBranchMax = 22;       // characters before a branch is cut
 // A copy is invisible: the clipboard says nothing, and the row it came from
 // looks exactly as it did. Long enough to be read, short enough that the row
 // is a question again before you look for it.
@@ -4487,11 +4533,49 @@ void StampInitial(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, i
     }
 }
 
+// A person the producer gave a built-in `icon` for instead of an avatar file:
+// a dark disc with a light glyph on it, which is how GitHub itself draws the
+// Copilot reviewer, and which survives having no network to download from.
+void StampPersonIcon(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int d,
+                     const char* glyph) {
+    constexpr Rgb kDisc{0x16 / 255.f, 0x1b / 255.f, 0x22 / 255.f};
+    for (int y = 0; y < d; ++y) {
+        const int cy = y0 + y;
+        if (cy < 0 || cy >= ch) continue;
+        for (int x = 0; x < d; ++x) {
+            const int cx = x0 + x;
+            if (cx < 0 || cx >= cw) continue;
+            const float c = d * 0.5f, r = c - 0.5f;
+            const float dx = x + 0.5f - c, dy = y + 0.5f - c;
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            const float a = 1.f - SmoothStep(-0.7f, 0.7f, dist - r);
+            if (a <= 0.004f) continue;
+            uint32_t& dst = (*deco)[static_cast<size_t>(cy) * cw + cx];
+            dst = BlendOver(Pack(kDisc, a), dst);
+            // a hairline, so a near-black disc still has an edge on a dark card
+            const float ring = 1.f - SmoothStep(-0.9f, 0.9f, std::fabs(dist - r) - 0.6f);
+            if (ring > 0.004f) dst = BlendOver(Pack(kPanLine, ring * 0.9f), dst);
+        }
+    }
+    // inset, so the glyph sits inside the disc rather than touching its rim
+    const int g = std::max(8, d * 3 / 4);
+    StampOcticon(deco, cw, ch, x0 + (d - g) / 2, y0 + (d - g) / 2, g, glyph, kPanTextA);
+}
+
+const char* PanPersonIcon(const std::string& name) {
+    if (name == "copilot") return kOctCopilot;
+    return nullptr;
+}
+
 void StampAvatar(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, int d,
                  const PanPerson& who) {
+    if (const char* glyph = PanPersonIcon(who.icon)) {
+        StampPersonIcon(deco, cw, ch, x0, y0, d, glyph);
+        return;
+    }
     const Avatar& av = AvatarFor(who.avatar, d);
     if (!av.ok) {
-        StampInitial(deco, cw, ch, x0, y0, d, who.login);
+        StampInitial(deco, cw, ch, x0, y0, d, who.Name());
         return;
     }
     for (int y = 0; y < d; ++y) {
@@ -4570,6 +4654,88 @@ std::vector<std::string> PopUrlLines(const std::string& url, int inner, int max_
     return out;
 }
 
+// `2026-09-16T14:08:39Z` as GitHub writes it on a hover card: `Sep 16`, and the
+// year too once it is not this one. Anything unparseable is left out rather than
+// guessed at — a wrong date is worse than no date.
+std::string PopWhen(const std::string& iso) {
+    if (iso.size() < 10) return std::string();
+    int y = 0, m = 0, d = 0;
+    if (std::sscanf(iso.c_str(), "%4d-%2d-%2d", &y, &m, &d) != 3) return std::string();
+    if (m < 1 || m > 12 || d < 1 || d > 31) return std::string();
+    static const char* kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    std::string out = std::string(kMonths[m - 1]) + " " + std::to_string(d);
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    if (y != now.wYear) out += ", " + std::to_string(y);
+    return out;
+}
+
+// A branch name is one word, so it cannot be wrapped and its end is the half
+// that identifies it (`8-rollouts-targets`). Cut out of the *middle*, which
+// keeps both the issue number it starts with and the words it ends with.
+std::string PopMidTrim(const std::string& s, size_t max_len) {
+    if (s.size() <= max_len || max_len < 6) return s;
+    const size_t head = (max_len - 1) / 2;
+    const size_t tail = max_len - 1 - head;
+    return s.substr(0, head) + "…" + s.substr(s.size() - tail);
+}
+
+// Greedy word wrap, measured for real. DT_WORDBREAK would do this in one call,
+// but it hands back a single mask — and the title needs its *last* line to end
+// where the muted `#N` begins, which only per-line masks can say.
+std::vector<std::string> PopWrap(const std::string& text, bool bold, int px, int inner,
+                                 int max_lines, int last_reserve) {
+    std::vector<std::string> out;
+    if (text.empty() || inner <= 0) return out;
+    std::vector<std::string> words;
+    for (size_t i = 0; i < text.size();) {
+        while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        const size_t s = i;
+        while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        if (i > s) words.push_back(text.substr(s, i - s));
+    }
+    const auto width = [&](const std::string& s) {
+        return PopLine(s, bold, 1 << 20, px).w;
+    };
+    std::string line;
+    size_t      taken = 0;   // words that made it onto a line
+    for (size_t i = 0; i < words.size(); ++i) {
+        const bool last_allowed = static_cast<int>(out.size()) + 1 >= max_lines;
+        const int  budget = inner - (last_allowed ? last_reserve : 0);
+        const std::string candidate = line.empty() ? words[i] : line + " " + words[i];
+        if (line.empty() || width(candidate) <= budget) {
+            line = candidate;
+            ++taken;
+            continue;
+        }
+        out.push_back(line);
+        line.clear();
+        if (static_cast<int>(out.size()) >= max_lines) break;
+        --i;   // retry this word on the fresh line
+    }
+    if (!line.empty() && static_cast<int>(out.size()) < max_lines) out.push_back(line);
+    // Whatever did not fit is signalled where it was cut, not silently dropped.
+    if (!out.empty()) {
+        if (taken < words.size()) {
+            const int budget = inner - last_reserve;
+            // whole UTF-8 characters, or the tail turns into a replacement mark
+            const auto pop_char = [](std::string* s) {
+                while (!s->empty()) {
+                    const unsigned char c = static_cast<unsigned char>(s->back());
+                    s->erase(s->size() - 1);
+                    if ((c & 0xC0) != 0x80) return;
+                }
+            };
+            while (!out.back().empty() && width(out.back() + "…") > budget) {
+                pop_char(&out.back());
+            }
+            out.back() += "…";
+        }
+    }
+    return out;
+}
+
 void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                       bool copied = false) {
     *out = PanelCard{};
@@ -4588,7 +4754,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
     // to stamp, then allocate and stamp. Cheaper than guessing the height, and
     // it keeps every y in one place.
     struct Piece {
-        enum class T { Text, Icon, Avatar, Pill } t = T::Text;
+        enum class T { Text, Icon, Avatar, Pill, Rule } t = T::Text;
         TextMask    mask;
         int         x = 0, y = 0, w = 0, h = 0;
         bool        dim = false;
@@ -4610,11 +4776,25 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
         pieces.push_back(std::move(p));
     };
 
-    // 1. the handle line: glyph, repo#N, the status in words. A question has
-    // neither — its handle *is* its text — so it says what it is instead.
     const bool question = PanelIsQuestion(item);
     const bool link     = item.kind == "link";
-    {
+    const bool hovercard = !question && !link;
+
+    const auto rule = [&]() {
+        Piece p;
+        p.t = Piece::T::Rule;
+        p.x = 0;
+        p.y = y;
+        p.w = inner;
+        p.h = std::max(1, PanScale(1));
+        const int h = p.h;
+        pieces.push_back(std::move(p));
+        y += h;
+    };
+
+    // 1. the handle line: glyph, repo#N, the status in words. A question has
+    // neither — its handle *is* its text — so it says what it is instead.
+    if (!hovercard) {
         const PanGlyph  g     = PanelGlyphFor(item);
         const TextMask  label = PopLine(question ? "Pending question"
                                                  : (link ? "Link" : item.Label()), true,
@@ -4638,8 +4818,128 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
         y += row_h + gap;
     }
 
-    // 2. the full title, which is the whole point of hovering
-    {
+    // 2. GitHub's own hover card, in its own order: where it lives and when it
+    // was opened, the full title with its number trailing it, then the state as
+    // a pill rather than as a word at the end of a line.
+    if (hovercard) {
+        // the header: `owner/repo on Sep 16`
+        {
+            std::string head = item.repo;
+            const std::string when = PopWhen(d.created_at);
+            if (!when.empty()) head += head.empty() ? when : (" on " + when);
+            if (!head.empty()) {
+                const TextMask m = PopLine(head, false, inner, kPopSmallPx);
+                text(m, 0, m.h, true);
+                y += m.h + PanScale(5);
+            }
+        }
+
+        // the title, bold and wrapped, with `#N` muted at the end of its last
+        // line — which is why the wrap is done by hand rather than by DT_WORDBREAK
+        {
+            const std::string t = d.have && !d.title.empty() ? d.title : item.title;
+            const std::string num =
+                item.number > 0 ? ("  #" + std::to_string(item.number)) : std::string();
+            const TextMask nm =
+                num.empty() ? TextMask{} : PopLine(num, false, inner, kPopLinePx);
+            const std::vector<std::string> lines =
+                PopWrap(t, true, kPopLinePx, inner, kPopTitleLines, nm.w);
+            for (size_t i = 0; i < lines.size(); ++i) {
+                const TextMask m = PopLine(lines[i], true, inner, kPopLinePx);
+                const int row_h = std::max(m.h, i + 1 == lines.size() ? nm.h : 0);
+                text(m, 0, row_h, false);
+                if (nm.w && i + 1 == lines.size()) text(nm, m.w, row_h, true);
+                y += row_h;
+            }
+            if (lines.empty() && nm.w) { text(nm, 0, nm.h, true); y += nm.h; }
+            if (!lines.empty() || nm.w) y += PanScale(7);
+        }
+
+        // the state, as GitHub's filled pill
+        {
+            const PanGlyph g = PanelGlyphFor(item);
+            const std::string word = PanStatusWord(item.status);
+            if (!word.empty()) {
+                const int  px = PanScale(9);
+                const TextMask m = PopLine(word, true, inner, kPopSmallPx);
+                Piece p;
+                p.t      = Piece::T::Pill;
+                p.mask   = m;
+                p.glyph  = g.path;
+                p.x      = 0;
+                p.y      = y;
+                p.w      = m.w + icon + PanScale(5) + 2 * px;
+                p.h      = m.h + PanScale(7);
+                p.colour = g.colour;
+                const int h = p.h;
+                pieces.push_back(std::move(p));
+                y += h + gap;
+            }
+        }
+
+        // the opening of the body, as plain text the enricher already reduced
+        if (!d.snippet.empty()) {
+            rule();
+            y += PanScale(kPopSepGap);
+            const std::vector<std::string> lines =
+                PopWrap(d.snippet, false, kPopSmallPx, inner, kPopSnippetLines, 0);
+            for (const std::string& l : lines) {
+                const TextMask m = PopLine(l, false, inner, kPopSmallPx);
+                text(m, 0, m.h, true);
+                y += m.h;
+            }
+            if (!lines.empty()) y += gap;
+        }
+
+        // where it merges into, and what from
+        if (!d.base.empty() || !d.head.empty()) {
+            const int bp = PanScale(kPopBranchPad);
+            const TextMask arrow = PopLine("←", false, inner, kPopSmallPx);
+            const TextMask bm = d.base.empty()
+                                    ? TextMask{}
+                                    : PopLine(PopMidTrim(d.base, kPopBranchMax), false,
+                                              inner, kPopSmallPx);
+            const TextMask hm = d.head.empty()
+                                    ? TextMask{}
+                                    : PopLine(PopMidTrim(d.head, kPopBranchMax), false,
+                                              inner, kPopSmallPx);
+            const int pill_h = std::max(bm.h, hm.h) + PanScale(6);
+            const int row_h  = std::max({pill_h, icon, arrow.h});
+            int x = 0;
+            {
+                Piece p;
+                p.t      = Piece::T::Icon;
+                p.glyph  = kOctGitBranch;
+                p.colour = kPanTextB;
+                p.x      = x;
+                p.y      = y + (row_h - icon) / 2;
+                p.w      = icon;
+                pieces.push_back(std::move(p));
+                x += icon + PanScale(7);
+            }
+            const auto branch_pill = [&](const TextMask& m) {
+                if (!m.w) return;
+                Piece p;
+                p.t      = Piece::T::Pill;
+                p.mask   = m;
+                p.x      = x;
+                p.y      = y + (row_h - pill_h) / 2;
+                p.w      = m.w + 2 * bp;
+                p.h      = pill_h;
+                p.colour = kPanHover;
+                const int w = p.w;
+                pieces.push_back(std::move(p));
+                x += w + PanScale(6);
+            };
+            branch_pill(bm);
+            if (arrow.w && bm.w && hm.w) {
+                text(arrow, x, row_h, true);
+                x += arrow.w + PanScale(6);
+            }
+            branch_pill(hm);
+            y += row_h + gap;
+        }
+    } else {
         if (link) {
             const std::vector<std::string> lines =
                 PopUrlLines(item.url, inner, kPopUrlLines);
@@ -4673,19 +4973,12 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
     }
 
     if (d.have && !question && !link) {
-        // 3. the author
-        if (!d.author.login.empty()) {
-            const TextMask m = PopLine(d.author.login, false, inner - av - PanScale(8));
-            const int row_h = std::max(av, m.h);
-            Piece p;
-            p.t   = Piece::T::Avatar;
-            p.who = d.author;
-            p.x   = 0;
-            p.y   = y + (row_h - av) / 2;
-            p.w   = av;
-            pieces.push_back(std::move(p));
-            text(m, av + PanScale(8), row_h, true);
-            y += row_h + gap;
+        // 3. everything below is about *people and process* rather than about
+        // the thing itself, and GitHub separates the two.
+        if (!d.labels.empty() || !d.assignees.empty() || !d.reviews.empty() ||
+            !d.review_requests.empty() || d.have_checks) {
+            rule();
+            y += PanScale(kPopSepGap);
         }
 
         // 4. labels, as pills that wrap
@@ -4732,7 +5025,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 const PanPerson& who = list[i];
                 const int  glyph_w = with_state ? icon + PanScale(6) : 0;
                 const TextMask m =
-                    PopLine(who.login, false, inner - av - PanScale(8) - glyph_w);
+                    PopLine(who.Name(), false, inner - av - PanScale(8) - glyph_w);
                 const int row_h = std::max(av, m.h);
                 Piece p;
                 p.t   = Piece::T::Avatar;
@@ -4821,6 +5114,11 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
             case Piece::T::Avatar:
                 StampAvatar(&out->deco, out->w, out->h, ox + p.x, oy + p.y, p.w, p.who);
                 break;
+            case Piece::T::Rule:
+                PanFillRect(&out->deco, out->w, out->h,
+                            RECT{ox + p.x, oy + p.y, ox + p.x + p.w, oy + p.y + p.h},
+                            kPanLine, 0.9f);
+                break;
             case Piece::T::Pill: {
                 const float r = p.h * 0.5f;
                 for (int py = 0; py < p.h; ++py) {
@@ -4841,11 +5139,22 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 // The pill's text is coloured by its background, so it cannot ride
                 // the shared ink layers.
                 const Rgb ink = PopPillInk(p.colour);
+                // A state pill carries its octicon too: the two are centred as one
+                // group, so the pair reads as a single mark rather than as a glyph
+                // that happens to sit beside a word.
+                const int g_sz  = p.glyph ? PanScale(kPanIcon) : 0;
+                const int g_gap = p.glyph ? PanScale(5) : 0;
+                const int used  = g_sz + g_gap + p.mask.w;
+                const int x_at  = p.x + (p.w - used) / 2;
+                if (p.glyph) {
+                    StampOcticon(&out->deco, out->w, out->h, ox + x_at,
+                                 oy + p.y + (p.h - g_sz) / 2, g_sz, p.glyph, ink);
+                }
                 for (int my = 0; my < p.mask.h; ++my) {
                     const int cy = oy + p.y + (p.h - p.mask.h) / 2 + my;
                     if (cy < 0 || cy >= out->h) continue;
                     for (int mx = 0; mx < p.mask.w; ++mx) {
-                        const int cx = ox + p.x + (p.w - p.mask.w) / 2 + mx;
+                        const int cx = ox + x_at + g_sz + g_gap + mx;
                         if (cx < 0 || cx >= out->w) continue;
                         const uint8_t a = p.mask.a[static_cast<size_t>(my) * p.mask.w + mx];
                         if (!a) continue;
@@ -5944,9 +6253,11 @@ Rgb ParseHexColour(const std::string& hex, const Rgb& fallback) {
 PanPerson ParsePerson(const JsonVal& v) {
     PanPerson who;
     if (v.t != JsonVal::T::Obj) return who;
-    who.login  = v.GetStr("login");
-    who.avatar = v.GetStr("avatar");
-    who.state  = v.GetStr("state");
+    who.login   = v.GetStr("login");
+    who.avatar  = v.GetStr("avatar");
+    who.state   = v.GetStr("state");
+    who.display = PanTrim(v.GetStr("display"));
+    who.icon    = v.GetStr("icon");
     return who;
 }
 
@@ -5964,7 +6275,11 @@ void ParsePeople(const JsonVal* arr, std::vector<PanPerson>* out) {
 void ParseDetails(const JsonVal* v, PanDetails* out) {
     if (!v || v->t != JsonVal::T::Obj) return;
     out->have  = true;
-    out->title = PanTrim(v->GetStr("title"));
+    out->title      = PanTrim(v->GetStr("title"));
+    out->snippet    = PanTrim(v->GetStr("snippet"));
+    out->created_at = PanTrim(v->GetStr("created_at"));
+    out->base       = PanTrim(v->GetStr("base"));
+    out->head       = PanTrim(v->GetStr("head"));
     if (const JsonVal* a = v->Find("author")) out->author = ParsePerson(*a);
     ParsePeople(v->Find("assignees"), &out->assignees);
     ParsePeople(v->Find("reviews"), &out->reviews);
@@ -6217,6 +6532,16 @@ PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string&
                    "one-shot highlight and the quiet-hours rule behind it"
                  : "MCP P14: bring the MCP tool surface to parity with the chat tools, "
                    "including the papers and calendar handlers";
+    d.snippet = pr ? "Adds the one-shot reminder toast to the calendar, behind the "
+                     "quiet-hours rule, and the migration that carries the per-user "
+                     "preference. Fixes #1370."
+                   : "The chat tools and the MCP tools have drifted: papers and "
+                     "calendar are reachable from one and not the other.";
+    d.created_at = "2026-09-16T14:08:39Z";
+    if (pr) {
+        d.base = "main";
+        d.head = "1370-calendar-reminder-toast-quiet-hours";
+    }
     d.author = PanPerson{"dovyski", av_a, ""};
     d.labels = {
         PanLabel{"enhancement", ParseHexColour("a2eeef", kOctGrey)},
@@ -6230,7 +6555,10 @@ PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string&
             PanPerson{"renata", "", "CHANGES_REQUESTED"},
             PanPerson{"joao", av_a, "COMMENTED"},
         };
-        d.review_requests = {PanPerson{"ezequiel", "", ""}};
+        d.reviews.push_back(
+            PanPerson{"copilot-pull-request-reviewer", "", "COMMENTED", "Copilot", "copilot"});
+        d.review_requests = {PanPerson{"ezequiel", "", ""},
+                              PanPerson{"dev", av_a, "", "dev", ""}};
         d.have_checks = true;
         d.total   = 6;
         d.failing = 1;
