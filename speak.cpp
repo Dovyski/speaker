@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -3070,6 +3071,21 @@ struct PanGlyph {
 
 bool PanelIsQuestion(const PanelItem& item) { return item.kind == "question"; }
 
+// True for "", "#137", "#0" — the placeholder a chat message leaves behind
+// when it links a PR/issue with just its number as the visible text
+// (`[#137](url)`). The row's real title lives in `details.title` once the
+// enricher has fetched it; this is what decides whether that fetched title
+// should stand in for the one the producer stored.
+bool PanelIsBareHashTitle(const std::string& s) {
+    if (s.empty()) return true;
+    if (s[0] != '#') return false;
+    if (s.size() == 1) return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    }
+    return true;
+}
+
 PanGlyph PanelGlyphFor(const PanelItem& item) {
     // A question an agent is waiting on is the one row that is about *you*, so it
     // gets the amber the review states use for "your move" — and keeps it
@@ -3574,6 +3590,10 @@ void BuildPanelCard(PanelCard* out, const std::string& summary,
             // dropped entirely rather than shown as three characters and a dot.
             const int rest = text_w - r.label.w - PanScale(kPanLabelGap);
             std::string title = item.title;
+            if (PanelIsBareHashTitle(title) && item.details.have &&
+                !item.details.title.empty()) {
+                title = item.details.title;
+            }
             if (title == item.Label()) title.clear();
             if (!title.empty() && rest >= PanScale(56)) r.title = PanLine(title, false, rest);
             r.h = std::max({r.label.h, r.title.h, icon}) + PanScale(kPanRowGap);
@@ -6537,7 +6557,8 @@ PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string&
         };
         d.reviews.push_back(
             PanPerson{"copilot-pull-request-reviewer", "", "COMMENTED", "Copilot", "copilot"});
-        d.review_requests = {PanPerson{"ezequiel", "", ""}};
+        d.review_requests = {PanPerson{"ezequiel", "", ""},
+                              PanPerson{"dev", av_a, "", "dev", ""}};
         d.have_checks = true;
         d.total   = 6;
         d.failing = 1;
