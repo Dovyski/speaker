@@ -11,6 +11,26 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ### Added
 
+- **The hover popover is GitHub's hover card now.** Same order, same marks: a
+  muted `owner/repo on Sep 16` header, the full title in bold with its `#N`
+  trailing it, the state as a filled pill carrying its own octicon, the opening
+  of the body as plain text, and — for a pull request — the `base ← head` pair
+  it moves between, cut out of the middle when a branch name is too long to fit.
+  Assignees, reviewers and checks are unchanged, below a separator. The author
+  row is gone, since the card this now matches does not carry one. The enricher
+  asks `gh` for `body`, `createdAt`, `baseRefName` and `headRefName` in the call
+  it was already making, so nothing costs an extra request, and it is the
+  enricher that reduces the markdown to a sentence: `details.snippet` arrives
+  already plain and already capped at 140 characters.
+- **Copilot is called `Copilot`.** It arrives from `gh` as
+  `copilot-pull-request-reviewer` when it reviews, as `copilot-swe-agent` or
+  `app/copilot-swe-agent` when it is assigned, and as `Copilot` when it is only
+  requested — three names for one reviewer, each wider than the column. A person
+  in `details` may now carry `display` (what to show) and `icon` (a glyph to draw
+  in place of the avatar), the panel prefers both, and Copilot gets its own
+  octicon on a dark disc. Any other `…[bot]` login keeps its avatar and simply
+  loses the `[bot]`.
+
 - **A `×` on the attention panel's card hides it.** The card is topmost and
   re-asserted on every foreground change, so a terminal covered by whatever you
   were actually working in still floated its panel over the lot, and minimizing
