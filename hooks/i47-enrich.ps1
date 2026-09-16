@@ -253,7 +253,7 @@ function Invoke-GhFetch([string[]]$keys) {
             }
             $p.Dispose()
         } catch { $err = $_.Exception.Message }
-        [pscustomobject]@{ key = $j.key; kind = $j.kind; code = $code; out = $out; err = $err }
+        [pscustomobject]@{ key = $j.key; kind = $j.kind; repo = $j.repo; code = $code; out = $out; err = $err }
     })
 }
 
@@ -297,6 +297,34 @@ try {
         if ($fc) { foreach ($p in $fc.PSObject.Properties) { $avatarFail[$p.Name] = [string]$p.Value } }
     }
 } catch { Add-Err 'avatar-fail-load' $_ }
+
+# a team's numeric id never changes, so it is looked up once ever (not on the
+# 7-day avatar TTL) and kept in its own file, separate from the per-run
+# per-login avatar backoff above
+$TeamIdFile = Join-Path $AvatarDir '.teams.json'
+$teamIds = @{}         # "org/slug" -> databaseId (0 = lookup failed, still cached)
+$teamIdsDirty = $false
+try {
+    if (Test-Path -LiteralPath $TeamIdFile) {
+        $tc = Read-JsonFile $TeamIdFile
+        if ($tc) { foreach ($p in $tc.PSObject.Properties) { $teamIds[$p.Name] = [int]$p.Value } }
+    }
+} catch { Add-Err 'team-id-load' $_ }
+
+function Get-TeamId([string]$org, [string]$slug) {
+    $k = '{0}/{1}' -f $org, $slug
+    if ($teamIds.ContainsKey($k)) { return $teamIds[$k] }
+    $id = 0
+    try {
+        if ($ghExePath) {
+            $out = & $ghExePath api ('orgs/{0}/teams/{1}' -f $org, $slug) --jq '.id' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) { $id = [int]([string]$out).Trim() }
+        }
+    } catch {}
+    $teamIds[$k] = $id
+    $script:teamIdsDirty = $true
+    return $id
+}
 
 function Add-AvatarSize([string]$url) {
     if (-not $url) { return $null }
@@ -344,28 +372,30 @@ function Save-AvatarPng([byte[]]$bytes, [string]$path) {
     } catch { return $false }
     return $true
 }
-function Get-Avatar($u) {
-    $login = ''
-    try { $login = [string]$u.login } catch {}
-    if (-not $login) { return $null }
-    if ($avatarDone.ContainsKey($login)) { return $avatarDone[$login] }
-    if ($login -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$') { $avatarDone[$login] = $null; return $null }
 
-    $path = Join-Path $AvatarDir ("{0}.png" -f $login)
+# Shared by `Get-Avatar` (a person, keyed by login) and `Get-TeamAvatar` (a
+# team, keyed by `team:org/slug`): the cache dir, the 7-day TTL, the
+# .failed.json backoff and the download/PNG-normalize dance are the same for
+# both — only the cache key, the destination path and the candidate URLs
+# differ.
+function Get-AvatarFile([string]$key, [string]$path, [string[]]$urls) {
+    if (-not $key) { return $null }
+    if ($avatarDone.ContainsKey($key)) { return $avatarDone[$key] }
+
     try {
         $fi = Get-Item -LiteralPath $path -ErrorAction Stop
         if ($fi.Length -gt 0 -and ((Now-Utc) - $fi.LastWriteTimeUtc).TotalDays -lt $AvatarMaxAgeD) {
-            $avatarDone[$login] = $fi.FullName
+            $avatarDone[$key] = $fi.FullName
             return $fi.FullName
         }
     } catch {}
 
-    # a login whose avatar could not be fetched is not retried every minute
-    $last = Parse-Utc $avatarFail[$login]
-    if ($last -and ((Now-Utc) - $last).TotalHours -lt $AvatarRetryH) { $avatarDone[$login] = $null; return $null }
+    # a key whose avatar could not be fetched is not retried every minute
+    $last = Parse-Utc $avatarFail[$key]
+    if ($last -and ((Now-Utc) - $last).TotalHours -lt $AvatarRetryH) { $avatarDone[$key] = $null; return $null }
 
-    $url = Get-AvatarUrl $u
-    if (-not $url) { $avatarDone[$login] = $null; return $null }
+    $urls = @($urls | Where-Object { $_ })
+    if (-not $urls) { $avatarDone[$key] = $null; return $null }
     $ok = $false
     try {
         if (-not (Test-Path -LiteralPath $AvatarDir)) { New-Item -ItemType Directory -Force -Path $AvatarDir | Out-Null }
@@ -375,24 +405,62 @@ function Get-Avatar($u) {
             $h.DefaultRequestHeaders.UserAgent.ParseAdd('i47-enrich')
             $script:httpAv = $h
         }
-        $t = $script:httpAv.GetByteArrayAsync($url)
-        if ($t.Wait($AvatarTimeout + 500) -and -not $t.IsFaulted) {
-            $ok = Save-AvatarPng $t.Result $path
+        foreach ($url in $urls) {
+            try {
+                $t = $script:httpAv.GetByteArrayAsync($url)
+                if ($t.Wait($AvatarTimeout + 500) -and -not $t.IsFaulted) {
+                    $ok = Save-AvatarPng $t.Result $path
+                }
+            } catch {}
+            if ($ok) { break }
         }
     } catch {}
 
     if ($ok) {
         $script:avatarNew++
-        if ($avatarFail.ContainsKey($login)) { $avatarFail.Remove($login); $script:avatarDirty = $true }
-        $avatarDone[$login] = $path
+        if ($avatarFail.ContainsKey($key)) { $avatarFail.Remove($key); $script:avatarDirty = $true }
+        $avatarDone[$key] = $path
         return $path
     }
     # the stale copy is better than a grey disc
-    if (Test-Path -LiteralPath $path) { $avatarDone[$login] = $path; return $path }
-    $avatarFail[$login] = Stamp
+    if (Test-Path -LiteralPath $path) { $avatarDone[$key] = $path; return $path }
+    $avatarFail[$key] = Stamp
     $script:avatarDirty = $true
-    $avatarDone[$login] = $null
+    $avatarDone[$key] = $null
     return $null
+}
+
+function Get-Avatar($u) {
+    $login = ''
+    try { $login = [string]$u.login } catch {}
+    if (-not $login) { return $null }
+    if ($login -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$') { $avatarDone[$login] = $null; return $null }
+    $path = Join-Path $AvatarDir ("{0}.png" -f $login)
+    return Get-AvatarFile $login $path @(Get-AvatarUrl $u)
+}
+
+# A team review request has no `login`, `avatar` or `databaseId` in gh's
+# GraphQL JSON — just `name` and `slug` (`org/team-slug`). GitHub's own UI
+# shows the team's custom avatar when it has one, and the parent org's logo
+# otherwise; `/t/<id>` already serves that fallback server-side, so trying it
+# first and falling back to the org logo covers both cases without a second
+# request in the common one. The numeric id is resolved once per team ever
+# (org/teams API) and cached forever in `avatars/.teams.json`, never per run.
+function Get-TeamAvatar([string]$org, [string]$slug) {
+    if ((-not $org) -or (-not $slug)) { return $null }
+    $teamSlug = $slug
+    if ($teamSlug -match '/') { $teamSlug = $teamSlug.Substring($teamSlug.LastIndexOf('/') + 1) }
+    if ($org -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' -or $teamSlug -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,38}$') { return $null }
+
+    $key  = 'team:{0}/{1}' -f $org, $teamSlug
+    $path = Join-Path $AvatarDir ("team-{0}-{1}.png" -f $org, $teamSlug)
+
+    $urls = New-Object System.Collections.ArrayList
+    $tid  = Get-TeamId $org $teamSlug
+    if ($tid -gt 0) { [void]$urls.Add(('https://avatars.githubusercontent.com/t/{0}?s=64' -f $tid)) }
+    [void]$urls.Add(('https://github.com/{0}.png?size=64' -f [uri]::EscapeDataString($org)))
+
+    return Get-AvatarFile $key $path @($urls)
 }
 
 function Get-Reviews($data, [string]$authorLogin) {
@@ -507,7 +575,7 @@ function Get-Snippet([string]$body) {
     return ($cut.TrimEnd() + '…')
 }
 
-function Build-Details([string]$kind, $data) {
+function Build-Details([string]$kind, $data, [string]$repo) {
     $d = [ordered]@{}
     $d['title'] = [string]$data.title
 
@@ -562,10 +630,21 @@ function Build-Details([string]$kind, $data) {
                 $p = New-Person $rr
                 if ($p) { [void]$req.Add($p) }
             } else {
-                # a requested *team* has a name and a slug and no avatar
+                # a requested *team* has a name and a slug (`org/team-slug`)
+                # and no `login`; the org that owns it is the one that owns
+                # the repo the PR lives in, not necessarily parsed out of slug
                 $nm = ''
                 try { if ($rr.PSObject.Properties['name']) { $nm = [string]$rr.name } } catch {}
-                if ($nm) { [void]$req.Add([ordered]@{ login = $nm; avatar = $null; team = $true }) }
+                if ($nm) {
+                    $slug = ''
+                    try { if ($rr.PSObject.Properties['slug']) { $slug = [string]$rr.slug } } catch {}
+                    if (-not $slug) { $slug = $nm }
+                    $org = ''
+                    if ($repo -and $repo.Contains('/')) { $org = $repo.Substring(0, $repo.IndexOf('/')) }
+                    $av = $null
+                    try { if ($org) { $av = Get-TeamAvatar $org $slug } } catch { Add-Err 'team-avatar' $_ }
+                    [void]$req.Add([ordered]@{ login = $nm; display = $nm; avatar = $av; team = $true })
+                }
             }
         }
         $d['review_requests'] = @($req | Select-Object -First $MaxReviews)
@@ -621,7 +700,7 @@ function Update-CacheFromResults($results) {
             }
             $e['title']      = [string]$data.title
             $e['url']        = [string]$data.url
-            try { $e['details'] = Build-Details $r.kind $data } catch { Add-Err ('details:' + $r.key) $_ }
+            try { $e['details'] = Build-Details $r.kind $data ([string]$r.repo) } catch { Add-Err ('details:' + $r.key) $_ }
             $e['_missing']   = 0
             $e['fetched_at'] = Stamp
             if ($e.ContainsKey('last_error')) { $e.Remove('last_error') }
@@ -818,6 +897,14 @@ try {
         Write-JsonFileAtomic $AvatarFailFile ([pscustomobject]$keep)
     }
 } catch { Add-Err 'avatar-fail-save' $_ }
+try {
+    if ($teamIdsDirty) {
+        if (-not (Test-Path -LiteralPath $AvatarDir)) { New-Item -ItemType Directory -Force -Path $AvatarDir | Out-Null }
+        $keep = [ordered]@{}
+        foreach ($k in ($teamIds.Keys | Sort-Object)) { $keep[$k] = $teamIds[$k] }
+        Write-JsonFileAtomic $TeamIdFile ([pscustomobject]$keep)
+    }
+} catch { Add-Err 'team-id-save' $_ }
 try { if ($httpAv) { $httpAv.Dispose() } } catch {}
 
 foreach ($obj in $changedFiles) {
