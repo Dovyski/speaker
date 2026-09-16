@@ -838,12 +838,16 @@ function Apply-ToObject($obj) {
             $it.status = $st
             $changed = $true
         }
+        # a chat message that links a PR/issue with its number as the visible
+        # text (`[#137](url)`) hands the producer that literal string as the
+        # item's title; it round-trips through the cache below and never gets
+        # a second look, so a bare `#N` is treated the same as no title at all
         $ct = [string]$e['title']
         if ($ct) {
             if (-not $it.PSObject.Properties['title']) {
                 $it | Add-Member -NotePropertyName title -NotePropertyValue $ct
                 $changed = $true
-            } elseif (-not [string]$it.title) {
+            } elseif ((-not [string]$it.title) -or ([string]$it.title -match '^#\d+$')) {
                 $it.title = $ct
                 $changed = $true
             }
