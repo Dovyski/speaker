@@ -209,8 +209,13 @@ that belongs to the icons.
 
 ## Hover: the popover
 
-A row has space for a handle, a glyph and a title with its end cut off.
-Everything else the enricher knows about it goes in a popover: **hover a pull
+A row has space for a handle, a glyph and a title with its end cut off. The
+title it shows there is the item's own `title` field — except when that field
+is empty or is nothing but `#<number>` (a chat message that linked the row
+with its own number as the link text leaves exactly that behind); the row
+then reaches into `details.title`, the one the enricher actually fetched from
+GitHub, rather than repeat the handle a second time. Everything else the
+enricher knows about it goes in a popover: **hover a pull
 request, issue or question row for about a third of a second** and a second card
 opens to the left of the first, aligned with the row that summoned it. Path rows
 have no popover — a directory has nothing else to say.
@@ -287,6 +292,18 @@ mtime *and* diameter — the failures too, so a login whose file never arrived
 costs one `GetFileAttributesEx` and one decode attempt rather than one per
 frame. A missing or unreadable file falls back to a grey disc with the login's
 initial, which is what every other product does for the same reason.
+
+A **team** review request (`reviewRequests` entries with no `login`, just
+`name`/`slug`) has no user avatar to fall back on, so the enricher resolves
+one instead of leaving it blank: it tries the team's own logo
+(`avatars.githubusercontent.com/t/<id>`, which GitHub itself serves as the
+parent org's logo when the team has no custom one) and falls back to the org
+logo (`github.com/<org>.png`) if that fails outright. The numeric team id
+never changes, so it is looked up once per team ever via `gh api
+orgs/<org>/teams/<slug>` and cached forever in `avatars/.teams.json`,
+separate from the per-login 7-day avatar cache and its `.failed.json`
+backoff. The file lands as `avatars/team-<org>-<slug>.png` and the JSON
+carries it the same way a person's avatar path is carried.
 
 ## The `details` contract
 
