@@ -40,6 +40,7 @@ $GhTimeoutMs    = 15000
 $MaxReviews     = 10
 $MaxAssignees   = 6
 $MaxLabels      = 8
+$MaxSnippet     = 140   # characters of the body the popover has room for
 $AvatarDir      = Join-Path $Dir 'avatars'
 $AvatarMaxAgeD  = 7
 $AvatarTimeout  = 5000
@@ -221,9 +222,9 @@ function Invoke-GhFetch([string[]]$keys) {
         # one call feeds both the badge (status) and the popover (details):
         # everything after `url` is P6 material and costs no extra request
         $fields = if ($j.kind -eq 'pr') {
-            'state,isDraft,reviewDecision,statusCheckRollup,mergedAt,title,url,author,assignees,labels,reviews,reviewRequests,updatedAt'
+            'state,isDraft,reviewDecision,statusCheckRollup,mergedAt,title,url,author,assignees,labels,reviews,reviewRequests,updatedAt,body,createdAt,baseRefName,headRefName'
         } else {
-            'state,title,url,author,assignees,labels,updatedAt'
+            'state,title,url,author,assignees,labels,updatedAt,body,createdAt'
         }
         $sub    = if ($j.kind -eq 'pr') { 'pr' } else { 'issue' }
         $out = ''; $err = ''; $code = -1
@@ -443,16 +444,78 @@ function Get-Checks($data) {
     return [ordered]@{ total = $total; failing = $failing; pending = $pending }
 }
 
+# A bot's login is an implementation detail of whoever registered the app, and
+# it is wider than the column it has to fit in: `copilot-pull-request-reviewer`,
+# `dependabot[bot]`, `app/copilot-swe-agent`. The panel is told what to *show*
+# rather than left to guess — display is the login without its bot decoration,
+# and `icon` names a glyph the daemon draws instead of an avatar file. Only
+# Copilot has one, because only Copilot turns up often enough to be recognised
+# by its mark rather than read.
+function Get-Identity([string]$login) {
+    $id = [ordered]@{ display = $null; icon = $null }
+    if (-not $login) { return $id }
+    $name = $login -replace '^app/', ''
+    $name = $name -replace '\[bot\]$', ''
+    if ($name -match '^(?i)copilot(-.*)?$') {
+        $id['display'] = 'Copilot'
+        $id['icon']    = 'copilot'
+        return $id
+    }
+    if ($name -ne $login) { $id['display'] = $name }
+    return $id
+}
+
 function New-Person($u) {
     $login = ''
     try { $login = [string]$u.login } catch {}
     if (-not $login) { return $null }
-    return [ordered]@{ login = $login; avatar = (Get-Avatar $u) }
+    $p = [ordered]@{ login = $login; avatar = (Get-Avatar $u) }
+    $id = Get-Identity $login
+    if ($id['display']) { $p['display'] = $id['display'] }
+    if ($id['icon'])    { $p['icon']    = $id['icon'] }
+    return $p
+}
+
+# Markdown reduced to the sentence a hover card has room for: fenced code,
+# headings, emphasis and comments go; a link keeps its text and loses its target;
+# inline code keeps what is inside the backticks.
+function Get-Snippet([string]$body) {
+    if (-not $body) { return $null }
+    $t = $body -replace "`r`n", "`n"
+    $t = [regex]::Replace($t, '(?s)<!--.*?-->', ' ')
+    $t = [regex]::Replace($t, '(?s)```.*?```', ' ')
+    $t = [regex]::Replace($t, '(?s)<[^>]+>', ' ')
+    $t = [regex]::Replace($t, '!\[([^\]]*)\]\([^)]*\)', ' ')      # images: gone
+    $t = [regex]::Replace($t, '\[([^\]]*)\]\([^)]*\)', '$1')      # links: the text
+    # a heading runs straight into the paragraph under it once the newlines are
+    # gone, so it is given the full stop it never had
+    $t = [regex]::Replace($t, '(?m)^\s{0,3}#{1,6}\s*(.*?)\s*$', '$1.')
+    $t = [regex]::Replace($t, '(?m)^\s{0,3}>\s?', '')             # quotes
+    $t = [regex]::Replace($t, '(?m)^\s{0,3}([-*+]|\d+\.)\s+', '')  # list markers
+    $t = [regex]::Replace($t, '(?m)^\s{0,3}([-*_])\s*\1\s*\1[-*_\s]*$', ' ')  # rules
+    $t = $t -replace '`([^`]*)`', '$1'                            # inline code
+    $t = [regex]::Replace($t, '(\*\*|__|\*|_|~~)', '')            # emphasis
+    $t = [regex]::Replace($t, '(?m)^\s*\.\s*$', ' ')              # an empty heading
+    $t = [regex]::Replace($t, '\s+', ' ').Trim()
+    $t = $t -replace '\.\.(?=\s|$)', '.'                          # a heading that had one
+    if (-not $t) { return $null }
+    if ($t.Length -le $MaxSnippet) { return $t }
+    # cut on a word, not mid-word, when there is one near enough to the limit
+    $cut = $t.Substring(0, $MaxSnippet)
+    $sp  = $cut.LastIndexOf(' ')
+    if ($sp -gt ($MaxSnippet - 25)) { $cut = $cut.Substring(0, $sp) }
+    return ($cut.TrimEnd() + '…')
 }
 
 function Build-Details([string]$kind, $data) {
     $d = [ordered]@{}
     $d['title'] = [string]$data.title
+
+    $snip = Get-Snippet ([string]$data.body)
+    if ($snip) { $d['snippet'] = $snip }
+    $c = Parse-Utc $data.createdAt
+    if ($c) { $d['created_at'] = $c.ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    elseif ($data.createdAt) { $d['created_at'] = [string]$data.createdAt }
 
     $authorLogin = ''
     try { $authorLogin = [string]$data.author.login } catch {}
@@ -475,10 +538,17 @@ function Build-Details([string]$kind, $data) {
     if ($lbl.Count -gt $MaxLabels) { $d['labels_more'] = $lbl.Count - $MaxLabels }
 
     if ($kind -eq 'pr') {
+        if ($data.baseRefName) { $d['base'] = [string]$data.baseRefName }
+        if ($data.headRefName) { $d['head'] = [string]$data.headRefName }
+
         $rev = @(Get-Reviews $data $authorLogin)
         $out = New-Object System.Collections.ArrayList
         foreach ($r in @($rev | Select-Object -First $MaxReviews)) {
-            [void]$out.Add([ordered]@{ login = $r.login; avatar = (Get-Avatar $r.user); state = $r.state })
+            $p = [ordered]@{ login = $r.login; avatar = (Get-Avatar $r.user); state = $r.state }
+            $id = Get-Identity $r.login
+            if ($id['display']) { $p['display'] = $id['display'] }
+            if ($id['icon'])    { $p['icon']    = $id['icon'] }
+            [void]$out.Add($p)
         }
         $d['reviews'] = @($out)
         if ($rev.Count -gt $MaxReviews) { $d['reviews_more'] = $rev.Count - $MaxReviews }
@@ -489,7 +559,8 @@ function Build-Details([string]$kind, $data) {
             $login = ''
             try { if ($rr.PSObject.Properties['login']) { $login = [string]$rr.login } } catch {}
             if ($login) {
-                [void]$req.Add([ordered]@{ login = $login; avatar = (Get-Avatar $rr) })
+                $p = New-Person $rr
+                if ($p) { [void]$req.Add($p) }
             } else {
                 # a requested *team* has a name and a slug and no avatar
                 $nm = ''
