@@ -4679,12 +4679,14 @@ std::vector<std::string> PopWrap(const std::string& text, bool bold, int px, int
         return PopLine(s, bold, 1 << 20, px).w;
     };
     std::string line;
+    size_t      taken = 0;   // words that made it onto a line
     for (size_t i = 0; i < words.size(); ++i) {
         const bool last_allowed = static_cast<int>(out.size()) + 1 >= max_lines;
         const int  budget = inner - (last_allowed ? last_reserve : 0);
         const std::string candidate = line.empty() ? words[i] : line + " " + words[i];
         if (line.empty() || width(candidate) <= budget) {
             line = candidate;
+            ++taken;
             continue;
         }
         out.push_back(line);
@@ -4695,9 +4697,7 @@ std::vector<std::string> PopWrap(const std::string& text, bool bold, int px, int
     if (!line.empty() && static_cast<int>(out.size()) < max_lines) out.push_back(line);
     // Whatever did not fit is signalled where it was cut, not silently dropped.
     if (!out.empty()) {
-        size_t shown = 0;
-        for (const std::string& l : out) shown += l.size() + 1;
-        if (shown < text.size()) {
+        if (taken < words.size()) {
             const int budget = inner - last_reserve;
             // whole UTF-8 characters, or the tail turns into a replacement mark
             const auto pop_char = [](std::string* s) {
