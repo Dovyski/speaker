@@ -159,20 +159,23 @@ the one you are already looking at.
 
 Questions outrank every status in the collapsed pill: while any is open the pill
 reads `N pending` with the amber `question` glyph rather than `N items` and the
-worst badge. A red pill means a machine is unhappy about something; an amber one
-means a machine is waiting for *you*, and only the second will not resolve
-itself.
+worst item's icon. The amber is the one colour on the card that means a machine
+is waiting for *you* — every other icon reports a GitHub state, which will
+resolve itself.
 
 ## Icons and colours
 
 Each row is marked with **GitHub's own icon for its type**, tinted with GitHub's
 own colour for its state — two pieces of information in the space a status dot
-took, and the same glyph the row's page shows:
+took, and the same glyph, in the same colour, the row's page shows. The colour is
+the *state* only (open, draft, merged, closed), never the review or the checks:
+`approved`, `changes_requested` and `checks_failing` are all an open item, and
+all green. They stay in the data; the popover is where they are shown.
 
 | Row | Icon | Colour |
 |---|---|---|
-| issue, any live state | `issue-opened` | green `#347d39`, amber `#c69026` for `changes_requested`, red `#c93c37` for `checks_failing` |
-| pull request, any live state | `git-pull-request` | as above; `approved` stays plain green |
+| issue, any live state | `issue-opened` | green `#347d39` |
+| pull request, any live state (`open`, `approved`, `changes_requested`, `checks_failing`) | `git-pull-request` | green `#347d39` |
 | `draft` | `git-pull-request-draft` | grey `#768390` |
 | `merged` | `git-merge` | purple `#8256d0` |
 | closed issue | `issue-closed` | purple `#8256d0` — GitHub's "completed" |
@@ -183,9 +186,10 @@ took, and the same glyph the row's page shows:
 | a path, or any other numberless item | `file-directory` | grey `#768390` |
 | any other `kind`, with a number | `issue-opened` | by state, as above |
 
-`approved` is left plain green rather than given a tick overlay: at 14 px a
-second mark inside the glyph turns into grit, and a row's job is "which thing,
-roughly how is it doing" — the exact review state is one click away.
+This is GitHub's own split: its lists and hover cards colour a pull request by
+state, and a failing check or a requested change is a separate mark next to it.
+At 14 px there is no room for that second mark inside the glyph, so a row's job is
+"which thing, and is it still open" — the review state is one hover away.
 
 The icons are the 16×16 [Octicons](https://github.com/primer/octicons) (MIT),
 verbatim path data, rasterized in the binary: the path is parsed, its curves and
@@ -221,7 +225,7 @@ opens to the left of the first, aligned with the row that summoned it. Path rows
 have no popover — a directory has nothing else to say.
 
 <p align="center">
-  <img src="../panel-popover-pr.png" width="440" alt="a pull request popover: repo#N, Changes requested, the full title, author, labels, assignees, reviewers with verdicts and a checks line">
+  <img src="../panel-popover-pr.png" width="440" alt="a pull request popover: the repo and date, the full title with #N, a green Open pill with a yellow Changes requested badge, labels, assignees, reviewers with verdicts and a checks line">
   <img src="../panel-popover-issue.png" width="440" alt="an issue popover: repo#N, its state, the full title, author, labels and assignees">
   <img src="../panel-popover-question.png" width="440" alt="a question popover: the amber question mark, Pending question, the whole question text, and click to copy">
   <img src="../panel-popover-link.png" width="440" alt="a link popover: the chain icon, the word Link, and the whole URL over two lines">
@@ -232,14 +236,22 @@ GitHub's own order: a muted `owner/repo on Sep 16`; the **full title** in bold,
 wrapped to at most three lines, with a muted `#N` at the end of its last line —
 which is why the wrap is done by hand rather than by `DT_WORDBREAK`, since a
 single mask cannot say where its last line ends; the status as a *filled pill*
-carrying the type's octicon (green `Open`, purple `Merged`, red `Closed`, grey
-`Draft`); then, under a separator, the opening of the body, and for a pull
+carrying the type's octicon, in the icon's colour and with GitHub's word for the
+state (green `Open` for any live pull request or issue, grey `Draft`, purple
+`Merged`, red `Closed` for a pull request and purple `Closed` for an issue);
+beside it on the same row, the badges that qualify it — today only a yellow
+`Changes requested` (`#e3b341`, GitHub's dark attention colour, as tinted text
+on an 18% fill with a hairline border) on an open pull request whose status is
+`changes_requested` *or* whose `details.review_decision` is `CHANGES_REQUESTED`,
+since a PR with failing checks reports `checks_failing` and would otherwise
+hide its review; then, under a separator, the opening of the body, and for a pull
 request the `base ← head` pair as two pills. Under a second separator, the part
 that is about people rather than about the thing: the labels as pills in
-GitHub's own label colours; `Assignees`; for pull requests `Reviewers`, each
-with the verdict beside them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a grey
-speech bubble for `COMMENTED`, a hollow circle for a review that has been
-requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
+GitHub's own dark-theme label style; `Assignees`; for pull requests `Reviewers`, each
+with the verdict beside them in the marks GitHub's own Reviewers sidebar uses —
+a green check for `APPROVED`, a red `file-diff` for `CHANGES_REQUESTED`, a grey
+speech bubble for `COMMENTED`, a filled amber dot (`#d29922`) for a review that
+has been requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
 1 failing`.
 
 A **question** row gets a shape of its own, because it has neither a `repo#N`
@@ -325,7 +337,8 @@ has.
   "reviews":   [{"login": "…", "avatar": "…", "state": "APPROVED|CHANGES_REQUESTED|COMMENTED|PENDING",
                  "display": "Copilot", "icon": "copilot"}],
   "review_requests": [{"login": "…", "avatar": "…"}],
-  "checks":    {"total": 6, "failing": 1, "pending": 1}
+  "checks":    {"total": 6, "failing": 1, "pending": 1},
+  "review_decision": "CHANGES_REQUESTED"
 }
 ```
 
@@ -350,10 +363,14 @@ column). The panel does not pattern-match logins; the producer says what to show
 `reviews` is the latest review per reviewer; `review_requests` are the ones who
 have not reviewed yet, and they are merged into the `Reviewers` list as
 `PENDING` (a login in both keeps its review). `labels[].color` is GitHub's own
-six-digit hex, with or without a `#`, and the pill's text is picked black or
-white by the colour's luminance — a pill is unreadable the moment that guesses
-wrong. `checks.total` counts everything, so *passing* is
-`total - failing - pending`.
+six-digit hex, with or without a `#`, and a label is drawn the way GitHub's dark
+theme draws one (Primer's `IssueLabel`): the raw colour at 18% as the fill; the
+text the same hue, lightened in HSL by `0.6 - L` when the colour's perceived
+lightness `L = 0.2126 R + 0.7152 G + 0.0722 B` is under 0.6, so a dark label
+still reads on a dark card; and that text colour at 30% as a hairline border.
+`checks.total` counts everything, so *passing* is `total - failing - pending`.
+`review_decision` is `gh`'s `reviewDecision` (`APPROVED`, `CHANGES_REQUESTED`,
+`REVIEW_REQUIRED`), pull requests only, absent when GitHub has none.
 
 ## Collapse
 
@@ -686,6 +703,7 @@ enough to be cut and two items too many so the `+N more` row appears:
 | `<prefix>-popover-issue.png` | the same for an issue |
 | `<prefix>-popover-question.png` | a question: the whole text and `click to copy` |
 | `<prefix>-popover-link.png` | a link: the word `Link` and the whole URL |
+| `<prefix>-popover-pr-checks-failing.png` | the same pull request as `checks_failing`: still `Open`, still badged `Changes requested` via `review_decision` |
 
 The popovers come with two generated avatar PNGs beside them, so the previews
 show real decoded circles rather than the fallback disc. Every image on this page

@@ -608,6 +608,9 @@ function Build-Details([string]$kind, $data, [string]$repo) {
     if ($kind -eq 'pr') {
         if ($data.baseRefName) { $d['base'] = [string]$data.baseRefName }
         if ($data.headRefName) { $d['head'] = [string]$data.headRefName }
+        # the status folds the review under failing checks; the popover's
+        # badges want the review itself
+        if ($data.reviewDecision) { $d['review_decision'] = ([string]$data.reviewDecision).ToUpper() }
 
         $rev = @(Get-Reviews $data $authorLogin)
         $out = New-Object System.Collections.ArrayList
