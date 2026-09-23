@@ -2632,14 +2632,22 @@ const char* PanStatusName(PanStatus s) {
     return kNames[static_cast<int>(s)];
 }
 
-// The status as a human reads it. The row has room for a glyph; the popover has
-// room for the word.
+// Every live, non-draft state: what GitHub's own page calls `Open`, however its
+// reviews and checks are going.
+bool PanelIsOpen(PanStatus s) {
+    return s == PanStatus::Open || s == PanStatus::Approved ||
+           s == PanStatus::ChangesRequested || s == PanStatus::ChecksFailing;
+}
+
+// The status as a human reads it — GitHub's word for the state, not for the
+// review: the row has room for a glyph, the popover for the word, and a review
+// verdict gets a badge of its own beside it (see PopBadgesFor).
 const char* PanStatusWord(PanStatus s) {
     switch (s) {
-        case PanStatus::Open:             return "Open";
-        case PanStatus::Approved:         return "Approved";
-        case PanStatus::ChangesRequested: return "Changes requested";
-        case PanStatus::ChecksFailing:    return "Checks failing";
+        case PanStatus::Open:
+        case PanStatus::Approved:
+        case PanStatus::ChangesRequested:
+        case PanStatus::ChecksFailing:    return "Open";
         case PanStatus::Merged:           return "Merged";
         case PanStatus::Closed:           return "Closed";
         case PanStatus::Draft:            return "Draft";
@@ -2692,6 +2700,10 @@ struct PanDetails {
     std::vector<PanLabel>  labels;
     bool                   have_checks = false;
     long                   total = 0, failing = 0, pending = 0;
+    // GitHub's own `reviewDecision` (`APPROVED`, `CHANGES_REQUESTED`,
+    // `REVIEW_REQUIRED`), pull requests only. The row's status folds it under
+    // `checks_failing`; this keeps it for the popover's badges.
+    std::string            review_decision;
 };
 
 struct PanelItem {
@@ -3011,6 +3023,9 @@ constexpr Rgb kOctPurple {0x82 / 255.f, 0x56 / 255.f, 0xd0 / 255.f};   // #8256d
 constexpr Rgb kOctRed    {0xc9 / 255.f, 0x3c / 255.f, 0x37 / 255.f};   // #c93c37
 constexpr Rgb kOctAmber  {0xc6 / 255.f, 0x90 / 255.f, 0x26 / 255.f};   // #c69026
 constexpr Rgb kOctGrey   {0x76 / 255.f, 0x83 / 255.f, 0x90 / 255.f};   // #768390
+// GitHub's attention-fg on dark: not a state colour, the colour of a note *about*
+// the state — the popover's badges, drawn as tinted outlines rather than fills.
+constexpr Rgb kOctYellow {0xe3 / 255.f, 0xb3 / 255.f, 0x41 / 255.f};   // #e3b341
 
 // Octicons 16px, verbatim (MIT).
 constexpr const char* kOctIssueOpened =
@@ -3088,7 +3103,7 @@ bool PanelIsBareHashTitle(const std::string& s) {
 
 PanGlyph PanelGlyphFor(const PanelItem& item) {
     // A question an agent is waiting on is the one row that is about *you*, so it
-    // gets the amber the review states use for "your move" — and keeps it
+    // gets amber, the one "your move" colour on the card — and keeps it
     // whatever else the status says, until the status says it is closed.
     if (PanelIsQuestion(item)) {
         return {kOctQuestion,
@@ -3118,14 +3133,13 @@ PanGlyph PanelGlyphFor(const PanelItem& item) {
         default:
             break;
     }
+    // Anything else still open is GitHub's plain green `Open`, whatever its
+    // reviews or checks say: the icon reports the *state* the item's page shows,
+    // and the review verdict is the popover's to tell (its badges, its Reviewers
+    // and its Checks line). `approved`, `changes_requested` and `checks_failing`
+    // stay in the data — only the tint stops distinguishing them.
     const char* path = issue ? kOctIssueOpened : kOctPullRequest;
-    switch (item.status) {
-        case PanStatus::Open:
-        case PanStatus::Approved:         return {path, kOctGreen};
-        case PanStatus::ChangesRequested: return {path, kOctAmber};
-        case PanStatus::ChecksFailing:    return {path, kOctRed};
-        default:                          return {path, kOctGrey};
-    }
+    return {path, PanelIsOpen(item.status) ? kOctGreen : kOctGrey};
 }
 
 // ── geometry ────────────────────────────────────────────────────────────────
@@ -4613,6 +4627,31 @@ PopGlyph PopReviewGlyph(const std::string& state) {
     return {kOctCircle, kOctGrey};   // PENDING, or anything unrecognised
 }
 
+// A badge qualifies the state pill beside it — `Open`, but with changes
+// requested — without borrowing a state colour: tinted, not filled, so it never
+// reads as a second state.
+constexpr float kPopBadgeFill   = 0.18f;
+constexpr float kPopBadgeBorder = 0.5f;
+
+struct PopBadge {
+    std::string word;
+    Rgb         colour;
+};
+
+// The badges a hover card carries after its state pill, in order. One today;
+// the next one is another `if` here.
+std::vector<PopBadge> PopBadgesFor(const PanelItem& item) {
+    std::vector<PopBadge> out;
+    if (item.kind != "pr" || !PanelIsOpen(item.status)) return out;
+    // The row's status ranks failing checks above the review, so the enricher's
+    // own `reviewDecision` is asked too: a PR can be both.
+    if (item.status == PanStatus::ChangesRequested ||
+        item.details.review_decision == "CHANGES_REQUESTED") {
+        out.push_back({"Changes requested", kOctYellow});
+    }
+    return out;
+}
+
 TextMask PopLine(const std::string& text, bool bold, int max_w, int px = kPopLinePx,
                  int lines = 1, UINT extra = DT_SINGLELINE | DT_END_ELLIPSIS) {
     return RenderText(Wide(text), PanScale(px), bold, max_w, lines, extra);
@@ -4761,6 +4800,9 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
         const char* glyph = nullptr;
         Rgb         colour{};
         PanPerson   who;
+        // A pill is filled solid by default. A badge is the tinted variant: a
+        // translucent fill, a hairline border and text in the colour itself.
+        bool        tinted = false;
     };
     std::vector<Piece> pieces;
     int y = 0;
@@ -4855,10 +4897,12 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
             if (!lines.empty() || nm.w) y += PanScale(7);
         }
 
-        // the state, as GitHub's filled pill
+        // the state, as GitHub's filled pill, then the badges that qualify it on
+        // the same row — wrapping under it only when the row runs out
         {
             const PanGlyph g = PanelGlyphFor(item);
             const std::string word = PanStatusWord(item.status);
+            int x = 0, row_h = 0;
             if (!word.empty()) {
                 const int  px = PanScale(9);
                 const TextMask m = PopLine(word, true, inner, kPopSmallPx);
@@ -4871,10 +4915,33 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 p.w      = m.w + icon + PanScale(5) + 2 * px;
                 p.h      = m.h + PanScale(7);
                 p.colour = g.colour;
-                const int h = p.h;
+                x     = p.w + PanScale(6);
+                row_h = p.h;
                 pieces.push_back(std::move(p));
-                y += h + gap;
             }
+            for (const PopBadge& b : PopBadgesFor(item)) {
+                const int  px = PanScale(8);
+                const TextMask m = PopLine(b.word, true, inner - 2 * px, kPopSmallPx);
+                if (!m.w) continue;
+                Piece p;
+                p.t      = Piece::T::Pill;
+                p.tinted = true;
+                p.mask   = m;
+                p.w      = m.w + 2 * px;
+                p.h      = m.h + PanScale(7);
+                if (x && x + p.w > inner) {
+                    y += row_h + PanScale(4);
+                    x = 0;
+                    row_h = 0;
+                }
+                p.x      = x;
+                p.y      = y;
+                p.colour = b.colour;
+                x    += p.w + PanScale(6);
+                row_h = std::max(row_h, p.h);
+                pieces.push_back(std::move(p));
+            }
+            if (row_h) y += row_h + gap;
         }
 
         // the opening of the body, as plain text the enricher already reduced
@@ -5121,6 +5188,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 break;
             case Piece::T::Pill: {
                 const float r = p.h * 0.5f;
+                const float hair = static_cast<float>(std::max(1, PanScale(1)));
                 for (int py = 0; py < p.h; ++py) {
                     for (int px = 0; px < p.w; ++px) {
                         const float bx = std::fabs(px + 0.5f - p.w * 0.5f);
@@ -5133,12 +5201,21 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                         const int cx = ox + p.x + px, cy = oy + p.y + py;
                         if (cx < 0 || cx >= out->w || cy < 0 || cy >= out->h) continue;
                         uint32_t& dst = (*&out->deco)[static_cast<size_t>(cy) * out->w + cx];
-                        dst = BlendOver(Pack(p.colour, a), dst);
+                        if (!p.tinted) {
+                            dst = BlendOver(Pack(p.colour, a), dst);
+                            continue;
+                        }
+                        // the same shape, inset by one hairline: what lies between
+                        // the two is the border
+                        const float d  = std::sqrt(qx * qx + qy * qy) - r;
+                        const float in = 1.f - SmoothStep(-0.7f, 0.7f, d + hair);
+                        dst = BlendOver(Pack(p.colour, in * kPopBadgeFill), dst);
+                        dst = BlendOver(Pack(p.colour, (a - in) * kPopBadgeBorder), dst);
                     }
                 }
                 // The pill's text is coloured by its background, so it cannot ride
-                // the shared ink layers.
-                const Rgb ink = PopPillInk(p.colour);
+                // the shared ink layers; a badge's text is its own colour.
+                const Rgb ink = p.tinted ? p.colour : PopPillInk(p.colour);
                 // A state pill carries its octicon too: the two are centred as one
                 // group, so the pair reads as a single mark rather than as a glyph
                 // that happens to sit beside a word.
@@ -6280,6 +6357,7 @@ void ParseDetails(const JsonVal* v, PanDetails* out) {
     out->created_at = PanTrim(v->GetStr("created_at"));
     out->base       = PanTrim(v->GetStr("base"));
     out->head       = PanTrim(v->GetStr("head"));
+    out->review_decision = PanTrim(v->GetStr("review_decision"));
     if (const JsonVal* a = v->Find("author")) out->author = ParsePerson(*a);
     ParsePeople(v->Find("assignees"), &out->assignees);
     ParsePeople(v->Find("reviews"), &out->reviews);
@@ -6439,7 +6517,7 @@ void HandlePanelDelete(SOCKET fd, const std::string& path, const std::string& bo
 // more" row appears.
 
 const char* kPanSampleSummary = "i47 - wiring the attention panel into the daemon";
-constexpr size_t kPanSampleRows = 12;   // the sample list, so a preview can point
+constexpr size_t kPanSampleRows = 13;   // the sample list, so a preview can point
                                         // at its last row
 
 std::vector<PanelItem> SamplePanelItems() {
@@ -6465,8 +6543,8 @@ std::vector<PanelItem> SamplePanelItems() {
              PanStatus::ChecksFailing),
         make("pr", "optidatacloud/optiwork-api-gateway", 1758,
              "fix: quantity step on the price table", PanStatus::Approved),
-        make("issue", "optidatacloud/optiwork-ai", 377,
-             "MCP P14: tool surface parity with the chat tools",
+        make("pr", "optidatacloud/optiwork-ai", 380,
+             "feat: MCP P14 tool surface parity with the chat tools",
              PanStatus::ChangesRequested),
         make("issue", "optidatacloud/laravel-opticloud", 1372,
              "Feature highlights popover regressions", PanStatus::Open),
@@ -6483,6 +6561,8 @@ std::vector<PanelItem> SamplePanelItems() {
              PanStatus::Draft),
         make("issue", "optidatacloud/optiwork-infra", 27,
              "bastion runbook", PanStatus::Closed),
+        make("pr", "optidatacloud/optiwork-infra", 31,
+             "chore: bastion on the old image", PanStatus::Closed),
         make("question", "", 0,
              "Merge the partners PR before or after the gateway one?",
              PanStatus::Open),
@@ -6516,12 +6596,16 @@ std::string WriteFakeAvatar(const std::string& path, const Rgb& a, const Rgb& b)
 
 // The sample row a popover is previewed against: everything the contract allows,
 // so every branch of the layout is on the page.
-PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string& av_b) {
+PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string& av_b,
+                            bool checks_failing = false) {
     PanelItem it;
     it.kind   = pr ? "pr" : "issue";
     it.repo   = pr ? "optidatacloud/laravel-opticloud" : "optidatacloud/optiwork-ai";
     it.number = pr ? 1375 : 377;
-    it.status = pr ? PanStatus::ChangesRequested : PanStatus::Open;
+    // What the enricher really sends for this PR is `checks_failing` (its checks
+    // outrank its review); the other variant is the same PR once CI is green.
+    it.status = !pr ? PanStatus::Open
+              : checks_failing ? PanStatus::ChecksFailing : PanStatus::ChangesRequested;
     it.title  = pr ? "feat: calendar event reminder as a bottom-right toast"
                    : "MCP P14: tool surface parity with the chat tools";
     it.url    = PanelGuessUrl(it);
@@ -6559,6 +6643,7 @@ PanelItem SamplePopoverItem(bool pr, const std::string& av_a, const std::string&
             PanPerson{"copilot-pull-request-reviewer", "", "COMMENTED", "Copilot", "copilot"});
         d.review_requests = {PanPerson{"ezequiel", "", ""},
                               PanPerson{"dev", av_a, "", "dev", ""}};
+        d.review_decision = "CHANGES_REQUESTED";
         d.have_checks = true;
         d.total   = 6;
         d.failing = 1;
@@ -6595,10 +6680,11 @@ void PanelPopoverPreview(const std::string& prefix, float scale) {
                                           Rgb{0.16f, 0.38f, 0.72f}, Rgb{0.42f, 0.20f, 0.62f});
     const std::string b = WriteFakeAvatar(prefix + "-avatar-b.png",
                                           Rgb{0.10f, 0.47f, 0.33f}, Rgb{0.70f, 0.62f, 0.14f});
-    for (int i = 0; i < 4; ++i) {
-        const PanelItem item = i < 2 ? SamplePopoverItem(i == 0, a, b)
+    for (int i = 0; i < 5; ++i) {
+        const PanelItem item = i < 2  ? SamplePopoverItem(i == 0, a, b)
                              : i == 2 ? SampleQuestionItem()
-                                      : SampleLinkItem();
+                             : i == 3 ? SampleLinkItem()
+                                      : SamplePopoverItem(true, a, b, true);
         PanelCard card;
         BuildPopoverCard(&card, item, scale);
         if (!card.w) continue;
@@ -6611,7 +6697,8 @@ void PanelPopoverPreview(const std::string& prefix, float scale) {
         const char* suffix = i == 0 ? "-popover-pr.png"
                            : i == 1 ? "-popover-issue.png"
                            : i == 2 ? "-popover-question.png"
-                                    : "-popover-link.png";
+                           : i == 3 ? "-popover-link.png"
+                                    : "-popover-pr-checks-failing.png";
         const std::string path = prefix + suffix;
         WritePng(path, px, card.w, card.h);
         std::printf("%s (%dx%d)  compose %.2f ms\n", path.c_str(), card.w, card.h,
