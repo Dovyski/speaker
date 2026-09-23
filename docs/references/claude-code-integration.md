@@ -276,6 +276,7 @@ there is exactly one state directory per user even with several
 | `reviews` | PRs only: the **latest** review per reviewer, the PR author's own excluded, `PENDING` drafts dropped, `DISMISSED` folded into `COMMENTED`. Sorted `CHANGES_REQUESTED` → `APPROVED` → `COMMENTED`, then most recent first, so the cap of 10 (`reviews_more`) never drops a human verdict for a bot comment |
 | `review_requests` | PRs only: reviewers who have not answered yet — this is what `PENDING` means on the popover. A requested *team* has no login, so it appears as `{login: "<team name>", avatar: null, team: true}` |
 | `checks` | PRs only: `{total, failing, pending}` counted off `statusCheckRollup` |
+| `review_decision` | PRs only: `gh`'s `reviewDecision`, upper-cased (`APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`), absent when empty. The row `status` ranks failing checks above it, so this is what lets the popover still badge `Changes requested` |
 | `updated_at` | GitHub's `updatedAt`, normalised to `…Z` |
 | `fetched_at` | when the popover content last *changed*. A refresh that finds nothing new does not rewrite the file (and so does not re-POST the card once a minute), which is exactly why this is not simply the last `gh` call |
 

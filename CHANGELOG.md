@@ -9,8 +9,24 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ## [Unreleased]
 
+### Changed
+
+- **Row icons and the popover's status pill use GitHub's state colours.** A
+  pull request that is neither merged nor closed is green `Open` whatever its
+  reviews or checks say — no more amber for `changes_requested` or red for
+  `checks_failing` — drafts stay grey, merged is purple, a closed pull request
+  red; issues are green `Open` and purple `Closed` as before. The statuses
+  themselves are unchanged in the data.
+- **Popover labels look like GitHub's dark-theme labels:** an 18% tint of the
+  label colour, text in the same hue lightened until it reads, and a hairline
+  border, instead of a solid fill with black or white text.
+
 ### Added
 
+- **A `Changes requested` badge on the pull request popover,** in yellow beside
+  the `Open` pill. It follows the status or the new `details.review_decision`
+  the enricher copies from `gh`'s `reviewDecision`, so a PR whose failing checks
+  outrank its review still shows it.
 - **The hover popover is GitHub's hover card now.** Same order, same marks: a
   muted `owner/repo on Sep 16` header, the full title in bold with its `#N`
   trailing it, the state as a filled pill carrying its own octicon, the opening
