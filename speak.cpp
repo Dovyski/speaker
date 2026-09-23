@@ -4608,8 +4608,9 @@ void StampAvatar(std::vector<uint32_t>* deco, int cw, int ch, int x0, int y0, in
 
 // ── laying the popover out ─────────────────────────────────────────────────
 
-// GitHub picks black or white label text by the colour's own brightness, and so
-// does this: a pill is unreadable the moment it guesses wrong.
+// A solid pill's text — a state, a branch — is black or white by the fill's own
+// brightness: a pill is unreadable the moment it guesses wrong. Labels are not
+// solid; their text comes from PopLabelTint.
 Rgb PopPillInk(const Rgb& bg) {
     const float lum = 0.299f * bg.r + 0.587f * bg.g + 0.114f * bg.b;
     return lum > 0.70f ? Rgb{0.05f, 0.06f, 0.07f} : Rgb{1.f, 1.f, 1.f};
@@ -4637,6 +4638,58 @@ struct PopBadge {
     std::string word;
     Rgb         colour;
 };
+
+// How a translucent pill is drawn: its fill (the raw colour at `fill` alpha),
+// its hairline (`edge` at `edge_a`) and its text.
+struct PopTint {
+    float fill;
+    Rgb   edge;
+    float edge_a;
+    Rgb   ink;
+};
+
+PopTint PopBadgeTint(const Rgb& c) { return {kPopBadgeFill, c, kPopBadgeBorder, c}; }
+
+void RgbToHsl(const Rgb& c, float* h, float* s, float* l) {
+    const float mx = std::max({c.r, c.g, c.b}), mn = std::min({c.r, c.g, c.b});
+    *l = (mx + mn) * 0.5f;
+    *h = *s = 0.f;
+    const float d = mx - mn;
+    if (d <= 1e-6f) return;
+    *s = *l > 0.5f ? d / (2.f - mx - mn) : d / (mx + mn);
+    if (mx == c.r)      *h = (c.g - c.b) / d + (c.g < c.b ? 6.f : 0.f);
+    else if (mx == c.g) *h = (c.b - c.r) / d + 2.f;
+    else                *h = (c.r - c.g) / d + 4.f;
+    *h /= 6.f;
+}
+
+Rgb HslToRgb(float h, float s, float l) {
+    if (s <= 1e-6f) return {l, l, l};
+    const auto hue = [](float p, float q, float t) {
+        if (t < 0.f) t += 1.f;
+        if (t > 1.f) t -= 1.f;
+        if (t < 1.f / 6.f) return p + (q - p) * 6.f * t;
+        if (t < 0.5f)      return q;
+        if (t < 2.f / 3.f) return p + (q - p) * (2.f / 3.f - t) * 6.f;
+        return p;
+    };
+    const float q = l < 0.5f ? l * (1.f + s) : l + s - l * s;
+    const float p = 2.f * l - q;
+    return {hue(p, q, h + 1.f / 3.f), hue(p, q, h), hue(p, q, h - 1.f / 3.f)};
+}
+
+// GitHub's dark-theme label (Primer's IssueLabel): the raw colour at 18% for the
+// fill, and the text the same hue lightened in HSL by however far the colour's
+// perceived lightness falls short of 0.6 — so a dark label still reads on a dark
+// card — with that text colour at 30% as the border.
+PopTint PopLabelTint(const Rgb& c) {
+    const float pl = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+    const float lighten = pl < 0.6f ? 0.6f - pl : 0.f;
+    float h = 0.f, s = 0.f, l = 0.f;
+    RgbToHsl(c, &h, &s, &l);
+    const Rgb text = HslToRgb(h, s, Clamp01(l + lighten));
+    return {0.18f, text, 0.30f, text};
+}
 
 // The badges a hover card carries after its state pill, in order. One today;
 // the next one is another `if` here.
@@ -4800,9 +4853,10 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
         const char* glyph = nullptr;
         Rgb         colour{};
         PanPerson   who;
-        // A pill is filled solid by default. A badge is the tinted variant: a
-        // translucent fill, a hairline border and text in the colour itself.
-        bool        tinted = false;
+        // A pill is filled solid by default (a state, a branch). A badge is a
+        // translucent fill, a hairline border and text in the colour itself; a
+        // label is GitHub's dark-theme label, which lightens its text first.
+        enum class Fill { Solid, Badge, Label } fill = Fill::Solid;
     };
     std::vector<Piece> pieces;
     int y = 0;
@@ -4925,7 +4979,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 if (!m.w) continue;
                 Piece p;
                 p.t      = Piece::T::Pill;
-                p.tinted = true;
+                p.fill   = Piece::Fill::Badge;
                 p.mask   = m;
                 p.w      = m.w + 2 * px;
                 p.h      = m.h + PanScale(7);
@@ -5072,6 +5126,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                 p.w      = w;
                 p.h      = h;
                 p.colour = lab.colour;
+                p.fill   = Piece::Fill::Label;
                 pieces.push_back(std::move(p));
                 x += w + PanScale(5);
                 row_h = std::max(row_h, h);
@@ -5189,6 +5244,8 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
             case Piece::T::Pill: {
                 const float r = p.h * 0.5f;
                 const float hair = static_cast<float>(std::max(1, PanScale(1)));
+                const PopTint tint = p.fill == Piece::Fill::Label ? PopLabelTint(p.colour)
+                                                                   : PopBadgeTint(p.colour);
                 for (int py = 0; py < p.h; ++py) {
                     for (int px = 0; px < p.w; ++px) {
                         const float bx = std::fabs(px + 0.5f - p.w * 0.5f);
@@ -5201,7 +5258,7 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                         const int cx = ox + p.x + px, cy = oy + p.y + py;
                         if (cx < 0 || cx >= out->w || cy < 0 || cy >= out->h) continue;
                         uint32_t& dst = (*&out->deco)[static_cast<size_t>(cy) * out->w + cx];
-                        if (!p.tinted) {
+                        if (p.fill == Piece::Fill::Solid) {
                             dst = BlendOver(Pack(p.colour, a), dst);
                             continue;
                         }
@@ -5209,13 +5266,13 @@ void BuildPopoverCard(PanelCard* out, const PanelItem& item, float scale,
                         // the two is the border
                         const float d  = std::sqrt(qx * qx + qy * qy) - r;
                         const float in = 1.f - SmoothStep(-0.7f, 0.7f, d + hair);
-                        dst = BlendOver(Pack(p.colour, in * kPopBadgeFill), dst);
-                        dst = BlendOver(Pack(p.colour, (a - in) * kPopBadgeBorder), dst);
+                        dst = BlendOver(Pack(p.colour, in * tint.fill), dst);
+                        dst = BlendOver(Pack(tint.edge, (a - in) * tint.edge_a), dst);
                     }
                 }
                 // The pill's text is coloured by its background, so it cannot ride
                 // the shared ink layers; a badge's text is its own colour.
-                const Rgb ink = p.tinted ? p.colour : PopPillInk(p.colour);
+                const Rgb ink = p.fill == Piece::Fill::Solid ? PopPillInk(p.colour) : tint.ink;
                 // A state pill carries its octicon too: the two are centred as one
                 // group, so the pair reads as a single mark rather than as a glyph
                 // that happens to sit beside a word.
