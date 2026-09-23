@@ -20,6 +20,9 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 - **Popover labels look like GitHub's dark-theme labels:** an 18% tint of the
   label colour, text in the same hue lightened until it reads, and a hairline
   border, instead of a solid fill with black or white text.
+- **Reviewer verdicts use GitHub's sidebar marks:** a red `file-diff` for
+  changes requested instead of an `✕`, and a filled amber dot for a requested
+  review not yet given instead of a hollow grey circle.
 
 ### Added
 

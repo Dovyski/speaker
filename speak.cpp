@@ -3022,6 +3022,9 @@ constexpr Rgb kOctGreen  {0x34 / 255.f, 0x7d / 255.f, 0x39 / 255.f};   // #347d3
 constexpr Rgb kOctPurple {0x82 / 255.f, 0x56 / 255.f, 0xd0 / 255.f};   // #8256d0
 constexpr Rgb kOctRed    {0xc9 / 255.f, 0x3c / 255.f, 0x37 / 255.f};   // #c93c37
 constexpr Rgb kOctAmber  {0xc6 / 255.f, 0x90 / 255.f, 0x26 / 255.f};   // #c69026
+// attention-fg on dark: the dot GitHub's Reviewers list puts beside a review that
+// has been requested and not yet given
+constexpr Rgb kOctAttention {0xd2 / 255.f, 0x99 / 255.f, 0x22 / 255.f};   // #d29922
 constexpr Rgb kOctGrey   {0x76 / 255.f, 0x83 / 255.f, 0x90 / 255.f};   // #768390
 // GitHub's attention-fg on dark: not a state colour, the colour of a note *about*
 // the state — the popover's badges, drawn as tinted outlines rather than fills.
@@ -3050,17 +3053,20 @@ constexpr const char* kOctMerge =
     "M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0 0 .005V3.25Z";
 constexpr const char* kOctQuestion =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.92 6.085h.001a.749.749 0 1 1-1.342-.67c.169-.339.436-.701.849-.977C6.845 4.16 7.369 4 8 4a2.756 2.756 0 0 1 1.637.525c.503.377.863.965.863 1.725 0 .448-.115.83-.329 1.15-.205.307-.47.513-.692.662-.109.072-.22.138-.313.195l-.006.004a6.24 6.24 0 0 0-.26.16.952.952 0 0 0-.276.245.75.75 0 0 1-1.248-.832c.184-.264.42-.489.692-.661.103-.067.207-.132.313-.195l.007-.004c.1-.061.182-.11.258-.161a.969.969 0 0 0 .277-.245C8.96 6.514 9 6.427 9 6.25a.612.612 0 0 0-.262-.525A1.27 1.27 0 0 0 8 5.5c-.369 0-.595.09-.74.187a1.01 1.01 0 0 0-.34.398ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z";
-// A review's verdict, and the empty circle for one that has not arrived.
-// Octicons has no `request-changes`, so changes-requested takes the plain `x`:
-// against the green check it reads immediately, which a diff glyph would not.
+// A review's verdict, as GitHub's Reviewers sidebar draws it: `check` approved,
+// `file-diff` changes requested, `comment` commented, `dot-fill` requested and
+// not yet given; the empty circle is left for a state nobody recognises.
 constexpr const char* kOctCheck =
     "M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z";
-constexpr const char* kOctX =
-    "M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z";
 constexpr const char* kOctComment =
     "M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z";
 constexpr const char* kOctCircle =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z";
+// file-diff: GitHub's mark for a review that requested changes
+constexpr const char* kOctFileDiff =
+    "M1 1.75C1 .784 1.784 0 2.75 0h7.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16H2.75A1.75 1.75 0 0 1 1 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25V4.664a.25.25 0 0 0-.073-.177l-2.914-2.914a.25.25 0 0 0-.177-.073ZM8 3.25a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5h-1.5v1.5a.75.75 0 0 1-1.5 0V7h-1.5a.75.75 0 0 1 0-1.5h1.5V4A.75.75 0 0 1 8 3.25Zm-3 8a.75.75 0 0 1 .75-.75h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1-.75-.75Z";
+// dot-fill: a requested review not yet given
+constexpr const char* kOctDotFill = "M8 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z";
 constexpr const char* kOctInfo =
     "M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z";
 constexpr const char* kOctLink =
@@ -4621,11 +4627,14 @@ struct PopGlyph {
     Rgb         colour;
 };
 
+// The marks GitHub's own Reviewers sidebar uses. `PENDING` is also what every
+// `review_requests[]` entry is given when it is merged into the list.
 PopGlyph PopReviewGlyph(const std::string& state) {
     if (state == "APPROVED")          return {kOctCheck, kOctGreen};
-    if (state == "CHANGES_REQUESTED") return {kOctX, kOctRed};
+    if (state == "CHANGES_REQUESTED") return {kOctFileDiff, kOctRed};
     if (state == "COMMENTED")         return {kOctComment, kOctGrey};
-    return {kOctCircle, kOctGrey};   // PENDING, or anything unrecognised
+    if (state == "PENDING")           return {kOctDotFill, kOctAttention};
+    return {kOctCircle, kOctGrey};   // anything unrecognised
 }
 
 // A badge qualifies the state pill beside it — `Open`, but with changes

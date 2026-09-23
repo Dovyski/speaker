@@ -248,9 +248,10 @@ hide its review; then, under a separator, the opening of the body, and for a pul
 request the `base ← head` pair as two pills. Under a second separator, the part
 that is about people rather than about the thing: the labels as pills in
 GitHub's own dark-theme label style; `Assignees`; for pull requests `Reviewers`, each
-with the verdict beside them — a green check for `APPROVED`, a red `✕` for `CHANGES_REQUESTED`, a grey
-speech bubble for `COMMENTED`, a hollow circle for a review that has been
-requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
+with the verdict beside them in the marks GitHub's own Reviewers sidebar uses —
+a green check for `APPROVED`, a red `file-diff` for `CHANGES_REQUESTED`, a grey
+speech bubble for `COMMENTED`, a filled amber dot (`#d29922`) for a review that
+has been requested and not yet given; and a one-line `Checks: 4 passing · 1 pending ·
 1 failing`.
 
 A **question** row gets a shape of its own, because it has neither a `repo#N`
