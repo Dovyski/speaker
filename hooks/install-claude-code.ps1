@@ -235,7 +235,7 @@ if ($existing) {
 # --- 5. checklist -----------------------------------------------------------
 
 Todo "start the daemon detached, e.g. Start-Process -FilePath <repo>\speak.exe -ArgumentList '--serve','--port',$DaemonPort -WindowStyle Hidden"
-Todo "the daemon runs $Enricher itself every 60 s while a panel is registered; it looks for hooks\i47-enrich.ps1 beside speak.exe (--enricher to point elsewhere)"
+Todo "the daemon runs the enricher beside speak.exe (hooks\i47-enrich.ps1 there, not the copy just installed to $HooksDst) every 60 s while a panel is registered; --enricher points it elsewhere"
 Todo "open (or restart) a Claude Code session: hooks are read at session start"
 Todo "verify: curl http://127.0.0.1:$panelPort/panels, and tail $RealAttention\producer.log"
 
