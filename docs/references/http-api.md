@@ -8,7 +8,7 @@ these routes move things on someone's screen, so they never leave the machine.
 | Port | What | Flag |
 |---|---|---|
 | `8123` | speech — upstream PocketTTS.cpp's `TTSServer` | `--port <n>` |
-| `8124` | pointing and the attention panel, a separate listener on its own thread | `--point-port <n>`, default `port+1` |
+| `8124` | pointing, the attention panel and remote speech, a separate listener on its own thread | `--point-port <n>`, default `port+1` |
 | `8125` | the speaking beacon: UDP, one fixed-size datagram every other frame (~30 Hz) | `point_port + 1` |
 
 `--no-point-server` starts the daemon with neither the pointing/panel listener
@@ -50,6 +50,36 @@ and requests queue rather than overlapping.
 
 `GET /targets` returns the pointable windows as JSON — `hwnd`, `pid`, `process`,
 `title`, `x`, `y`, `w`, `h`. See [pointing.md](pointing.md).
+
+## Remote speech: `POST /speak` (port 8124)
+
+For a caller that cannot run `speak.exe` itself — a Claude Code agent on a Linux
+runner reaching this desktop through an SSH reverse tunnel (`RemoteForward 8124`).
+The daemon runs its own binary as a client with the matching flags, so the
+utterance gets the orb, the caption and pointing exactly as from the CLI.
+
+```console
+$ curl -s -X POST http://127.0.0.1:8124/speak -d '{
+    "text": "Remote speech works now, sir.",
+    "caption_title": "claude-runner-2", "caption": "tunnel speak e2e",
+    "caption_variant": "light", "title": "reviewer worker"}'
+{"ok":true,"exit":0}
+```
+
+| Field | Flag |
+|---|---|
+| `text` (required) | the positional text |
+| `voice`, `caption_title`, `caption`, `caption_variant`, `caption_icon`, `subtitle` | `--voice`, `--caption-title`, … |
+| `caption_opacity` (number or numeric string) | `--caption-opacity` |
+| `no_orb` (`true`) | `--no-orb` |
+| `title`, `session` | `--title`, `--session`: point at that window while speaking |
+
+It answers when playback ends: `{"ok":true,"exit":0}`, or `{"ok":false,"exit":N}`
+with a `500` when the client failed (an unknown `caption_variant` exits `2`).
+`400` for a missing `text`; `500` if the client could not start or ran past 120 s.
+Requests queue, one utterance at a time. Each runs on its own thread, so
+`/panels` (which `--session` resolves against) and `/point` keep answering
+while it speaks; synthesis goes to `8123`, served by a different thread.
 
 ## The attention panel (port 8124)
 

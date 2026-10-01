@@ -256,6 +256,14 @@ optional `pulses`, `duration`, `color` and `size`; a request **must** name its t
 daemon cannot tell where the call came from. It replies when the animation ends
 (~3.5 s), and concurrent requests queue.
 
+`POST /speak` on the same port speaks on this desktop for a caller that cannot run
+`speak.exe` — e.g. an agent on a remote runner over an SSH reverse tunnel. Fields
+mirror the flags (`text` required) and it replies when playback ends:
+
+```bash
+curl -s -X POST http://127.0.0.1:8124/speak -d '{"text":"Done, sir.","caption_title":"claude-runner-2","caption":"runner up","title":"reviewer worker"}'   # {"ok":true,"exit":0}
+```
+
 ## Rules
 
 - **Subagents do not speak or point.** Only the top-level session the user is

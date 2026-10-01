@@ -6918,7 +6918,9 @@ bool JsonGetNumber(const std::string& json, const std::string& key, double* out)
 
 void PointHttpRespond(SOCKET fd, int status, const std::string& body) {
     const char* text = status == 200 ? "OK" : (status == 404 ? "Not Found"
-                                            : (status == 409 ? "Conflict" : "Bad Request"));
+                                            : (status == 409 ? "Conflict"
+                                            : (status == 500 ? "Internal Server Error"
+                                                             : "Bad Request")));
     std::string resp = "HTTP/1.1 " + std::to_string(status) + " " + text + "\r\n"
                        "Content-Type: application/json\r\n"
                        "Content-Length: " + std::to_string(body.size()) + "\r\n"
@@ -6926,22 +6928,127 @@ void PointHttpRespond(SOCKET fd, int status, const std::string& body) {
     SendAll(fd, resp);
 }
 
-void HandlePointRequest(SOCKET fd) {
+// ── POST /speak ─────────────────────────────────────────────────────────────
+// Speech for a caller that is not on this machine — an agent on a Linux box,
+// reaching us through an SSH reverse tunnel. Rather than teach the daemon to
+// draw orbs and captions itself, it runs this same binary as a client: the
+// child gets the full CLI (orb, caption, pointing) and talks back to the speech
+// port like any other caller.
+//
+// Off the listener thread, because the child may ask this very listener for
+// GET /panels to resolve --session; answering that while blocked on the child
+// would stall it until its 400 ms timeout. The speech port is served by
+// upstream's loop on the main thread, so the child's synthesis never waits on us.
+
+int        g_speak_port = 8123;   // the speech port the child should use
+std::mutex g_speak_mtx;           // one utterance at a time; later callers queue
+
+bool JsonGetBool(const std::string& json, const std::string& key) {
+    const std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + search.size());
+    if (pos == std::string::npos) return false;
+    ++pos;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+    return json.compare(pos, 4, "true") == 0;
+}
+
+// The quoting CommandLineToArgvW undoes: backslashes are literal unless they
+// precede a quote, in which case they are doubled along with the quote's escape.
+void AppendArg(std::wstring* cmd, const std::wstring& arg) {
+    if (!cmd->empty()) *cmd += L' ';
+    *cmd += L'"';
+    size_t slashes = 0;
+    for (wchar_t c : arg) {
+        if (c == L'\\') { ++slashes; continue; }
+        cmd->append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
+        slashes = 0;
+        *cmd += c;
+    }
+    cmd->append(slashes * 2, L'\\');
+    *cmd += L'"';
+}
+
+void HandleSpeakPost(SOCKET fd, const std::string& body) {
+    std::string text = pocket_tts::json_get_string(body, "text");
+    if (text.empty()) {
+        PointHttpRespond(fd, 400, "{\"ok\":false,\"error\":\"text is required\"}");
+        return;
+    }
+    // A leading dash would read as an option; a space is silent.
+    if (text[0] == '-') text.insert(0, " ");
+
+    std::wstring cmd;
+    AppendArg(&cmd, Wide(ExePath()));
+    AppendArg(&cmd, L"--port");
+    AppendArg(&cmd, std::to_wstring(g_speak_port));
+    static const char* const kFlags[][2] = {
+        {"voice", "--voice"},               {"caption_title", "--caption-title"},
+        {"caption", "--caption"},           {"caption_variant", "--caption-variant"},
+        {"caption_icon", "--caption-icon"}, {"subtitle", "--subtitle"},
+        {"title", "--title"},               {"session", "--session"},
+    };
+    for (const auto& f : kFlags) {
+        const std::string v = pocket_tts::json_get_string(body, f[0]);
+        if (v.empty()) continue;
+        AppendArg(&cmd, Wide(f[1]));
+        AppendArg(&cmd, Wide(v));
+    }
+    // A number, or a numeric string: shell-built bodies tend to quote it.
+    double opacity = 0;
+    std::string opacity_s = pocket_tts::json_get_string(body, "caption_opacity");
+    if (JsonGetNumber(body, "caption_opacity", &opacity))
+        opacity_s = std::to_string(static_cast<int>(opacity));
+    if (!opacity_s.empty()) {
+        AppendArg(&cmd, L"--caption-opacity");
+        AppendArg(&cmd, Wide(opacity_s));
+    }
+    if (JsonGetBool(body, "no_orb")) AppendArg(&cmd, L"--no-orb");
+    AppendArg(&cmd, Wide(text));
+
+    std::lock_guard<std::mutex> lock(g_speak_mtx);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) {
+        PointHttpRespond(fd, 500, "{\"ok\":false,\"error\":\"could not start speak.exe, "
+                                  "error " + std::to_string(GetLastError()) + "\"}");
+        return;
+    }
+    CloseHandle(pi.hThread);
+    DWORD exit_code = 0;
+    if (WaitForSingleObject(pi.hProcess, 120000) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        PointHttpRespond(fd, 500, "{\"ok\":false,\"error\":\"speak.exe ran past 120 s\"}");
+        return;
+    }
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    PointHttpRespond(fd, exit_code == 0 ? 200 : 500,
+                     "{\"ok\":" + std::string(exit_code == 0 ? "true" : "false") +
+                     ",\"exit\":" + std::to_string(exit_code) + "}");
+}
+
+// False when the socket was handed to a worker that will close it.
+bool HandlePointRequest(SOCKET fd) {
     const pocket_tts::HttpRequest req = pocket_tts::HttpRequest::parse(fd);
 
     if (req.method == "GET" && (req.path == "/health" || req.path == "/")) {
         PointHttpRespond(fd, 200, "{\"ok\":true,\"service\":\"speak-pointer\"}");
-        return;
+        return true;
     }
     if (req.method == "GET" && req.path == "/targets") {
         PointHttpRespond(fd, 200, TargetsJson(EnumTargets()));
-        return;
+        return true;
     }
     // The attention panel. Unlike /point this returns as soon as the panel is
     // queued: it is a thing that stays on screen, not a gesture to wait out.
     if (req.method == "GET" && PanelPathOnly(req.path) == "/panels") {
         HandlePanelList(fd, req.path, PointHttpRespond);
-        return;
+        return true;
     }
     if (PanelPathOnly(req.path) == "/panel") {
         if (req.method == "POST") {
@@ -6952,12 +7059,19 @@ void HandlePointRequest(SOCKET fd) {
             PointHttpRespond(fd, 404, "{\"ok\":false,\"error\":\"try POST /panel or "
                                       "DELETE /panel?session=<id>\"}");
         }
-        return;
+        return true;
+    }
+    if (req.method == "POST" && req.path == "/speak") {
+        std::thread([fd, body = req.body] {
+            HandleSpeakPost(fd, body);
+            closesocket(fd);
+        }).detach();
+        return false;
     }
     if (req.method != "POST" || req.path != "/point") {
         PointHttpRespond(fd, 404, "{\"ok\":false,\"error\":\"try GET /targets, "
-                                  "GET /panels, POST /point or POST /panel\"}");
-        return;
+                                  "GET /panels, POST /point, POST /panel or POST /speak\"}");
+        return true;
     }
 
     PointRequest pr;
@@ -6982,7 +7096,7 @@ void HandlePointRequest(SOCKET fd) {
             PointHttpRespond(fd, 400, "{\"ok\":false,\"error\":\"colour '" +
                                           JsonEscape(colour) +
                                           "' is not a name, #rrggbb or r,g,b\"}");
-            return;
+            return true;
         }
         pr.have_colour = true;
     }
@@ -6991,13 +7105,13 @@ void HandlePointRequest(SOCKET fd) {
         PointHttpRespond(fd, 400,
             "{\"ok\":false,\"error\":\"name a target: session, title, hwnd, "
             "or x and y\"}");
-        return;
+        return true;
     }
     // One overlay at a time: two animations on top of each other read as noise.
     bool expected = false;
     if (!g_pointing.compare_exchange_strong(expected, true)) {
         PointHttpRespond(fd, 409, "{\"ok\":false,\"error\":\"already pointing\"}");
-        return;
+        return true;
     }
 
     std::string err, candidates;
@@ -7011,6 +7125,7 @@ void HandlePointRequest(SOCKET fd) {
         if (!candidates.empty()) body += ",\"candidates\":" + candidates;
         PointHttpRespond(fd, 400, body + "}");
     }
+    return true;
 }
 
 // Serves the endpoint until the process ends. Its own thread, so a long animation
@@ -7042,8 +7157,7 @@ void RunPointServer(int port) {
         DWORD timeout = 5000;
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-        HandlePointRequest(client);
-        closesocket(client);
+        if (HandlePointRequest(client)) closesocket(client);
     }
     closesocket(fd);
 }
@@ -7159,6 +7273,7 @@ int RunDaemon(const Options& opt) {
         // separate thread, no model involved.
         if (opt.point_server) {
             const int point_port = opt.point_port ? opt.point_port : opt.port + 1;
+            g_speak_port = opt.port;
             std::thread(RunPointServer, point_port).detach();
             // And the speaking beacon on the one after that: UDP, so a 60 Hz
             // stream of level updates cannot queue behind a /panel POST.
