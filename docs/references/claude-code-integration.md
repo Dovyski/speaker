@@ -280,6 +280,28 @@ there is exactly one state directory per user even with several
 | `updated_at` | GitHub's `updatedAt`, normalised to `…Z` |
 | `fetched_at` | when the popover content last *changed*. A refresh that finds nothing new does not rewrite the file (and so does not re-POST the card once a minute), which is exactly why this is not simply the last `gh` call |
 
+#### `pane_id` and `provenance` — for Devpilot
+
+[Devpilot](https://github.com/Dovyski/devpilot) hosts Claude Code terminals and
+reads these files directly (a file watcher, not `POST /panel`). Two producer
+fields exist for it; the daemon ignores both.
+
+- **`pane_id`** (top level): the value of `DEVPILOT_PANE_ID`, which Devpilot sets
+  on every terminal it starts and Claude Code passes down to its hooks. It is the
+  exact terminal ↔ session mapping that Windows Terminal cannot give. The
+  producer writes it from the current environment on every run and omits it when
+  the variable is unset, so a session resumed in another pane moves with it. The
+  enricher and the Haiku worker edit the loaded object in place and keep it; the
+  producer in turn carries over any top-level key it does not own.
+- **`provenance`** (`pr` / `issue` rows): `created` when the row's URL came out of
+  a `gh pr create` / `gh issue create` call in this session, `touched` otherwise.
+  The producer takes the URL from the `PostToolUse` payload's `tool_response`
+  (the command's stdout) and, as a fallback on `Stop`, from the transcript's
+  `tool_result` whose `tool_use_id` matches a create call in the same delta. A
+  later sighting never downgrades `created`, and the enricher keeps `created`
+  when it folds duplicate rows. Issues and PRs created through MCP or `gh api`
+  are not detected: they stay `touched`.
+
 ### `avatars/<login>.png` — one file per person
 
 `gh`'s JSON has no `avatarUrl` (it gives `login`, `name` and sometimes
