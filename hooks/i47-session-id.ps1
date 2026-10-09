@@ -5,10 +5,13 @@
 # SessionStart is the one hook whose stdout is injected into the model's
 # context, so the single line below is the whole delivery mechanism.
 #
+# Inside Devpilot (DEVPILOT_PANE_ID set) a second line tells the model to use
+# `devpilot speak` / `devpilot point` instead of speak.exe.
+#
 # Also stamps the id into ~/.claude/attention/<session_id>.json as `session`
 # when the producer has already created that file (it never creates it).
 #
-# Always exits 0, under 200 ms, and prints nothing but that one line.
+# Always exits 0, under 200 ms, and prints nothing but those lines.
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
@@ -34,6 +37,9 @@ try {
     # the line carries an em dash; do not let the console mangle it
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
     Write-Output ("Speak session id: {0} — pass it as --session to speak.exe when speaking or pointing." -f $sessionId)
+    if ($env:DEVPILOT_PANE_ID) {
+        Write-Output ("Devpilot pane id: {0} — this session runs inside Devpilot: speak and point with ``devpilot speak`` / ``devpilot point`` (same flags) instead of speak.exe." -f $env:DEVPILOT_PANE_ID)
+    }
 
     # Best effort: keep the attention file's `session` key in sync. The producer
     # owns that file; if it is not there yet, there is nothing to do.

@@ -1,6 +1,6 @@
 ---
 name: speak
-description: "Low-latency text-to-speech via speak.exe. Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, can caption it with the initiative/repo/issue the utterance is about, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
+description: "Low-latency text-to-speech via speak.exe (or `devpilot speak` inside Devpilot). Use when the user wants to speak text aloud, generate speech audio, convert text to voice, or play spoken output. Shows a pulsing orb on screen while speaking, can caption it with the initiative/repo/issue the utterance is about, and can point at a window on screen with expanding rings so the user knows which terminal spoke."
 ---
 
 # speak — Text-to-Speech via speak.exe
@@ -19,6 +19,35 @@ The repo's own docs go deeper than this skill needs to: `docs/references/speech.
 `docs/references/pointing.md` (rings and targets) and
 `docs/references/attention-panel.md` (the per-terminal card `--session` resolves
 against).
+
+## Inside Devpilot: use `devpilot speak`
+
+When the session runs inside [Devpilot](https://github.com/Dovyski/devpilot) —
+a `Devpilot pane id: <id>` line is in your context, or `DEVPILOT_PANE_ID` is set
+in the environment — call **`devpilot speak`** instead of `speak.exe`, with the
+same captions, `--session` and `--voice`:
+
+```bash
+devpilot speak --session "2c212f58-f956-4be3-ad42-c964cecfba2f" \
+    --caption-title "i11 - reviewer worker" --caption "PR #451 reviewed, CI green." \
+    --caption-variant light \
+    "Tests are green."
+
+# point without speaking
+devpilot point --session "2c212f58-f956-4be3-ad42-c964cecfba2f"
+```
+
+Devpilot glows the terminal's row in its sidebar, shows the caption beside its
+own orb and plays the audio through the speak.exe daemon; speak.exe draws
+nothing itself. Without `--session` it targets `DEVPILOT_PANE_ID`. It falls back
+to `speak.exe` on its own when the Devpilot app is not running or does not know
+the terminal, and prints one JSON line (`"ok": true` on success). If the
+`devpilot` command is not found (an ssh session on another host), use
+`speak.exe` as below. Everything else in this skill applies unchanged: the
+register, captions, `light`/`danger`, one call per utterance, subagents stay
+silent. The pointing flags (`--pulses`, `--color`, `--title`, …) do not apply.
+
+Outside Devpilot, nothing changes: use `speak.exe` exactly as described below.
 
 ## Speaking
 
