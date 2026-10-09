@@ -141,6 +141,13 @@ speak.exe --session <id>  /  POST /point {"session":"<id>"}  ──▶  rings on
   `session` key of `~/.claude/attention/<session_id>.json`. The hook re-stamps
   that key when the file already exists; it never creates the file, because the
   producer owns it.
+- Inside [Devpilot](https://github.com/Dovyski/devpilot) (`DEVPILOT_PANE_ID`
+  set in the environment) the hook prints a second line, `Devpilot pane id:
+  <id>`, and the `speak` skill switches to `devpilot speak` / `devpilot point`
+  with the same flags. Devpilot glows its own terminal row, shows the caption
+  beside its orb and forwards the audio to this daemon (`POST /speak` on the
+  control port with `no_orb`); it falls back to `speak.exe` when the app is not
+  running or does not know the terminal.
 
 ## The hook JSON
 
