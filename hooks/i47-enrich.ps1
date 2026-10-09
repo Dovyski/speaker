@@ -808,6 +808,8 @@ function Reconcile-Items($obj) {
                 }
             }
             if ((-not $tgt.PSObject.Properties['details']) -and $it.PSObject.Properties['details'] -and $it.details) { Set-Prop $tgt 'details' $it.details }
+            # `created` is never downgraded by folding a `touched` duplicate into it
+            if (([string]$it.provenance) -eq 'created' -and ([string]$tgt.provenance) -ne 'created') { Set-Prop $tgt 'provenance' 'created' }
             if ((-not [string]$tgt.title) -and [string]$it.title) { Set-Prop $tgt 'title' ([string]$it.title) }
             if ((-not [string]$tgt.url) -and [string]$it.url)     { Set-Prop $tgt 'url'   ([string]$it.url) }
             $changed = $true

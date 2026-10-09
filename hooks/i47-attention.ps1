@@ -73,6 +73,14 @@ if ($event -eq 'PostToolUse') {
     try { if ($hook.tool_input) { $cmd = [string]$hook.tool_input.command } } catch {}
     if ($cmd -notmatch '(?i)\bgh\s+(pr|issue)\b') { $log.post_status = 'skip:not-gh'; Write-Log; exit 0 }
 }
+# `gh pr|issue create` prints the new URL on stdout. On PostToolUse the hook
+# payload carries that output (`tool_response`), so the URL is tied to the
+# command that created it without waiting for the transcript to catch up.
+$rxCreateCmd = [regex]'(?i)\bgh\s+(pr|issue)\s+create\b'
+$createResponse = $null
+if ($event -eq 'PostToolUse' -and $rxCreateCmd.IsMatch($cmd)) {
+    try { $createResponse = $hook.tool_response } catch { Add-Err 'tool-response' $_ }
+}
 $budgetMs = if ($event -eq 'Stop') { 5000 } else { 3000 }
 
 # --- 1. session file --------------------------------------------------------
@@ -308,12 +316,33 @@ function Add-Item($kind, $repo, $number, $url, $title, $ts, $relevance = 'worked
         $h['title'] = if ($title) { [string]$title } else { '' }
         $h['status'] = 'unknown'
         $h['relevance'] = $relevance
+        # `created` only ever comes from Set-Created; any other sighting is a touch
+        if ($kind -eq 'pr' -or $kind -eq 'issue') { $h['provenance'] = 'touched' }
         $h['last_seen'] = $ts
         $items[$key] = $h
     }
     return $key
 }
 
+# An issue/PR whose URL came out of a `gh pr|issue create` run in this session.
+# Never downgraded: a later sighting goes through Add-Item, which leaves an
+# existing `provenance` alone.
+function Set-Created([string]$text, [string]$ts) {
+    if (-not $text) { return }
+    foreach ($m in $rxUrl.Matches($text)) {
+        $owner = $m.Groups[1].Value; $repo = $m.Groups[2].Value
+        $kind = if ($m.Groups[3].Value -eq 'pull') { 'pr' } else { 'issue' }
+        $num  = $m.Groups[4].Value
+        $url  = "https://github.com/$owner/$repo/$($m.Groups[3].Value)/$num"
+        $k = Add-Item $kind "$owner/$repo" $num $url $null $ts
+        $items[$k]['provenance'] = 'created'
+        $items[$k]['relevance'] = 'worked'
+    }
+}
+
+# tool_use ids of the `gh pr|issue create` Bash calls seen in this delta; their
+# tool_result (on a later user line) is the command's output
+$createIds = @{}
 $processed = 0
 foreach ($line in $deltaLines) {
     if (-not $line -or $line.Length -lt 2) { continue }
@@ -433,6 +462,25 @@ foreach ($line in $deltaLines) {
         [void]$touched.Add((Add-Item 'link' $null $null $u (Get-LinkTitle $u) $ts $rel))
     }
 
+    # 4g. provenance: the output of a `gh pr|issue create` call in this delta
+    try {
+        $mc = $null; if ($j.message) { $mc = $j.message.content }
+        if ($mc -and -not ($mc -is [string])) {
+            foreach ($b in @($mc)) {
+                if ($null -eq $b -or ($b -is [string])) { continue }
+                $bt = [string]$b.type
+                if ($t -eq 'assistant' -and $bt -eq 'tool_use' -and ([string]$b.name) -match '(?i)^bash') {
+                    $bc = ''; try { $bc = [string]$b.input.command } catch {}
+                    if ($b.id -and $rxCreateCmd.IsMatch($bc)) { $createIds[[string]$b.id] = $true }
+                } elseif ($t -eq 'user' -and $bt -eq 'tool_result' -and $b.tool_use_id -and $createIds.ContainsKey([string]$b.tool_use_id)) {
+                    $rc = $b.content
+                    $out = if ($rc -is [string]) { $rc } else { (Flatten-Strings $rc) -join "`n" }
+                    Set-Created $out $ts
+                }
+            }
+        }
+    } catch { Add-Err 'provenance' $_ }
+
     # a single item in a message claims that message's lone title
     if ($loneTitle) {
         $prIssue = @($touched | Select-Object -Unique | Where-Object { $_ -and -not $_.StartsWith('path|') })
@@ -441,6 +489,18 @@ foreach ($line in $deltaLines) {
             if ($h -and -not $h['title']) { $h['title'] = $loneTitle }
         }
     }
+}
+
+# PostToolUse on the create command itself: its stdout is in the hook payload
+if ($createResponse) {
+    try {
+        Set-Created ((Flatten-Strings $createResponse) -join "`n") ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+    } catch { Add-Err 'provenance-hook' $_ }
+}
+# rows written before provenance existed
+foreach ($k in @($items.Keys)) {
+    $h = $items[$k]
+    if (([string]$h['kind']) -in @('pr', 'issue') -and -not $h['provenance']) { $h['provenance'] = 'touched' }
 }
 
 # --- 5. prune + cap ---------------------------------------------------------
@@ -587,6 +647,10 @@ $payload = [ordered]@{
     updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 }
 if ($state -and $state.summary) { $payload['summary'] = [string]$state.summary }
+# Devpilot sets DEVPILOT_PANE_ID on every terminal it hosts (inherited by Claude
+# Code and its hooks): the exact terminal <-> session mapping. The current env
+# wins; a session running outside Devpilot has no pane.
+if ($env:DEVPILOT_PANE_ID) { $payload['pane_id'] = [string]$env:DEVPILOT_PANE_ID }
 
 try {
     $onDisk = [ordered]@{}
@@ -594,6 +658,14 @@ try {
     $onDisk['_cursor'] = $newCursor
     # P4 keeps its own cursor over the same transcript; never clobber it
     if ($state -and $state.PSObject.Properties['_haiku_cursor']) { $onDisk['_haiku_cursor'] = $state._haiku_cursor }
+    # top-level keys another writer added survive this rewrite too; `pane_id`
+    # is the producer's own and follows the current env
+    if ($state) {
+        foreach ($p in $state.PSObject.Properties) {
+            if ($p.Name -in @('pane_id', 'items', 'title', 'session', 'updated_at', 'summary', '_cursor')) { continue }
+            if (-not $onDisk.Contains($p.Name)) { $onDisk[$p.Name] = $p.Value }
+        }
+    }
     if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
     $json = $onDisk | ConvertTo-Json -Depth 8
     [System.IO.File]::WriteAllText($File, $json, (New-Object System.Text.UTF8Encoding($false)))
