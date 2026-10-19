@@ -16,11 +16,25 @@ if ($env:I47_NESTED) { exit 0 }
 $Dir      = Join-Path $env:USERPROFILE '.claude\attention'
 $LogFile  = Join-Path $Dir 'producer.log'
 $RepoCache = Join-Path $Dir 'known-repos.txt'
+$AliasFile = Join-Path $Dir 'repo-aliases.txt'
 $Endpoint = 'http://127.0.0.1:8124/panel'
+# test seam: the fixture tests point this at a closed port
+if ($env:I47_PANEL_ENDPOINT) { $Endpoint = [string]$env:I47_PANEL_ENDPOINT }
 $DefaultOwner = 'optidatacloud'
-$MaxItems = 30
-$MaxLinks = 8
-$MaxAgeHours = 48
+# Caps are per kind, so a cheap kind can never push an expensive one off the
+# card: `pr` and `issue` rows each have their own cap, `link` + `path` share
+# one, `question` rows have theirs.
+$MaxPrs       = 40
+$MaxIssues    = 40
+$MaxLinkPaths = 30
+$MaxLinks     = 8      # links alone, inside the link + path cap
+$MaxQuestions = 8
+$MaxAgeHours        = 48    # link, path, question
+$MaxAgeHoursPrIssue = 168   # pr, issue: 7 days
+# `repo#N` aliases that are not a directory name. `repo-aliases.txt` in the
+# attention dir (`alias=repo`, one per line) adds to / overrides these.
+$DefaultRepoAliases = @{ 'mobile' = 'optiwork-mobile' }
+$RepoCacheVersion = '# i47 known-repos v2'
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $errors = New-Object System.Collections.ArrayList
@@ -113,25 +127,58 @@ $preExisting = @($items.Keys)
 $knownRepos = @{}
 try {
     $fresh = (Test-Path $RepoCache) -and (((Get-Date) - (Get-Item $RepoCache).LastWriteTime).TotalHours -lt 24)
+    # a v1 cache (any directory name, topic folders such as `mobile` included)
+    # is rebuilt at once instead of waiting out its 24 h
+    if ($fresh) {
+        try { $fresh = ((Get-Content -LiteralPath $RepoCache -TotalCount 1 -Encoding UTF8) -eq $RepoCacheVersion) } catch { $fresh = $false }
+    }
     if (-not $fresh) {
-        # depth-limited globs only: a -Recurse walk of C:\Dev costs seconds
+        # depth-limited globs only: a -Recurse walk of C:\Dev costs seconds.
+        # Under repos\ and www\ only git checkouts count: the topic folders
+        # (`mobile`, `cloud`, `web`, ...) are not repositories, and `mobile#12`
+        # must not become optidatacloud/mobile. work\<repo> is named after the
+        # repository by convention, so its first level counts as is.
         $names = New-Object System.Collections.ArrayList
-        $specs = @(
-            'C:\Dev\field\cto\repos\*', 'C:\Dev\field\cto\repos\*\*', 'C:\Dev\field\cto\repos\*\*\*',
-            'C:\Dev\field\work\*', 'C:\Dev\www\*'
-        )
-        foreach ($spec in $specs) {
+        $gitSpecs = @('C:\Dev\field\cto\repos\*', 'C:\Dev\field\cto\repos\*\*', 'C:\Dev\field\cto\repos\*\*\*', 'C:\Dev\www\*')
+        foreach ($spec in $gitSpecs) {
             foreach ($d in (Get-Item -Path $spec -ErrorAction SilentlyContinue)) {
-                if ($d.PSIsContainer) { [void]$names.Add($d.Name) }
+                if ($d.PSIsContainer -and (Test-Path -LiteralPath (Join-Path $d.FullName '.git'))) { [void]$names.Add($d.Name) }
             }
         }
+        foreach ($d in (Get-Item -Path 'C:\Dev\field\work\*' -ErrorAction SilentlyContinue)) {
+            if ($d.PSIsContainer -and $d.Name -notmatch '^[_.]') { [void]$names.Add($d.Name) }
+        }
         $uniq = @($names | Where-Object { $_ -and $_.Length -gt 2 -and $_ -notmatch '^\d' -and $_ -match '[A-Za-z]' } | Sort-Object -Unique)
-        if ($uniq.Count -gt 0) { Set-Content -LiteralPath $RepoCache -Value $uniq -Encoding UTF8 }
+        if ($uniq.Count -gt 0) { Set-Content -LiteralPath $RepoCache -Value (@($RepoCacheVersion) + $uniq) -Encoding UTF8 }
     }
     if (Test-Path $RepoCache) {
-        foreach ($n in (Get-Content -LiteralPath $RepoCache -Encoding UTF8)) { if ($n) { $knownRepos[$n.Trim().ToLower()] = $true } }
+        foreach ($n in (Get-Content -LiteralPath $RepoCache -Encoding UTF8)) {
+            if ($n -and -not $n.StartsWith('#')) { $knownRepos[$n.Trim().ToLower()] = $true }
+        }
     }
 } catch { Add-Err 'known-repos' $_ }
+
+# alias -> repo name for `repo#N`. Resolution order in 4c: an explicit alias,
+# then the alias as a known repo, then `optiwork-<alias>` when that is a known
+# repo (`app#5487`, `chat#2399`). Anything else is ignored.
+$repoAliases = @{}
+foreach ($a in $DefaultRepoAliases.Keys) { $repoAliases[$a.ToLower()] = $DefaultRepoAliases[$a] }
+try {
+    if (Test-Path -LiteralPath $AliasFile) {
+        foreach ($ln in (Get-Content -LiteralPath $AliasFile -Encoding UTF8)) {
+            if (-not $ln -or $ln.TrimStart().StartsWith('#')) { continue }
+            $kv = $ln -split '=', 2
+            if ($kv.Count -eq 2 -and $kv[0].Trim() -and $kv[1].Trim()) { $repoAliases[$kv[0].Trim().ToLower()] = $kv[1].Trim() }
+        }
+    }
+} catch { Add-Err 'repo-aliases' $_ }
+function Resolve-RepoAlias([string]$name) {
+    $l = $name.ToLower()
+    if ($repoAliases.ContainsKey($l)) { return $repoAliases[$l] }
+    if ($knownRepos.ContainsKey($l)) { return $name }
+    if ($knownRepos.ContainsKey('optiwork-' + $l)) { return 'optiwork-' + $l }
+    return $null
+}
 
 # --- 3. transcript delta ----------------------------------------------------
 $deltaLines = @()
@@ -162,7 +209,9 @@ try {
 } catch { Add-Err 'transcript' $_ }
 
 # --- 4. extraction ----------------------------------------------------------
-$rxUrl       = [regex]'https?://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/(pull|issues)/(\d{1,7})'
+# The scheme is optional: `github.com/o/r/pull/1` pasted without it counts too.
+# Without a scheme the host must not be the tail of another word or path.
+$rxUrl       = [regex]'(?:https?://(?:www\.)?|(?<![A-Za-z0-9._/@:-])(?:www\.)?)github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/(pull|issues)/(\d{1,7})(?![0-9])'
 $rxOwnerRepo = [regex]'(?<![A-Za-z0-9._/#-])([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)#(\d{1,5})(?![0-9A-Za-z])'
 $rxRepoHash  = [regex]'(?<![A-Za-z0-9._/#-])([A-Za-z][A-Za-z0-9._-]*)#(\d{1,5})(?![0-9A-Za-z])'
 $rxBare      = [regex]'(?<![A-Za-z0-9._#:/-])(?:(?<kw>PR|pull request|issue)\s+)?#(?<n>\d{1,5})(?![0-9A-Za-z])'
@@ -406,10 +455,12 @@ foreach ($line in $deltaLines) {
     }
     $work = $rxOwnerRepo.Replace($work, ' ')
 
-    # 4c. repo#N (owner implied: optidatacloud), only for repos we know
+    # 4c. repo#N (owner implied: optidatacloud), only for repos we know or an
+    # alias maps; an unknown name is ignored rather than invented
     foreach ($m in $rxRepoHash.Matches($work)) {
-        $repo = $m.Groups[1].Value; $num = $m.Groups[2].Value
-        if (-not $knownRepos.ContainsKey($repo.ToLower())) { continue }
+        $num = $m.Groups[2].Value
+        $repo = Resolve-RepoAlias $m.Groups[1].Value
+        if (-not $repo) { continue }
         $url = "https://github.com/$DefaultOwner/$repo/issues/$num"
         [void]$touched.Add((Add-Item 'issue' "$DefaultOwner/$repo" $num $url $null $ts))
         [void]$reposHere.Add("$DefaultOwner/$repo")
@@ -505,8 +556,7 @@ foreach ($k in @($items.Keys)) {
 
 # --- 5. prune + cap ---------------------------------------------------------
 # Links are the cheapest thing in here to produce, so they are capped on their
-# own before the global cap sees them: a chatty turn full of URLs must not push
-# the pull requests off the card.
+# own before the link + path cap sees them.
 try {
     $linkKeys = @()
     foreach ($k in @($items.Keys)) {
@@ -522,17 +572,35 @@ try {
     }
 } catch { Add-Err 'link-cap' $_ }
 
+# Age prune and cap per group, never across groups: questions (whose rows the
+# Haiku worker keeps) and links can no longer evict the PRs and issues.
 try {
-    $cut = (Get-Date).ToUniversalTime().AddHours(-$MaxAgeHours)
-    $kept = @()
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $cutShort = $nowUtc.AddHours(-$MaxAgeHours)
+    $cutLong  = $nowUtc.AddHours(-$MaxAgeHoursPrIssue)
+    $groups = @{ pr = @(); issue = @(); linkpath = @(); question = @() }
+    $caps   = @{ pr = $MaxPrs; issue = $MaxIssues; linkpath = $MaxLinkPaths; question = $MaxQuestions }
     foreach ($k in @($items.Keys)) {
         $h = $items[$k]
+        $kind = [string]$h['kind']
+        $g = switch ($kind) { 'pr' { 'pr' } 'issue' { 'issue' } 'question' { 'question' } default { 'linkpath' } }
         $ls = $null
-        try { $ls = ([datetime]$h['last_seen']).ToUniversalTime() } catch { $ls = (Get-Date).ToUniversalTime() }
-        if ($ls -lt $cut) { continue }
-        $kept += [pscustomobject]@{ key = $k; when = $ls }
+        try { $ls = ([datetime]$h['last_seen']).ToUniversalTime() } catch { $ls = $nowUtc }
+        # a question's `last_seen` is when it was first asked; it stays alive
+        # for as long as the Haiku worker keeps re-checking it
+        $alive = $ls
+        if ($g -eq 'question' -and $h['last_checked']) {
+            try { $lc = ([datetime]$h['last_checked']).ToUniversalTime(); if ($lc -gt $alive) { $alive = $lc } } catch {}
+        }
+        $cut = if ($g -eq 'pr' -or $g -eq 'issue') { $cutLong } else { $cutShort }
+        if ($alive -lt $cut) { continue }
+        $groups[$g] += [pscustomobject]@{ key = $k; when = $ls }
     }
-    $kept = @($kept | Sort-Object when -Descending | Select-Object -First $MaxItems)
+    $kept = @()
+    foreach ($g in @('pr', 'issue', 'linkpath', 'question')) {
+        $kept += @($groups[$g] | Sort-Object when -Descending | Select-Object -First $caps[$g])
+    }
+    $kept = @($kept | Sort-Object when -Descending)
     $final = [ordered]@{}
     foreach ($e in $kept) { $final[$e.key] = $items[$e.key] }
     $items = $final

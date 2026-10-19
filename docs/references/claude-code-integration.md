@@ -33,8 +33,10 @@ Claude Code session, in a Windows Terminal window titled "◑ <what it is doing>
         ▼
    hooks/i47-attention.ps1  — the producer (regex, no model)
         ├─ reads the transcript .jsonl from `_cursor` to EOF (the delta only)
-        ├─ regex → items: GitHub URLs, owner/repo#N, repo#N, bare #N, work paths,
+        ├─ regex → items: GitHub URLs (scheme optional), owner/repo#N, repo#N
+        │            (known repos and aliases only), bare #N, work paths,
         │            plain http(s) links (8 most recent)
+        ├─ prunes and caps per kind (pr 40, issue 40, link+path 30, question 8)
         ├─ resolves its own hosting terminal title (see below)
         ├─ writes ~/.claude/attention/<session_id>.json
         ├─ POSTs the `worked` items + questions to http://127.0.0.1:8124/panel
@@ -234,7 +236,7 @@ there is exactly one state directory per user even with several
       }
     },
     { "kind": "question", "url": "", "title": "Merge the pending pair now or wait for D50?",
-      "status": "open", "last_seen": "2026-09-09T12:04:24Z" },
+      "status": "open", "last_seen": "2026-09-09T11:40:02Z", "last_checked": "2026-09-09T12:04:24Z" },
     { "kind": "path", "url": "C:\\Dev\\field\\work\\laravel-opticloud\\1372-toast",
       "title": "1372-toast", "status": "unknown", "last_seen": "2026-09-09T12:04:24Z" },
     { "kind": "link", "url": "https://optibotinho-594.test/dev-login",
@@ -263,10 +265,34 @@ there is exactly one state directory per user even with several
   has no `repo#N` key the model could answer for, and the producer already knows
   whether the assistant wrote or ran the URL. Its relevance therefore only ever
   changes when the producer sees the same URL again in a stronger position.
-- Items are pruned at 48 h since `last_seen` and capped at 30, most recent
-  first; `link` rows are capped at 8 before that, so a chatty turn full of URLs
-  cannot push the pull requests off the card.
-- `summary` and `question` rows only ever come from the Haiku worker.
+- Items are capped **per kind**, most recent `last_seen` first, and one kind
+  never evicts another:
+
+  | Kind | Cap | Age prune |
+  |---|---|---|
+  | `pr` | 40 | 7 days since `last_seen` |
+  | `issue` | 40 | 7 days since `last_seen` |
+  | `link` + `path` (shared) | 30, of which at most 8 `link` | 48 h since `last_seen` |
+  | `question` | 8 | 48 h since the later of `last_seen` / `last_checked` |
+
+  So a chatty turn full of URLs, or a stack of open questions, cannot push the
+  pull requests and issues off the card.
+- `summary` and `question` rows only ever come from the Haiku worker. A
+  question's `last_seen` is when it was **first** listed open and never moves;
+  `last_checked` is the latest worker pass that still listed it open. The worker
+  keeps at most 8 questions too (re-listed ones first).
+- GitHub URLs count with or without the scheme (`github.com/o/r/pull/1`,
+  `www.github.com/o/r/issues/2`); the stored `url` is always
+  `https://github.com/...`.
+- `repo#N` (no owner) becomes `optidatacloud/<repo>#N` only when the name
+  resolves, in this order: an alias (built-in `mobile` → `optiwork-mobile`, plus
+  `alias=repo` lines in `~/.claude/attention/repo-aliases.txt`), a known repo of
+  that exact name, or `optiwork-<name>` when that is a known repo (`app#5487` →
+  `optiwork-app`). Anything else is ignored. Known repos are git checkouts under
+  the scan roots (topic folders such as `repos\optiwork\customer-facing\mobile`
+  do not count) plus the first level of `C:\Dev\field\work`, cached 24 h in
+  `known-repos.txt`; a cache without the `# i47 known-repos v2` header is
+  rebuilt at once.
 - `details` is the P6 hover popover's whole content, written only by the
   enricher (`pr` and `issue` rows; never `path`, `link` or `question` — the
   enricher makes no `gh` call for those and passes them through untouched). The producer and
@@ -572,7 +598,9 @@ using the chain on another machine.
 | Where | What |
 |---|---|
 | `i47-attention.ps1` | `$DefaultOwner = 'optidatacloud'` — the owner assumed for a bare `repo#N` |
-| `i47-attention.ps1` | the known-repo scan globs: `C:\Dev\field\cto\repos\*` (three depths), `C:\Dev\field\work\*`, `C:\Dev\www\*`, cached 24 h in `known-repos.txt`. Depth-limited on purpose: a `-Recurse` walk of `C:\Dev` costs seconds inside a 5 s budget |
+| `i47-attention.ps1` | the known-repo scan globs: `C:\Dev\field\cto\repos\*` (three depths) and `C:\Dev\www\*` (git checkouts only), `C:\Dev\field\work\*` (first level as is), cached 24 h in `known-repos.txt`. Depth-limited on purpose: a `-Recurse` walk of `C:\Dev` costs seconds inside a 5 s budget |
+| `i47-attention.ps1` | `$DefaultRepoAliases` (`mobile` → `optiwork-mobile`) and the `optiwork-` prefix fallback for `repo#N`; per-machine additions go in `~/.claude/attention/repo-aliases.txt` |
+| `i47-attention.ps1`, `i47-haiku.ps1` | the per-kind caps and age prunes (`$MaxPrs`, `$MaxIssues`, `$MaxLinkPaths`, `$MaxLinks`, `$MaxQuestions`, `$MaxAgeHours`, `$MaxAgeHoursPrIssue`); `$MaxQuestions` exists in both, keep them equal |
 | `i47-attention.ps1` | the work-path rule `<drive>:\Dev\field\work\<repo>\<slug>` — two segments deep, and the leaf becomes the row's title |
 | `i47-attention.ps1`, `i47-enrich.ps1`, `i47-haiku.ps1` | `$Endpoint = 'http://127.0.0.1:8124/panel'`; the installer rewrites it for a non-default `-DaemonPort` |
 | `i47-terminal-title.ps1` | `$SpeakExe = 'C:\Dev\www\claude-speak\speak.exe'` |
@@ -580,3 +608,17 @@ using the chain on another machine.
 | `install-claude-code.ps1` | the legacy task name `cto-i47-enrich` it removes, and `.claude-max` as the extra config dir |
 | `i47-session-id.ps1` | nothing — it is the one script with no machine-specific constant |
 | all | `~/.claude/attention` as the state directory, resolved from `$env:USERPROFILE` |
+
+## Tests
+
+`tests/i47-producer.tests.ps1` runs the producer and the Haiku worker in a child
+pwsh against a throw-away `USERPROFILE` (per-kind caps and eviction order, age
+prune, scheme-less URLs, `repo#N` aliases, question `last_seen` stability):
+
+```powershell
+pwsh -NoProfile -File tests\i47-producer.tests.ps1   # exit code = failures
+```
+
+Two environment variables exist only for it: `I47_PANEL_ENDPOINT` overrides the
+POST endpoint (both scripts) and `I47_HAIKU_VERDICT_FILE` makes the worker read a
+canned verdict instead of calling the model.

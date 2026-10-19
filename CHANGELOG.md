@@ -11,6 +11,21 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 
 ### Changed
 
+- **The attention producer caps rows per kind.** `pr` and `issue` rows get 40
+  each and a 7-day age prune; `link` + `path` share 30 (at most 8 links) at
+  48 h; `question` rows get 8. Questions and links can no longer evict the
+  pull requests and issues a session worked on.
+- **A question's `last_seen` is when it was first asked.** The Haiku worker no
+  longer bumps it on every pass (which made questions win every recency sort);
+  it writes `last_checked` instead, and keeps at most 8 questions.
+- **GitHub URLs without a scheme count** (`github.com/o/r/pull/1`).
+- **`repo#N` maps only to real repositories.** Known repos are git checkouts,
+  not topic folders, so `mobile#12` no longer becomes `optidatacloud/mobile`;
+  `mobile` aliases to `optiwork-mobile`, `<name>` falls back to
+  `optiwork-<name>` when that is a known repo, and
+  `~/.claude/attention/repo-aliases.txt` adds more. A v1 `known-repos.txt`
+  cache is rebuilt at once.
+
 - **Row icons and the popover's status pill use GitHub's state colours.** A
   pull request that is neither merged nor closed is green `Open` whatever its
   reviews or checks say — no more amber for `changes_requested` or red for

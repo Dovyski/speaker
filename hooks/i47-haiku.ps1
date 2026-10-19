@@ -42,6 +42,8 @@ $FillerPerMsg     = 600
 $ModelTimeoutMs   = 40000
 if ($env:I47_HAIKU_TIMEOUT_MS) { try { $ModelTimeoutMs = [int]$env:I47_HAIKU_TIMEOUT_MS } catch {} }
 $LockStaleMin     = 5
+$MaxQuestions     = 8         # keep in sync with i47-attention.ps1
+if ($env:I47_PANEL_ENDPOINT) { $Endpoint = [string]$env:I47_PANEL_ENDPOINT }
 $ApiModel         = 'claude-haiku-4-5-20251001'
 
 $sw     = [System.Diagnostics.Stopwatch]::StartNew()
@@ -429,7 +431,12 @@ function Parse-Verdict([string]$raw) {
 
 $verdict = $null
 $useApi  = $false
+# test seam: a canned verdict instead of the model (tests/i47-producer.tests.ps1)
+if ($env:I47_HAIKU_VERDICT_FILE) {
+    try { $verdict = Parse-Verdict ([System.IO.File]::ReadAllText($env:I47_HAIKU_VERDICT_FILE)); $log.model = 'fixture' } catch { Add-Err 'fixture' $_ }
+}
 foreach ($attempt in 1, 2) {
+    if ($verdict) { break }
     $log.attempts = $attempt
     $text = if ($attempt -eq 1) { $prompt } else { $prompt + "`n`nIMPORTANT: return only the JSON object. No prose, no code fence." }
     $raw = $null
@@ -506,17 +513,22 @@ foreach ($it in @($state.items)) {
     if (-not $it -or ([string]$it.kind) -ne 'question') { continue }
     $prevQ[(Norm ([string]$it.title))] = $it
 }
+# `last_seen` on a question is when it was first asked and never moves: a
+# re-listed question that kept bumping it used to win every recency sort in the
+# producer's cap. `last_checked` records the latest pass that still saw it open.
+$qKeep = New-Object System.Collections.ArrayList
 foreach ($n in $openOrder) {
     $it = $prevQ[$n]
     if ($it) {
-        Set-Prop $it 'title'     $stillOpen[$n]
-        Set-Prop $it 'status'    'open'
-        Set-Prop $it 'last_seen' $now
-        [void]$keep.Add($it)
+        Set-Prop $it 'title'        $stillOpen[$n]
+        Set-Prop $it 'status'       'open'
+        if (-not $it.last_seen) { Set-Prop $it 'last_seen' $now }
+        Set-Prop $it 'last_checked' $now
+        [void]$qKeep.Add($it)
     } else {
-        [void]$keep.Add([pscustomobject][ordered]@{
+        [void]$qKeep.Add([pscustomobject][ordered]@{
             kind = 'question'; url = ''; title = $stillOpen[$n]
-            status = 'open'; last_seen = $now
+            status = 'open'; last_seen = $now; last_checked = $now
         })
     }
 }
@@ -524,9 +536,11 @@ foreach ($n in $openOrder) {
 if (-not $hasNewUser) {
     foreach ($n in @($prevQ.Keys)) {
         if ($stillOpen.ContainsKey($n) -or $resolved.ContainsKey($n)) { continue }
-        [void]$keep.Add($prevQ[$n])
+        [void]$qKeep.Add($prevQ[$n])
     }
 }
+# same cap as the producer's: the ones the model re-listed first, then the rest
+foreach ($q in @($qKeep | Select-Object -First $MaxQuestions)) { [void]$keep.Add($q) }
 foreach ($n in @($prevQ.Keys)) { if ($resolved.ContainsKey($n)) { $log.q_resolved++ } }
 $log.q_open = $openOrder.Count
 
