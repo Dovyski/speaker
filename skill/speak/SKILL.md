@@ -47,6 +47,11 @@ the terminal, and prints one JSON line (`"ok": true` on success). If the
 register, captions, `light`/`danger`, one call per utterance, subagents stay
 silent. The pointing flags (`--pulses`, `--color`, `--title`, …) do not apply.
 
+Spoken lines are for results. Inside Devpilot a question for the user is never
+spoken: ask it with `devpilot ask confirm|choose|input|write --id <slug> "…"`
+(it lands in Devpilot's Pending tab and the answer comes back as a
+`<devpilot-answer>` block in the next prompt), then end the turn.
+
 Outside Devpilot, nothing changes: use `speak.exe` exactly as described below.
 
 ## Speaking
