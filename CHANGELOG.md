@@ -10,6 +10,7 @@ in `version.h`, and a `v*` tag ships whatever that header says.
 ## [Unreleased]
 
 ### Changed
+- The daemon no longer runs the i47 panel status poller (`hooks\i47-enrich.ps1`) by default; the panel is retired (Devpilot replaces it). `--enricher <path>` opts back in, `--no-enricher` is now the default.
 
 - **Row icons and the popover's status pill use GitHub's state colours.** A
   pull request that is neither merged nor closed is green `Open` whatever its

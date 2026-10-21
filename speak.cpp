@@ -7179,7 +7179,7 @@ struct Options {
     bool   point        = false;   // point at a window (before or instead of speaking)
     bool   list_targets = false;
     bool   point_server = true;    // daemon: serve the pointing endpoint
-    bool   enricher     = true;    // daemon: poll GitHub for row statuses
+    bool   enricher     = false;   // daemon: poll GitHub for row statuses (i47 retired; --enricher opts in)
     std::string enricher_path;     // default: <exe dir>\\hooks\\i47-enrich.ps1
     int    enricher_interval = 60; // seconds between runs
     int    point_port   = 0;       // 0 = speech port + 1
@@ -7445,11 +7445,11 @@ void Usage() {
         "  --list-targets        list pointable windows as JSON and exit\n"
         "  --point-port <n>      daemon: pointing endpoint port (default port+1)\n"
         "  --no-point-server     daemon: do not serve the pointing endpoint\n"
-        "  --enricher <path>     daemon: the panel status poller to run (default\n"
-        "                        <exe dir>\\hooks\\i47-enrich.ps1), while any panel\n"
-        "                        is registered\n"
+        "  --enricher <path>     daemon: run this panel status poller while any\n"
+        "                        panel is registered (off by default: the i47\n"
+        "                        panel is retired)\n"
         "  --enricher-interval <s>  seconds between poller runs (default 60)\n"
-        "  --no-enricher         daemon: never run the status poller\n"
+        "  --no-enricher         daemon: never run the status poller (default)\n"
         "  --keepalive <sec>     daemon: nudge itself every N seconds so it stays\n"
         "                        fast when idle (default 60)\n"
         "  --no-keepalive        daemon: let it go cold between calls\n"
@@ -7559,7 +7559,7 @@ int main() {
                 std::strtof(next("--panel-seconds").c_str(), nullptr));
         else if (a == "--point-port")  opt.point_port = std::atoi(next("--point-port").c_str());
         else if (a == "--no-point-server") opt.point_server = false;
-        else if (a == "--enricher")     opt.enricher_path = next("--enricher");
+        else if (a == "--enricher")   { opt.enricher_path = next("--enricher"); opt.enricher = true; }
         else if (a == "--no-enricher")  opt.enricher = false;
         else if (a == "--enricher-interval")
             opt.enricher_interval =
