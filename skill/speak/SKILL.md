@@ -54,6 +54,36 @@ spoken: ask it with `devpilot ask confirm|choose|input|write --id <slug> "…"`
 
 Outside Devpilot, nothing changes: use `speak.exe` exactly as described below.
 
+## The room speaker: speaking to everyone in the office
+
+`macdev` (the office Mac) runs a "room speaker": the same Pocket TTS engine
+behind an HTTP endpoint, playing through the Mac's own speakers. Use it **only
+when the user explicitly asks for the room** — "tell the room", "say it on
+macdev", "announce" — never as a default for results: every session shares one
+pair of speakers, so a broadcast nobody asked for is noise for the whole office.
+
+```bash
+curl -s -m 120 -X POST http://10.20.30.32:8130/speak \
+    -d '{"text":"The forms batch is ready to merge.","voice":"jarvis"}'
+# -> {"ok": true, "ms": 4381}
+```
+
+- Host: `10.20.30.32` from the office LAN; `100.108.238.1` (Tailscale) from
+  claude-runner-2 / claude-runner-3 or anywhere off the LAN.
+- `text` is required. `voice` is `jarvis` (default) or `ultron`; the register
+  follows the voice exactly as below. Do not pass `volume` unless the user asks
+  to change it.
+- The call returns when playback ends (about 4 s for a short sentence, longer
+  for a paragraph). One utterance plays at a time; a second request waits.
+- No orb, no caption, no pointing: it is audio only, so put the context in the
+  sentence itself ("On optiwork-forms, …"). Do not combine it with `speak.exe`
+  or `devpilot speak` for the same line.
+- `curl -s http://10.20.30.32:8130/health` answers `{"ok":true,"engine":"ready"}`;
+  `starting`, `down` or a timeout means the Mac is asleep or off Wi-Fi — say so
+  in text and fall back to local speech.
+- Everything else here still applies: one call per utterance, subagents stay
+  silent, symbols written out.
+
 ## Speaking
 
 ```bash
@@ -303,6 +333,8 @@ curl -s -X POST http://127.0.0.1:8124/speak -d '{"text":"Done, sir.","caption_ti
 - **Subagents do not speak or point.** Only the top-level session the user is
   talking to calls `speak.exe` at all; a subagent reports its result as text and
   lets its orchestrator say it. Holding a session id changes nothing here.
+- **The room speaker is opt-in.** Local speech (`speak.exe` / `devpilot speak`)
+  is the default; the macdev endpoint above only when the user asks for the room.
 - **One call per utterance.** Gather everything you want to say into a single
   string and make one call. On a cold call especially, splitting a summary into
   several calls pays the model load several times.
